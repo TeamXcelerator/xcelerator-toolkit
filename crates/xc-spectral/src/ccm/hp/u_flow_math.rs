@@ -50,6 +50,24 @@ fn exact_quadrant(node: &Float, n: usize) -> Result<Option<usize>> {
     let twice_mode = n
         .checked_mul(2)
         .ok_or_else(|| anyhow::anyhow!("u-flow mode overflow"))?;
+    // For a nonzero dyadic M*2^(e-b), cancel M's trailing zero bits.
+    // Its reduced denominator is 2^(b-e-v2(M)). Adding one preserves that
+    // denominator, so multiplication by 2n cannot be integral when the
+    // denominator needs more powers of two than 2n supplies. Borrowing the
+    // significand allocates nothing; the original rational route handles all
+    // divisible cases, zeros, and integers (including its i64 admission).
+    if twice_mode != 0 {
+        if let (Some(significand), Some(exponent)) = (node.get_significand(), node.get_exp()) {
+            if let Some(trailing) = significand.find_one(0) {
+                let denominator_bits = i64::from(significand.significant_bits())
+                    - i64::from(exponent)
+                    - i64::from(trailing);
+                if denominator_bits > i64::from(twice_mode.trailing_zeros()) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
     let exact_turn: Rational =
         (node.to_rational().expect("validated finite node") + 1i32) * twice_mode;
     Ok(if exact_turn.denom() == &1 {
@@ -61,7 +79,7 @@ fn exact_quadrant(node: &Float, n: usize) -> Result<Option<usize>> {
         None
     })
 }
-fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Result<[I; 3]> {
+fn validate_table(nodes: &[Float], weights: &[Float]) -> Result<()> {
     if nodes.len() != weights.len()
         || nodes.is_empty()
         || nodes.len() > 1_000_000
@@ -70,6 +88,10 @@ fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Resu
     {
         bail!("invalid stored u-flow quadrature rule");
     }
+    Ok(())
+}
+fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Result<[I; 3]> {
+    validate_table(nodes, weights)?;
     let one = I::from_i64(1, p);
     let two = I::from_i64(2, p);
     let half = I::point(Float::with_val(p, 0.5));
@@ -92,11 +114,8 @@ fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Resu
             let cos = I::from_i64([1, 0, -1, 0][q], p);
             (I::from_i64([0, 1, 0, -1][q], p), cos.clone(), cos.sub(&one))
         } else {
-            (
-                phase.sin(),
-                phase.cos(),
-                phase.mul(&half).sin().square().mul(&two).neg(),
-            )
+            let (sin, cos) = phase.sin_cos();
+            (sin, cos, phase.mul(&half).sin().square().mul(&two).neg())
         };
         let weight = I::from_float(weight, p)?;
         alpha.push(weight.mul(&sin).mul(&combined));
@@ -118,6 +137,97 @@ fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Resu
             .add(&one.div(&two.mul(&sinh(l)?))?),
     ])
 }
+struct IntegrandFactors {
+    h: I,
+    weight: I,
+    combined: I,
+    decay_difference: I,
+    gamma_offset: I,
+}
+struct SharedRule {
+    factors: Vec<IntegrandFactors>,
+    one: I,
+    two: I,
+    half: I,
+    pi: I,
+    gamma_tail: I,
+    _reservation: xc_core::MemoryReservation,
+}
+fn shared_rule_bytes(points: usize, p: u32) -> u128 {
+    // Five intervals per node, four scalar intervals and the final tail.
+    (points as u128 * 10 + 16) * (u128::from(p).div_ceil(8) + 96)
+}
+fn prepare_shared_rule(l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Result<SharedRule> {
+    validate_table(nodes, weights)?;
+    let reservation = prime_response_kernel::reserve_optional(shared_rule_bytes(nodes.len(), p))
+        .ok_or_else(|| anyhow::anyhow!("optional u-flow rule sharing unavailable"))?;
+    let one = I::from_i64(1, p);
+    let two = I::from_i64(2, p);
+    let half = I::point(Float::with_val(p, 0.5));
+    let pi = I::pi(p);
+    let factors = nodes
+        .iter()
+        .zip(weights)
+        .map(|(node, weight)| -> Result<_> {
+            let h = I::from_float(node, p)?.add(&one).mul(&half);
+            let x = l.mul(&h);
+            let e = x.mul(&half).neg().exp();
+            let rho = e.div(&exp_m1(&x.mul(&two).neg())?.neg())?;
+            let coth = one.add(&two.div(&exp_m1(&x.mul(&two))?)?);
+            let combined = rho.mul(&one.add(&x.mul(&half.sub(&coth))));
+            Ok(IntegrandFactors {
+                h,
+                weight: I::from_float(weight, p)?,
+                combined,
+                decay_difference: exp_m1(&x.mul(&half).neg())?,
+                gamma_offset: x.mul(&e).mul(&rho).mul(&half),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let gamma_tail = one.div(&two.mul(&sinh(l)?))?;
+    Ok(SharedRule {
+        factors,
+        one,
+        two,
+        half,
+        pi,
+        gamma_tail,
+        _reservation: reservation,
+    })
+}
+fn integral_shared(n: usize, nodes: &[Float], rule: &SharedRule, p: u32) -> Result<[I; 3]> {
+    let SharedRule {
+        one, two, half, pi, ..
+    } = rule;
+    let mut alpha = Vec::with_capacity(nodes.len());
+    let mut beta = Vec::with_capacity(nodes.len());
+    let mut gamma = Vec::with_capacity(nodes.len());
+    for (node, factor) in nodes.iter().zip(&rule.factors) {
+        let phase = pi.mul(&I::from_u64((2 * n) as u64, p)).mul(&factor.h);
+        let quadrant = exact_quadrant(node, n)?;
+        let (sin, cos, difference_cos) = if let Some(q) = quadrant {
+            let cos = I::from_i64([1, 0, -1, 0][q], p);
+            (I::from_i64([0, 1, 0, -1][q], p), cos.clone(), cos.sub(one))
+        } else {
+            let (sin, cos) = phase.sin_cos();
+            (sin, cos, phase.mul(half).sin().square().mul(two).neg())
+        };
+        alpha.push(factor.weight.mul(&sin).mul(&factor.combined));
+        beta.push(factor.weight.mul(&factor.h).mul(&cos).mul(&factor.combined));
+        let difference = difference_cos.sub(&factor.decay_difference);
+        gamma.push(
+            factor
+                .weight
+                .mul(&difference.mul(&factor.combined).add(&factor.gamma_offset)),
+        );
+    }
+    Ok([
+        sum(&alpha, p)?.div(&two.mul(pi))?,
+        sum(&beta, p)?.mul(half),
+        sum(&gamma, p)?.mul(half).add(&rule.gamma_tail),
+    ])
+}
+#[cfg(test)]
 fn arch_coefficients(v: &[Rational], n: usize, row: usize) -> (Vec<Rational>, Rational) {
     let a = row as i64 - n as i64;
     let mut alpha = vec![Rational::from(0); n + 1];
@@ -207,6 +317,260 @@ pub(super) fn evaluate(
     l: &Float,
     vector: &[Float],
 ) -> Result<UFlowVelocityActions> {
+    evaluate_with_reuse(params, cfg, l, vector, true)
+}
+
+fn action_checkpoint_identity(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    vector: &[Float],
+    semantic: &SemanticKeyEnvelope,
+) -> serde_json::Value {
+    serde_json::json!({
+        "semantics": "ccm-private-u-flow-actions-v2",
+        "request": semantic,
+        "lambda_squared": lambda_squared_cache_identity(params),
+        "modes": params.n_modes,
+        "precision_bits": cfg.precision_bits,
+        "quad_points": cfg.quad_points,
+        "quadrature_generator": cfg.archimedean_gl_generator,
+        "source": hp_values_memo_identity(vector),
+        "length": hp_values_memo_identity(std::slice::from_ref(l)),
+        "mpfr_range": [rug::float::exp_min(), rug::float::exp_max()],
+    })
+}
+
+fn action_checkpoint_allowed(
+    mode: xc_cache::ArtifactExecutionCacheMode,
+    assurance: xc_core::AssuranceLevel,
+) -> bool {
+    mode == xc_cache::ArtifactExecutionCacheMode::PreferReuse
+        && assurance == xc_core::AssuranceLevel::Computed
+}
+
+pub(super) fn evaluate_checkpointed(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    vector: &[Float],
+    semantic: &SemanticKeyEnvelope,
+    mode: xc_cache::ArtifactExecutionCacheMode,
+    assurance: xc_core::AssuranceLevel,
+) -> Result<UFlowVelocityActions> {
+    // Higher assurance, refresh, disabled, and independent verification never
+    // consume or write execution checkpoints. They exercise the original path.
+    let store = if action_checkpoint_allowed(mode, assurance) {
+        match crate::ccm::capture_runtime::Checkpoints::new(&action_checkpoint_identity(
+            params, cfg, l, vector, semantic,
+        )) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                xc_core::progress_message!("u-flow action checkpoint unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    evaluate_with_checkpoint(params, cfg, l, vector, true, store.as_ref())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionCheckpoint {
+    schema_version: u32,
+    precision_bits: u32,
+    // Fixed-count JSON strings avoid Vec<String> allocation amplification from
+    // a malformed sealed file containing many tiny scalar elements. Tokens are
+    // counted and length-checked before allocating any decoded Float vector.
+    channels: [String; 4],
+}
+
+impl ActionCheckpoint {
+    fn encode(actions: &UFlowVelocityActions, p: u32) -> Self {
+        let encode = |values: &[Float]| {
+            let mut text = String::new();
+            for value in values {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&lossless_hp_decimal(value));
+            }
+            text
+        };
+        Self {
+            schema_version: 2,
+            precision_bits: p,
+            channels: [
+                encode(&actions.tau_pole),
+                encode(&actions.tau_archimedean),
+                encode(&actions.tau_prime),
+                encode(&actions.tau_total),
+            ],
+        }
+    }
+
+    fn decode(self, count: usize, p: u32) -> Result<UFlowVelocityActions> {
+        anyhow::ensure!(
+            self.schema_version == 2
+                && self.precision_bits == p
+                && self.channels.iter().all(|row| {
+                    row.split('\n').count() == count
+                        && row
+                            .split('\n')
+                            .all(|text| !text.is_empty() && text.len() <= p as usize + 128)
+                }),
+            "u-flow action checkpoint shape or precision mismatch"
+        );
+        let decode = |values: String| -> Result<Vec<Float>> {
+            values
+                .split('\n')
+                .map(|text| {
+                    let value = parse_hp_scalar(text, p)?;
+                    anyhow::ensure!(
+                        value.is_finite() && lossless_hp_decimal(&value) == text,
+                        "u-flow action checkpoint is not canonical finite point data"
+                    );
+                    Ok(value)
+                })
+                .collect()
+        };
+        let [pole, archimedean, prime, total] = self.channels;
+        Ok(UFlowVelocityActions {
+            tau_pole: decode(pole)?,
+            tau_archimedean: decode(archimedean)?,
+            tau_prime: decode(prime)?,
+            tau_total: decode(total)?,
+            _checkpoint_reservation: None,
+        })
+    }
+}
+
+// One ASCII character per precision bit is a conservative bound for the
+// lossless decimal mantissa; the remainder admits exponents and JSON framing.
+fn action_checkpoint_bytes(count: usize, p: u32) -> u64 {
+    1024 + 4 * count as u64 * (u64::from(p) + 128)
+}
+
+fn action_checkpoint_workspace(cap: u64) -> u64 {
+    // Checkpoints uses a 1 MiB BufReader. The remaining allowance covers JSON
+    // string growth, parsed Floats, and canonical scalar formatting scratch.
+    (1 << 20) + cap.saturating_mul(4)
+}
+
+fn load_action_checkpoint(
+    store: &crate::ccm::capture_runtime::Checkpoints,
+    count: usize,
+    p: u32,
+    budget: u128,
+) -> Option<UFlowVelocityActions> {
+    if !store.enabled() {
+        return None;
+    }
+    // A checkpoint must not bypass the native exponent-range compatibility
+    // required by the subsequent numerical worker route.
+    xc_numerics::mpfr_interval::ensure_uniform_exponent_range().ok()?;
+    let cap = action_checkpoint_bytes(count, p);
+    let bytes = action_checkpoint_workspace(cap);
+    if u128::from(bytes) > budget {
+        return None;
+    }
+    // Admit JSON text, decoded points, and temporary validation storage before
+    // deserialization. A denied optional reuse takes the original cold path.
+    let reservation = match xc_core::RunResources::current() {
+        Some(resources) => Some(resources.try_reserve_working(bytes).ok()?),
+        None => None,
+    };
+    match store
+        .limited_bytes(cap)
+        .load::<ActionCheckpoint>("u-flow-velocity-actions")
+    {
+        Ok(Some(saved)) => match saved.decode(count, p) {
+            Ok(mut actions) => {
+                actions._checkpoint_reservation = reservation;
+                xc_core::progress_message!(
+                    "[HP] u-flow velocity actions: reused private completion"
+                );
+                Some(actions)
+            }
+            Err(error) => {
+                xc_core::progress_message!(
+                    "u-flow action checkpoint rejected ({error}); recomputing"
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            xc_core::progress_message!(
+                "u-flow action checkpoint unavailable ({error}); recomputing"
+            );
+            None
+        }
+    }
+}
+
+fn save_action_checkpoint(
+    store: &crate::ccm::capture_runtime::Checkpoints,
+    actions: &UFlowVelocityActions,
+    p: u32,
+    budget: u128,
+) {
+    if !store.enabled() {
+        return;
+    }
+    let cap = action_checkpoint_bytes(actions.tau_total.len(), p);
+    let bytes = action_checkpoint_workspace(cap);
+    if u128::from(bytes) > budget {
+        return;
+    }
+    let _reservation = match xc_core::RunResources::current() {
+        Some(resources) => match resources.try_reserve_working(bytes) {
+            Ok(reservation) => Some(reservation),
+            Err(_) => return,
+        },
+        None => None,
+    };
+    if let Err(error) = store.limited_bytes(cap).save(
+        "u-flow-velocity-actions",
+        &ActionCheckpoint::encode(actions, p),
+    ) {
+        xc_core::progress_message!("u-flow action checkpoint not saved ({error})");
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static GL_PRECOMPUTE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn evaluate_with_reuse(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    vector: &[Float],
+    reuse: bool,
+) -> Result<UFlowVelocityActions> {
+    evaluate_with_checkpoint(params, cfg, l, vector, reuse, None)
+}
+
+fn evaluate_with_checkpoint(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    vector: &[Float],
+    reuse: bool,
+    checkpoint: Option<&crate::ccm::capture_runtime::Checkpoints>,
+) -> Result<UFlowVelocityActions> {
+    let event_batch = if reuse {
+        prime_response_kernel::validate_batch_configuration()?;
+        match std::env::var("XC_RESPONSE_EVENT_BATCH") {
+            Ok(value) => event_batch_size(Some(&value))?,
+            Err(std::env::VarError::NotPresent) => event_batch_size(None)?,
+            Err(_) => bail!("XC_RESPONSE_EVENT_BATCH must be valid text"),
+        }
+    } else {
+        1
+    };
     let p = cfg.precision_bits;
     let n = params.n_modes;
     if !(64..=995_904).contains(&p)
@@ -242,11 +606,47 @@ pub(super) fn evaluate(
         * rayon::current_num_threads().min(n + 1) as u128
         * (u128::from(base + 4096).div_ceil(8) + 96)
         * 16;
-    if bytes + scratch > super::source_working_budget()? {
+    let budget = super::source_working_budget()?;
+    if bytes + scratch > budget {
         bail!("u-flow exceeds the declared workspace budget");
     }
-    let plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique, p);
-    let tables =
+    // Refuse an inadmissible exact source before resolving potentially expensive
+    // quadrature tables. Successful inputs retain the same source arithmetic.
+    let exponent = vector
+        .iter()
+        .filter_map(Float::get_exp)
+        .max()
+        .map_or(0, i64::from);
+    let normalized = vector
+        .iter()
+        .map(|v| scale_float(v, -exponent, base))
+        .collect::<Result<Vec<_>>>()?;
+    let exact = crate::ccm::certified_roots::boundary::response_points(
+        &normalized,
+        n,
+        rayon::current_num_threads(),
+        bytes + scratch,
+        budget,
+    )?;
+    // Preserve source, execution-policy, and workspace admission before any
+    // reuse. The checkpoint contains only fully resolved action vectors, never
+    // a failed/partial action or the subsequent channel-solve result.
+    if let Some(checkpoint) = checkpoint {
+        if let Some(actions) = load_action_checkpoint(checkpoint, vector.len(), p, budget) {
+            return Ok(actions);
+        }
+    }
+    #[cfg(test)]
+    GL_PRECOMPUTE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let tables = {
+        let plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique, p);
+        let _stage = crate::ccm::capture_runtime::Stage::new(format!(
+            "u-flow quadrature tables ({} unique, {}..{} points, {p} bits, {})",
+            unique.len(),
+            unique.first().copied().unwrap_or(0),
+            unique.last().copied().unwrap_or(0),
+            plan.label(),
+        ));
         xc_numerics::hp_runtime::map_gl_precompute_planned(&unique, plan, |points, schedule| {
             xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
                 points,
@@ -257,37 +657,69 @@ pub(super) fn evaluate(
             .map(|table| (points, table))
         })
         .into_iter()
-        .collect::<std::result::Result<std::collections::HashMap<usize, Table>, _>>()?;
-    let exponent = vector
-        .iter()
-        .filter_map(Float::get_exp)
-        .max()
-        .map_or(0, i64::from);
-    let normalized = vector
-        .iter()
-        .map(|v| scale_float(v, -exponent, base))
-        .collect::<Result<Vec<_>>>()?;
-    crate::ccm::certified_roots::boundary::rational_budget(normalized.iter(), normalized.len())?;
-    let exact = normalized
-        .iter()
-        .map(|v| v.to_rational().expect("finite validated source"))
-        .collect::<Vec<_>>();
+        .collect::<std::result::Result<std::collections::HashMap<usize, Table>, _>>()?
+    };
     let events = super::super::try_prime_powers_up_to(params.lambda_sq_int())?;
+    // Exact preparation is independent of the guard precision and prime event.
+    // Keep the previous path if the extra preparation cannot be admitted.
+    let prime_scratch = prime_response_kernel::workspace_bytes(vector.len(), base + 4096, true);
+    let coefficient_source = prime_response_kernel::CoefficientSource::new(
+        &exact.values,
+        n,
+        if reuse {
+            budget.saturating_sub(bytes + scratch + prime_scratch + exact.workspace_bytes)
+        } else {
+            0
+        },
+    );
+    // The order formula has one repeated prefix, then strictly increasing
+    // orders. Sharing only that prefix bounds storage to one rule per guard.
+    let shared_order = orders
+        .first()
+        .copied()
+        .filter(|order| reuse && orders.iter().filter(|v| *v == order).count() > 1);
     for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
         let work = base + guard;
         let length = I::from_float(l, work)?;
+        let integral_stage = crate::ccm::capture_runtime::Stage::new(format!(
+            "u-flow integrals (guard={guard}, work={work} bits, {} modes)",
+            n + 1,
+        ));
+        let shared = shared_order.and_then(|order| {
+            let required = shared_rule_bytes(order, work);
+            if required > (64u128 << 20)
+                || required
+                    > budget.saturating_sub(bytes + scratch + coefficient_source.storage_bytes())
+            {
+                return None;
+            }
+            let (nodes, weights) = &tables[&order];
+            // A preparation error follows the original mode/node path so its
+            // existing failure order is preserved rather than reordered.
+            prepare_shared_rule(&length, nodes, weights, work).ok()
+        });
         let integrals = (0..=n)
             .into_par_iter()
             .map(|mode| {
                 let (nodes, weights) = &tables[&orders[mode]];
+                if shared_order == Some(orders[mode]) {
+                    if let Some(rule) = &shared {
+                        return integral_shared(mode, nodes, rule, work);
+                    }
+                }
                 integral(mode, &length, nodes, weights, work)
             })
             .collect::<Result<Vec<_>>>()?;
-        let poles = pole(&exact, n, &length, work)?;
+        drop(shared);
+        drop(integral_stage);
+        let assembly_stage = crate::ccm::capture_runtime::Stage::new(format!(
+            "u-flow pole and archimedean actions (guard={guard}, work={work} bits)"
+        ));
+        let poles = pole(&exact.values, n, &length, work)?;
         let arches = (0..vector.len())
             .into_par_iter()
             .map(|row| -> Result<I> {
-                let (coeff, diag) = arch_coefficients(&exact, n, row);
+                let (coeff, diag) = coefficient_source.arch_coefficients(row);
                 let mut terms = coeff
                     .iter()
                     .zip(&integrals)
@@ -299,14 +731,66 @@ pub(super) fn evaluate(
                 sum(&terms, work)
             })
             .collect::<Result<Vec<_>>>()?;
+        drop(assembly_stage);
+        let prime_stage = crate::ccm::capture_runtime::Stage::new(format!(
+            "u-flow prime actions (guard={guard}, work={work} bits, {} events)",
+            events.len(),
+        ));
         let mut primes = vec![I::from_i64(0, work); vector.len()];
-        for &(power, prime, _) in &events {
-            let action =
-                prime_response_kernel::evaluate(n, power, prime, l, &normalized, work, true)?;
-            for (value, term) in primes.iter_mut().zip(action.action) {
-                *value = value.add(&rounding_enclosure(term)?);
+        for batch in events.chunks(event_batch) {
+            let actions = if reuse {
+                let pairs = batch
+                    .iter()
+                    .map(|&(power, prime, _)| (power, prime))
+                    .collect::<Vec<_>>();
+                prime_response_kernel::evaluate_prepared_batch(
+                    n,
+                    &pairs,
+                    l,
+                    &normalized,
+                    work,
+                    true,
+                    &coefficient_source,
+                    budget.saturating_sub(
+                        bytes
+                            + scratch
+                            + prime_scratch
+                            + exact.workspace_bytes
+                            + coefficient_source.storage_bytes(),
+                    ),
+                )?
+            } else {
+                None
+            };
+            // Retain the batch owner (and its memory reservation) until every
+            // independently rounded event has been accumulated in canonical order.
+            if let Some(actions) = actions {
+                for action in &actions.actions {
+                    for (value, term) in primes.iter_mut().zip(&action.action) {
+                        *value = value.add(&rounding_enclosure(term.clone())?);
+                    }
+                }
+            } else {
+                // Optional batching must never add a source-admission failure.
+                // A denied batch uses the original single-event storage lifetime.
+                for &(power, prime, _) in batch {
+                    let action = prime_response_kernel::evaluate_prepared(
+                        n,
+                        power,
+                        prime,
+                        l,
+                        &normalized,
+                        work,
+                        true,
+                        &coefficient_source,
+                    )?;
+                    for (value, term) in primes.iter_mut().zip(action.action) {
+                        *value = value.add(&rounding_enclosure(term)?);
+                    }
+                }
             }
         }
+        drop(prime_stage);
         let mut pole_out = Vec::with_capacity(vector.len());
         let mut arch_out = pole_out.clone();
         let mut prime_out = pole_out.clone();
@@ -331,20 +815,508 @@ pub(super) fn evaluate(
             total_out.push(values[3].clone());
         }
         if resolved {
-            return Ok(UFlowVelocityActions {
+            let actions = UFlowVelocityActions {
                 tau_pole: pole_out,
                 tau_archimedean: arch_out,
                 tau_prime: prime_out,
                 tau_total: total_out,
-            });
+                _checkpoint_reservation: None,
+            };
+            if let Some(checkpoint) = checkpoint {
+                save_action_checkpoint(checkpoint, &actions, p, budget);
+            }
+            return Ok(actions);
         }
     }
     bail!("u-flow action rounding unresolved within 4096 guard bits")
 }
 
+fn event_batch_size(value: Option<&str>) -> Result<usize> {
+    match value {
+        None => Ok(8),
+        Some(value) => {
+            anyhow::ensure!(
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+                "XC_RESPONSE_EVENT_BATCH must be a positive ASCII integer"
+            );
+            let size: usize = value.parse().map_err(|_| {
+                anyhow::anyhow!("XC_RESPONSE_EVENT_BATCH must be a positive integer")
+            })?;
+            anyhow::ensure!(size > 0, "XC_RESPONSE_EVENT_BATCH must be positive");
+            Ok(size)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checkpoint_fixture() -> (
+        CcmParams,
+        HighPrecConfig,
+        Float,
+        Vec<Float>,
+        SemanticKeyEnvelope,
+    ) {
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = 128;
+        cfg.quad_points = 96;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let params = CcmParams::from_lambda_sq_integer(3, 1);
+        let l = Float::with_val(128, 3);
+        let vector = [1, -2, 3].map(|v| Float::with_val(128, v) / 7).to_vec();
+        let semantic = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_u_flow_response_analysis".into(),
+            mathematical_semantics_version: "test".into(),
+            resolved_mathematical_parameters: serde_json::json!({"source": "test"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        (params, cfg, l, vector, semantic)
+    }
+
+    #[test]
+    fn uflow_action_checkpoint_survives_later_failure_and_rejects_tampering() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::new(1 << 30).unwrap();
+            let _scope = resources.enter();
+            let (params, cfg, l, vector, semantic) = checkpoint_fixture();
+            let directory = xc_core::test_support::TestDir::new("u-flow-progress");
+            let identity = action_checkpoint_identity(&params, &cfg, &l, &vector, &semantic);
+            let store =
+                crate::ccm::capture_runtime::Checkpoints::local(&identity, directory.to_path_buf())
+                    .unwrap();
+            let before = GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get);
+            let cold =
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).unwrap();
+            let expected = channel_bits(&cold);
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before + 1);
+            drop(cold);
+            // A later response-channel failure does not undo successful action work.
+            let later: Result<()> = (|| {
+                let warm =
+                    evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store))?;
+                assert_eq!(channel_bits(&warm), expected);
+                assert!(resources.usage().working_bytes > 0);
+                bail!("injected later channel refusal")
+            })();
+            assert!(later
+                .unwrap_err()
+                .to_string()
+                .contains("later channel refusal"));
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before + 1);
+            assert_eq!(resources.usage().working_bytes, 0);
+            let warm =
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).unwrap();
+            assert_eq!(channel_bits(&warm), expected);
+            drop(warm);
+            // The existing checkpoint reader authenticates the sealed payload.
+            let key_dir = std::fs::read_dir(&directory)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let payload = std::fs::read_dir(key_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_none())
+                .unwrap();
+            let mut bytes = std::fs::read(&payload).unwrap();
+            bytes[0] = b'!';
+            std::fs::write(&payload, bytes).unwrap();
+            let repaired =
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).unwrap();
+            assert_eq!(channel_bits(&repaired), expected);
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before + 2);
+            drop(repaired);
+            // Reuse still runs admission before touching the stored vectors.
+            let occupied = resources.try_reserve_retained((1 << 30) - 1).unwrap();
+            assert!(
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).is_err()
+            );
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before + 2);
+            drop(occupied);
+            assert_eq!(resources.usage().working_bytes, 0);
+        });
+    }
+
+    #[test]
+    fn uflow_action_checkpoint_validates_points_and_binds_context() {
+        let (params, cfg, l, vector, semantic) = checkpoint_fixture();
+        let identity = action_checkpoint_identity(&params, &cfg, &l, &vector, &semantic);
+        let mut changed = vector.clone();
+        changed[0] += 1;
+        assert_ne!(
+            identity,
+            action_checkpoint_identity(&params, &cfg, &l, &changed, &semantic)
+        );
+        changed = vector.clone();
+        changed[0].set_prec(129);
+        assert_ne!(
+            identity,
+            action_checkpoint_identity(&params, &cfg, &l, &changed, &semantic)
+        );
+        let mut other_cfg = cfg.clone();
+        other_cfg.quad_points += 1;
+        assert_ne!(
+            identity,
+            action_checkpoint_identity(&params, &other_cfg, &l, &vector, &semantic)
+        );
+        let mut other = semantic.clone();
+        other.resolved_mathematical_parameters = serde_json::json!({"source": "different"});
+        assert_ne!(
+            identity,
+            action_checkpoint_identity(&params, &cfg, &l, &vector, &other)
+        );
+        let values = vec![Float::with_val(128, -0.0), Float::with_val(128, 1) / 7];
+        let actions = UFlowVelocityActions {
+            tau_pole: values.clone(),
+            tau_archimedean: values.clone(),
+            tau_prime: values.clone(),
+            tau_total: values,
+            _checkpoint_reservation: None,
+        };
+        let decoded = ActionCheckpoint::encode(&actions, 128)
+            .decode(2, 128)
+            .unwrap();
+        assert_eq!(channel_bits(&decoded), channel_bits(&actions));
+        assert!(ActionCheckpoint::encode(&actions, 128)
+            .decode(2, 127)
+            .is_err());
+        assert!(ActionCheckpoint::encode(&actions, 128)
+            .decode(1, 128)
+            .is_err());
+        let mut invalid = ActionCheckpoint::encode(&actions, 128);
+        invalid.channels[0] = "NaN\n1".into();
+        assert!(invalid.decode(2, 128).is_err());
+        let mut invalid = ActionCheckpoint::encode(&actions, 128);
+        invalid.channels[0] = "0.0\n1".into();
+        assert!(invalid.decode(2, 128).is_err());
+        for malformed in [
+            "0\n".to_owned(),
+            "\n0".to_owned(),
+            "0\n0\n0".to_owned(),
+            "0".repeat(257),
+        ] {
+            let mut invalid = ActionCheckpoint::encode(&actions, 128);
+            invalid.channels[0] = malformed;
+            assert!(invalid.decode(2, 128).is_err());
+        }
+        // Tiny-element JSON arrays are rejected by the wire type itself;
+        // deserialization cannot grow an arbitrary Vec<String> first.
+        let malformed = serde_json::json!({
+            "schema_version": 2, "precision_bits": 128,
+            "channels": [["", "", ""], [], [], []],
+        });
+        assert!(serde_json::from_value::<ActionCheckpoint>(malformed).is_err());
+        use xc_cache::ArtifactExecutionCacheMode as Mode;
+        use xc_core::AssuranceLevel as Assurance;
+        assert!(action_checkpoint_allowed(
+            Mode::PreferReuse,
+            Assurance::Computed
+        ));
+        for assurance in [Assurance::CrossChecked, Assurance::Certified] {
+            assert!(!action_checkpoint_allowed(Mode::PreferReuse, assurance));
+        }
+        for mode in [
+            Mode::RequireReuse,
+            Mode::Refresh,
+            Mode::VerifyAgainstReference,
+            Mode::Disabled,
+        ] {
+            for assurance in [
+                Assurance::Computed,
+                Assurance::CrossChecked,
+                Assurance::Certified,
+            ] {
+                assert!(!action_checkpoint_allowed(mode, assurance));
+            }
+        }
+    }
+
+    #[test]
+    fn response_event_batch_configuration_is_positive_and_not_a_source_cap() {
+        assert_eq!(event_batch_size(None).unwrap(), 8);
+        assert_eq!(event_batch_size(Some("1")).unwrap(), 1);
+        assert_eq!(event_batch_size(Some("256")).unwrap(), 256);
+        for value in ["0", "-1", "+1", " 1", "１", "", "many"] {
+            assert!(event_batch_size(Some(value)).is_err());
+        }
+    }
+    #[test]
+    fn capacity_uflow_denied_exact_source_skips_quadrature() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::with_worker_limit(4 << 20, 2).unwrap();
+            let _scope = resources.enter();
+            let mut cfg = HighPrecConfig::for_decimal_digits(20);
+            cfg.precision_bits = 128;
+            cfg.quad_points = 17;
+            cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+            let params = CcmParams::from_lambda_sq_integer(3, 1);
+            let vector = [
+                Float::with_val(128, 1),
+                Float::with_val(128, 0),
+                Float::with_val(128, 1) >> 1_000_000u32,
+            ];
+            let before = GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get);
+            let error = evaluate(&params, &cfg, &Float::with_val(128, 3), &vector)
+                .err()
+                .expect("the compact Float source exceeds exact rational workspace");
+            assert!(error
+                .to_string()
+                .contains("exact response point conversion exceeds the rational workspace budget"));
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before);
+            assert_eq!(resources.usage().working_bytes, 0);
+            assert_eq!(resources.usage().retained_bytes, 0);
+        });
+    }
+
+    #[test]
+    fn uflow_paired_trigonometry_matches_separate_directed_endpoints() {
+        for p in [64, 128, 6772, 13608] {
+            let pi = I::pi(p);
+            let phases = [
+                I::from_i64(0, p),
+                I::point(-Float::with_val(p, 0)),
+                I::point(Float::with_val(p, 1) >> 400u32),
+                pi.mul(&I::from_i64(800, p)),
+                pi.div(&I::from_i64(7, p)).unwrap(),
+                I::new(Float::with_val(p, -100), Float::with_val(p, 100)).unwrap(),
+            ];
+            for phase in phases {
+                let (sin, cos) = phase.sin_cos();
+                for (actual, expected) in [(sin, phase.sin()), (cos, phase.cos())] {
+                    for (a, b) in [
+                        (actual.lower(), expected.lower()),
+                        (actual.upper(), expected.upper()),
+                    ] {
+                        assert_eq!(a, b);
+                        assert_eq!(a.prec(), b.prec());
+                        assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    #[ignore = "supervised shared-integrand measurement; not claim-scale qualification"]
+    fn measure_uflow_shared_rule_kernel() {
+        use std::{hint::black_box, time::Instant};
+        let resources = xc_core::RunResources::new(1 << 28).unwrap();
+        let _scope = resources.enter();
+        let (modes, points, p) = (16, 65, 512);
+        let (nodes, weights) = xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
+            points,
+            p,
+            xc_numerics::quadrature::CacheMode::Off,
+            xc_numerics::hp_runtime::plan_gl_precompute(&[points], p).root_schedule(points),
+        )
+        .unwrap();
+        let l = I::from_i64(3, p);
+        let scalar_bits = |values: &[I; 3]| {
+            values
+                .iter()
+                .flat_map(|v| [v.lower(), v.upper()])
+                .map(|v| {
+                    (
+                        xc_numerics::prefix::lossless_decimal(v),
+                        v.prec(),
+                        v.is_sign_negative(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let shared = prepare_shared_rule(&l, &nodes, &weights, p).unwrap();
+        for mode in 0..=modes {
+            assert_eq!(
+                scalar_bits(&integral(mode, &l, &nodes, &weights, p).unwrap()),
+                scalar_bits(&integral_shared(mode, &nodes, &shared, p).unwrap())
+            );
+        }
+        drop(shared);
+        let mut times = [Vec::new(), Vec::new()];
+        for repetition in 0..5 {
+            for route in if repetition % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let started = Instant::now();
+                let shared =
+                    (route == 1).then(|| prepare_shared_rule(&l, &nodes, &weights, p).unwrap());
+                for mode in 0..=modes {
+                    black_box(
+                        if let Some(shared) = &shared {
+                            integral_shared(mode, &nodes, shared, p)
+                        } else {
+                            integral(mode, &l, &nodes, &weights, p)
+                        }
+                        .unwrap(),
+                    );
+                }
+                times[route].push(started.elapsed().as_secs_f64());
+            }
+        }
+        for values in &mut times {
+            values.sort_by(f64::total_cmp);
+        }
+        println!("Directed integral kernel only: modes={modes}, points={points}, p={p}, trials=5; original/current median {:.6}/{:.6}s; shared preparation included, table generation excluded; exact endpoint equality checked; not a claim-scale speed estimate", times[0][2], times[1][2]);
+    }
+    fn channel_bits(action: &UFlowVelocityActions) -> Vec<(String, u32, bool)> {
+        [
+            &action.tau_pole,
+            &action.tau_archimedean,
+            &action.tau_prime,
+            &action.tau_total,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|v| {
+            (
+                xc_numerics::prefix::lossless_decimal(v),
+                v.prec(),
+                v.is_sign_negative(),
+            )
+        })
+        .collect()
+    }
+    #[test]
+    fn capacity_uflow_full_actions_match_original_with_admitted_exact_source() {
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let _scope = resources.enter();
+        for p in [64, 128] {
+            let mut cfg = HighPrecConfig::for_decimal_digits(20);
+            cfg.precision_bits = p;
+            cfg.quad_points = 96;
+            cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+            let params = CcmParams::from_lambda_sq_integer(3, 1);
+            let l = Float::with_val(p, 3);
+            for values in [[2, -3, 1], [1, 0, -1], [0, 0, 0]] {
+                let vector = values.map(|v| Float::with_val(p, v));
+                let original = evaluate_with_reuse(&params, &cfg, &l, &vector, false).unwrap();
+                let reused = evaluate(&params, &cfg, &l, &vector).unwrap();
+                assert_eq!(channel_bits(&reused), channel_bits(&original));
+                assert_eq!(resources.usage().retained_bytes, 0);
+                assert_eq!(resources.usage().working_bytes, 0);
+                assert!(resources.usage().peak_bytes > 0);
+                let occupied = resources.try_reserve_retained((1 << 30) - 1).unwrap();
+                let before = resources.usage();
+                let error = evaluate(&params, &cfg, &l, &vector).err().unwrap();
+                assert!(format!("{error:#}").contains("run memory budget exceeded"));
+                assert_eq!(resources.usage(), before);
+                drop(occupied);
+            }
+        }
+    }
+
+    #[test]
+    fn batched_uflow_preserves_all_channels_across_multiple_prime_events() {
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let _scope = resources.enter();
+        let p = 128;
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = p;
+        cfg.quad_points = 96;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let params = CcmParams::from_lambda_sq_integer(13, 3);
+        let l = Float::with_val(p, 13).ln();
+        let vector = (0..7)
+            .map(|k| Float::with_val(p, k - 2) / (k + 3))
+            .collect::<Vec<_>>();
+        let original = evaluate_with_reuse(&params, &cfg, &l, &vector, false).unwrap();
+        let batched = evaluate_with_reuse(&params, &cfg, &l, &vector, true).unwrap();
+        assert_eq!(channel_bits(&original), channel_bits(&batched));
+        assert_eq!(resources.usage().working_bytes, 0);
+        assert_eq!(resources.usage().retained_bytes, 0);
+    }
+    #[test]
+    fn uflow_shared_rule_reservation_denial_releases_all_optional_storage() {
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let _scope = resources.enter();
+        let p = 128;
+        let l = I::from_i64(3, p);
+        let nodes = [-0.5, 0.0, 0.5].map(|v| Float::with_val(p, v));
+        let weights = [1, 2, 1].map(|v| Float::with_val(p, v));
+        {
+            let _rule = prepare_shared_rule(&l, &nodes, &weights, p).unwrap();
+            assert_eq!(
+                u128::from(resources.usage().retained_bytes),
+                shared_rule_bytes(nodes.len(), p)
+            );
+        }
+        assert_eq!(resources.usage().retained_bytes, 0);
+        let _occupied = resources.try_reserve_retained((1 << 20) - 1).unwrap();
+        assert!(prepare_shared_rule(&l, &nodes, &weights, p).is_err());
+        assert_eq!(resources.usage().retained_bytes, (1 << 20) - 1);
+    }
+    #[test]
+    fn uflow_shared_rule_matches_original_interval_endpoints_across_guards() {
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let _scope = resources.enter();
+        for source_precision in [64, 128] {
+            let mut nodes = [-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75]
+                .map(|x| Float::with_val(source_precision, x))
+                .to_vec();
+            nodes.push(Float::with_val(source_precision, 1) >> 400u32);
+            nodes.push(-Float::with_val(source_precision, 1) >> 400u32);
+            let weights = (0..nodes.len())
+                .map(|i| Float::with_val(source_precision, i + 1) / 16u32)
+                .collect::<Vec<_>>();
+            for guard in [64, 128, 256] {
+                let work = source_precision + guard;
+                for length in [1, 3] {
+                    let l = I::from_i64(length, work);
+                    let shared = prepare_shared_rule(&l, &nodes, &weights, work).unwrap();
+                    for mode in 0..=4 {
+                        let expected = integral(mode, &l, &nodes, &weights, work).unwrap();
+                        let actual = integral_shared(mode, &nodes, &shared, work).unwrap();
+                        for (actual, expected) in actual.iter().zip(&expected) {
+                            for (a, b) in [
+                                (actual.lower(), expected.lower()),
+                                (actual.upper(), expected.upper()),
+                            ] {
+                                assert_eq!(a, b, "p={source_precision},guard={guard},mode={mode}");
+                                assert_eq!(a.prec(), b.prec());
+                                assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uflow_compact_arch_coefficients_match_original_exact_rows() {
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let _scope = resources.enter();
+        for modes in 0..=8 {
+            let exact = (0..2 * modes + 1)
+                .map(|k| Rational::from(((k as i32 - 5) * (k as i32 + 1), 1u32 << k)))
+                .collect::<Vec<_>>();
+            let prepared =
+                prime_response_kernel::CoefficientSource::new(&exact, modes, 1u128 << 30);
+            let fallback = prime_response_kernel::CoefficientSource::new(&exact, modes, 0);
+            assert!(prepared.storage_bytes() > 0);
+            assert_eq!(fallback.storage_bytes(), 0);
+            for row in 0..exact.len() {
+                let expected = arch_coefficients(&exact, modes, row);
+                assert_eq!(prepared.arch_coefficients(row), expected);
+                assert_eq!(fallback.arch_coefficients(row), expected);
+            }
+        }
+    }
+
     #[test]
     fn uflow_directed_quadrature_matches_independent_derivative_rule() {
         for p in [64, 128, 256] {
@@ -461,5 +1433,130 @@ mod tests {
                 assert_eq!(channel[0], -channel[2].clone());
             }
         }
+    }
+
+    fn exact_quadrant_rational_reference(node: &Float, n: usize) -> Result<Option<usize>> {
+        crate::ccm::certified_roots::boundary::rational_budget(std::iter::once(node), 1)?;
+        let twice_mode = n
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("u-flow mode overflow"))?;
+        let exact_turn: Rational =
+            (node.to_rational().expect("validated finite node") + 1i32) * twice_mode;
+        Ok(if exact_turn.denom() == &1 {
+            exact_turn
+                .numer()
+                .to_i64()
+                .map(|q| q.rem_euclid(4) as usize)
+        } else {
+            None
+        })
+    }
+
+    fn compare_quadrant_routes(node: &Float, mode: usize) {
+        let render = |value: Result<Option<usize>>| value.map_err(|error| format!("{error:#}"));
+        assert_eq!(
+            render(exact_quadrant(node, mode)),
+            render(exact_quadrant_rational_reference(node, mode)),
+            "precision={}, exponent={:?}, negative={}, mode={mode}",
+            node.prec(),
+            node.get_exp(),
+            node.is_sign_negative()
+        );
+    }
+
+    #[test]
+    fn uflow_quadrant_fast_rejection_matches_exact_dyadics() {
+        let modes = [0, 1, 2, 3, 4, 7, 8, 15, 16, 63, 64, 255, 256, 800, 4096];
+        for precision in [16, 64, 128, 6772] {
+            for numerator in -17..=17 {
+                for shift in -12..=2 {
+                    let node = Float::with_val(precision, numerator) << shift;
+                    for mode in modes {
+                        compare_quadrant_routes(&node, mode);
+                    }
+                }
+            }
+            // Full-precision dyadics obtained from non-dyadic divisions,
+            // with deterministic varied signs and exponents.
+            let mut state = 0x79a5_d13c_e012_638fu64;
+            for index in 0..64 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let mut node =
+                    Float::with_val(precision, state) / Float::with_val(precision, u64::MAX - 58);
+                node <<= [-400, -64, 0, 5, 32][index % 5];
+                if index % 2 == 0 {
+                    node = -node;
+                }
+                for mode in modes {
+                    compare_quadrant_routes(&node, mode);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uflow_quadrant_fast_rejection_preserves_edge_cases_and_errors() {
+        let precision = 128;
+        let tiny = Float::with_val(precision, 1) >> 4096u32;
+        for node in [
+            Float::with_val(precision, 0),
+            -Float::with_val(precision, 0),
+            Float::with_val(precision, -1),
+            Float::with_val(precision, 1),
+            Float::with_val(precision, -0.5),
+            Float::with_val(precision, 0.5),
+            tiny.clone(),
+            -tiny,
+        ] {
+            for mode in [0, 1, 2, 4096, usize::MAX / 2, usize::MAX] {
+                compare_quadrant_routes(&node, mode);
+            }
+        }
+        // The original rational resource check still wins before mode overflow,
+        // and before the new rejection can bypass an expensive conversion.
+        let denied = Float::with_val(precision, 1) >> 70_000_000u32;
+        for mode in [0, 1, usize::MAX] {
+            compare_quadrant_routes(&denied, mode);
+            assert!(format!("{:#}", exact_quadrant(&denied, mode).unwrap_err())
+                .contains("rational workspace budget"));
+        }
+        for special in [rug::float::Special::Nan, rug::float::Special::Infinity] {
+            compare_quadrant_routes(&Float::with_val(precision, special), usize::MAX);
+        }
+    }
+
+    #[test]
+    #[ignore = "bounded kernel benchmark; no quadrature generation or cache access"]
+    fn uflow_quadrant_fast_rejection_benchmark() {
+        let nodes = (-64..=64)
+            .filter(|value| *value != 0)
+            .map(|value| Float::with_val(6772, value) / 257u32)
+            .collect::<Vec<_>>();
+        for node in &nodes {
+            for mode in 0..=32 {
+                compare_quadrant_routes(node, mode);
+            }
+        }
+        let mut timings = [Vec::new(), Vec::new()];
+        for _ in 0..5 {
+            for (route, times) in timings.iter_mut().enumerate() {
+                let started = std::time::Instant::now();
+                for mode in 1..=32 {
+                    for node in &nodes {
+                        let value = if route == 0 {
+                            exact_quadrant_rational_reference(node, mode)
+                        } else {
+                            exact_quadrant(node, mode)
+                        };
+                        std::hint::black_box(value.unwrap());
+                    }
+                }
+                times.push(started.elapsed().as_secs_f64());
+            }
+        }
+        for times in &mut timings {
+            times.sort_by(f64::total_cmp);
+        }
+        println!("Exact quadrant kernel: p=6772, 128 stored GL-like dyadics, 32 modes, 5 trials; rational/borrowed-rejection median {:.6}/{:.6}s; source construction excluded; exact Options/errors compared; not a full u-flow speed estimate", timings[0][2], timings[1][2]);
     }
 }

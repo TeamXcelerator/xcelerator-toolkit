@@ -48,11 +48,11 @@ mod certified {
         let digits = Some((u64::from(x.precision()) * 30103 / 100000 + 10) as usize);
         out.insert(
             format!("{name}_lower"),
-            x.lower().to_string_radix_round(10, digits, Round::Down),
+            xc_numerics::fmt::decimal_string_round(x.lower(), digits, Round::Down),
         );
         out.insert(
             format!("{name}_upper"),
-            x.upper().to_string_radix_round(10, digits, Round::Up),
+            xc_numerics::fmt::decimal_string_round(x.upper(), digits, Round::Up),
         );
         Ok(())
     }

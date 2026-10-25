@@ -555,12 +555,15 @@ pub(super) fn prime_matrix(n: usize, cutoff: u64, l: &Float, p: u32) -> Result<V
     }
     bail!("prime matrix rounding unresolved within the guard budget")
 }
-pub(super) fn total(c: &ComputedCcmMatrixComponents, p: u32) -> Result<Vec<Float>> {
+pub(super) fn total<P: AsRef<[Float]> + Sync>(
+    c: &ComputedCcmMatrixComponents<P>,
+    p: u32,
+) -> Result<Vec<Float>> {
     uniform_exponent_range()?;
     if !(64..=1_000_000).contains(&p)
         || c.pole.is_empty()
         || c.pole.len() != c.archimedean.len()
-        || c.pole.len() != c.prime.len()
+        || c.pole.len() != c.prime.as_ref().len()
     {
         bail!("invalid component shape or precision");
     }
@@ -572,7 +575,7 @@ pub(super) fn total(c: &ComputedCcmMatrixComponents, p: u32) -> Result<Vec<Float
         .pole
         .par_iter()
         .zip(c.archimedean.par_iter())
-        .zip(c.prime.par_iter())
+        .zip(c.prime.as_ref().par_iter())
         .map(|((a, b), c)| {
             if [a, b, c]
                 .iter()
@@ -744,5 +747,223 @@ mod matrix_budget_tests {
         preflight(928, &l, 64).unwrap();
         assert!(matrix_workspace_bytes(1857, 64) < (2u128 << 30));
         assert!(preflight(4096, &Float::with_val(1_000_000, 2), 1_000_000).is_err());
+    }
+}
+
+// This supplements, and never relaxes, the existing pre-GL and per-rule gates.
+// It estimates this call's owned GL inputs, batched interval/rational work,
+// and complete output. It is not a process RSS cap or a live run reservation.
+#[derive(Clone, Copy)]
+struct IntegralRuleWorkspace {
+    gl: u128,
+    prepare: u128,
+    retained: u128,
+    mode: u128,
+}
+
+fn integral_bytes_add(a: u128, b: u128) -> Result<u128> {
+    a.checked_add(b)
+        .ok_or_else(|| anyhow::anyhow!("integral batch workspace overflow"))
+}
+
+fn integral_bytes_mul(a: u128, b: u128) -> Result<u128> {
+    a.checked_mul(b)
+        .ok_or_else(|| anyhow::anyhow!("integral batch workspace overflow"))
+}
+
+fn integral_rule_workspace_estimate(
+    count: usize,
+    base: u32,
+    gl: u128,
+    rational: u128,
+) -> Result<IntegralRuleWorkspace> {
+    if count == 0 || count > 1_000_000 || !(64..=1_000_000).contains(&base) {
+        bail!("invalid integral batch workspace dimensions");
+    }
+    let first = (u128::from(base) * 2 + 64).div_ceil(8) + 96;
+    let maximum = (u128::from(base) * 2 + 4096).div_ceil(8) + 96;
+    let count = count as u128;
+    // Eight retained endpoints per term; ten per-table constant endpoints.
+    // The 512 scalar allowance also covers table/container construction.
+    let retained_points = integral_bytes_add(integral_bytes_mul(8, count)?, 512)?;
+    // A mode retains six sum-vector endpoints per term alongside its table.
+    // Node preparation and mode evaluation each have fewer than 32 explicit
+    // live scalar endpoints per term. 64 additionally allows linear reduction
+    // storage/metadata and temporary/result staging; never infer this bound
+    // solely from a worker count in a nested Rayon iterator.
+    let active_points = integral_bytes_add(integral_bytes_mul(64, count)?, 512)?;
+    // The existing rational estimate includes both dyadic integer parts,
+    // per-record overhead, and 64 maximum-sized scalar temporaries. Adding one
+    // can double a near-zero point's numerator/denominator span. Four times
+    // that estimate covers shifted values plus copies/2n products (n<=4096),
+    // without assuming source precision alone bounds rational storage.
+    let rational = integral_bytes_mul(4, rational)?;
+    Ok(IntegralRuleWorkspace {
+        gl,
+        prepare: integral_bytes_add(integral_bytes_mul(active_points, first)?, rational)?,
+        retained: integral_bytes_add(integral_bytes_mul(retained_points, first)?, rational)?,
+        mode: integral_bytes_add(integral_bytes_mul(active_points, maximum)?, rational)?,
+    })
+}
+
+fn bounded_integral_workspace_bytes(
+    rules: &[(IntegralRuleWorkspace, usize)],
+    modes: usize,
+    p: u32,
+    width: usize,
+) -> Result<u128> {
+    if modes == 0 || width == 0 || width > 16 || !(64..=1_000_000).contains(&p) {
+        bail!("invalid integral batch workspace shape");
+    }
+    let counted = rules.iter().try_fold(0usize, |total, (_, count)| {
+        total
+            .checked_add(*count)
+            .ok_or_else(|| anyhow::anyhow!("integral mode count overflow"))
+    })?;
+    if counted != modes || rules.iter().any(|(_, count)| *count == 0) {
+        bail!("integral batch workspace mode partition mismatch");
+    }
+    let scalar = u128::from(p).div_ceil(8) + 96;
+    // Both fused result and split vector containers, indexes, and small maps.
+    // Float limbs move, but charging six values per mode is conservative.
+    let mut common = integral_bytes_mul(modes as u128, integral_bytes_add(6 * scalar, 256)?)?;
+    common = integral_bytes_add(common, integral_bytes_mul(rules.len() as u128, 512)?)?;
+    for (rule, _) in rules {
+        common = integral_bytes_add(common, rule.gl)?;
+    }
+    let mut peak = 0;
+    for batch in rules.chunks(width) {
+        let mut prepared = 0;
+        let mut retained = 0;
+        let mut maximum_mode = 0;
+        let mut batch_modes = 0usize;
+        for (rule, count) in batch {
+            prepared = integral_bytes_add(prepared, rule.prepare)?;
+            retained = integral_bytes_add(retained, rule.retained)?;
+            maximum_mode = maximum_mode.max(rule.mode);
+            batch_modes = batch_modes
+                .checked_add(*count)
+                .ok_or_else(|| anyhow::anyhow!("integral mode count overflow"))?;
+        }
+        let active = batch_modes.min(width) as u128;
+        let evaluating = integral_bytes_add(retained, integral_bytes_mul(active, maximum_mode)?)?;
+        peak = peak.max(prepared).max(evaluating);
+    }
+    integral_bytes_add(common, peak)
+}
+
+pub(super) fn integral_batch_workspace(
+    l: &Float,
+    p: u32,
+    orders: &[usize],
+    gl: &std::collections::HashMap<usize, (Vec<Float>, Vec<Float>)>,
+    width: usize,
+) -> Result<()> {
+    let mut counts = BTreeMap::<usize, usize>::new();
+    for &order in orders {
+        let count = counts.entry(order).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("integral mode count overflow"))?;
+    }
+    let mut rules = Vec::with_capacity(counts.len());
+    for (order, modes) in counts {
+        let (nodes, weights) = gl
+            .get(&order)
+            .ok_or_else(|| anyhow::anyhow!("missing integral quadrature rule"))?;
+        if nodes.len() != order {
+            bail!("integral quadrature order and shape differ");
+        }
+        // These are the original scalar/domain/rational-span checks, before
+        // any Rational conversion or first-guard interval allocation.
+        let base = validate_integral_rule(l, p, nodes, weights)?;
+        let rational =
+            crate::ccm::certified_roots::boundary::rational_point_vector_workspace(nodes.iter())?;
+        let stored = nodes.iter().chain(weights).try_fold(0, |total, value| {
+            integral_bytes_add(total, u128::from(value.prec()).div_ceil(8) + 96)
+        })?;
+        rules.push((
+            integral_rule_workspace_estimate(order, base, stored, rational)?,
+            modes,
+        ));
+    }
+    let bytes = bounded_integral_workspace_bytes(&rules, orders.len(), p, width)?;
+    source_workspace(bytes, "bounded integral tables and concurrent arithmetic")
+}
+
+#[cfg(test)]
+mod integral_batch_budget_tests {
+    use super::*;
+
+    #[test]
+    fn integral_batch_budget_covers_campaign_counts_without_point_allocation() {
+        let p = 3386;
+        // A conservative 320-rule envelope, every order at the observed max.
+        // This deliberately exceeds the actual distinct-order sum1,112,482.
+        let q = 3955;
+        let gl = 2 * q as u128 * (u128::from(p).div_ceil(8) + 96);
+        let rational = q as u128 * ((2 * u128::from(p) + 32).div_ceil(8) + 96)
+            + 64 * (2 * u128::from(p) + 32).div_ceil(8);
+        let rule = integral_rule_workspace_estimate(q, p, gl, rational).unwrap();
+        let mut rules = vec![(rule, 1); 320];
+        rules[0].1 = 682;
+        let bytes = bounded_integral_workspace_bytes(&rules, 1001, p, 16).unwrap();
+        assert!(bytes < (32u128 << 30));
+        assert!(16 * rule.retained < 320 * rule.retained);
+        assert!(source_workspace_with_budget(bytes, "test integral batch", bytes - 1).is_err());
+        source_workspace_with_budget(bytes, "test integral batch", bytes).unwrap();
+        let serial = bounded_integral_workspace_bytes(&rules, 1001, p, 1).unwrap();
+        assert!(serial < bytes);
+    }
+
+    #[test]
+    fn integral_batch_budget_checks_shape_overflow_and_actual_dyadic_span() {
+        let rule = integral_rule_workspace_estimate(7, 128, 100, 100).unwrap();
+        assert!(bounded_integral_workspace_bytes(&[(rule, 1)], 2, 128, 1).is_err());
+        assert!(bounded_integral_workspace_bytes(&[(rule, 1)], 1, 128, 0).is_err());
+        let extreme = IntegralRuleWorkspace {
+            gl: u128::MAX,
+            ..rule
+        };
+        assert!(bounded_integral_workspace_bytes(&[(extreme, 1)], 1, 128, 1).is_err());
+        assert!(integral_rule_workspace_estimate(7, 128, 0, u128::MAX).is_err());
+        let p = 128;
+        let l = Float::with_val(p, 3);
+        let nodes = vec![Float::with_val(p, 1) >> 1_000_000_000u32];
+        let gl = std::collections::HashMap::from([(1, (nodes, vec![Float::with_val(p, 2)]))]);
+        let error = integral_batch_workspace(&l, p, &[1], &gl, 1).unwrap_err();
+        assert!(error.to_string().contains("rational conversion budget"));
+    }
+
+    #[test]
+    fn integral_batch_fallback_preserves_exact_values_after_injected_unresolved_first_guard() {
+        let p = 128;
+        let l = Float::with_val(p, 13).ln();
+        let (nodes, weights) = xc_numerics::quadrature::try_gauss_legendre_nodes(
+            9,
+            p,
+            xc_numerics::quadrature::CacheMode::Off,
+        )
+        .unwrap();
+        let mut first = integral_node_table(&l, p, &nodes, &weights, 64).unwrap();
+        // Test injection only: guarantee an unresolved gamma interval. This
+        // does not claim ordinary input9/p128 naturally requires escalation.
+        first.kappa = I::new(
+            Float::with_val(first.work, -100),
+            Float::with_val(first.work, 100),
+        )
+        .unwrap();
+        assert!(mode_integrals(1, p, &first).unwrap().is_none());
+        let fallback = integrals_with_table(1, &l, p, &nodes, &weights, &first).unwrap();
+        let independent = integrals(1, &l, p, &nodes, &weights).unwrap();
+        for (a, b) in [
+            (&fallback.0, &independent.0),
+            (&fallback.1, &independent.1),
+            (&fallback.2, &independent.2),
+        ] {
+            assert_eq!(a.prec(), b.prec());
+            assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+            assert_eq!(a.to_string_radix(16, None), b.to_string_radix(16, None));
+        }
     }
 }

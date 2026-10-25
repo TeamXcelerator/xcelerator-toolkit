@@ -64,9 +64,20 @@ fn validate_exact_input(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Own cleanup from the moment of spawn, including failures during setup.
+#[derive(Debug)]
+struct ProviderChild(Child);
+
+impl Drop for ProviderChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[derive(Debug)]
 struct Connection {
-    child: Child,
+    child: ProviderChild,
     requests: mpsc::Sender<Vec<u8>>,
     writes: mpsc::Receiver<std::io::Result<()>>,
     replies: mpsc::Receiver<std::result::Result<serde_json::Value, String>>,
@@ -75,12 +86,6 @@ struct Connection {
     next_request_id: u64,
     precision_bits: u32,
     _executable_file: File,
-}
-impl Drop for Connection {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 impl Connection {
     fn exchange(&mut self, message: &serde_json::Value) -> Result<serde_json::Value> {
@@ -143,7 +148,7 @@ impl Connection {
         })();
         if result.is_err() {
             self.failed = true;
-            let _ = self.child.kill();
+            let _ = self.child.0.kill();
         }
         result
     }
@@ -177,8 +182,7 @@ fn validate_reply(
 ) -> Result<()> {
     anyhow::ensure!(
         reply["protocol_version"].as_u64() == Some(2),
-        "target provider protocol version mismatch: the Toolkit speaks protocol 2 (with request_nonce), the provider replied with {}",
-        reply.get("protocol_version").map_or_else(|| "no protocol_version".to_owned(), |v| v.to_string())
+        "target provider protocol version mismatch: expected protocol 2 (with request_nonce)"
     );
     anyhow::ensure!(
         reply["request_nonce"].as_str() == Some(nonce),
@@ -357,6 +361,9 @@ impl Provider {
             bits <= spec.evaluation_precision_bits,
             "external target requires regeneration at the requested precision"
         );
+        let pure_identity = provider_declared_pure()?
+            .then(|| pure_reply_identity(spec, bits))
+            .transpose()?;
         let path = std::env::var_os("XC_TARGET_PROVIDER_EXECUTABLE").context(
             "external target requires explicit XC_TARGET_PROVIDER_EXECUTABLE authorization",
         )?;
@@ -383,24 +390,24 @@ impl Provider {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        let mut child = command
-            .spawn()
-            .context("cannot start authorized target provider")?;
+        let mut child = ProviderChild(
+            command
+                .spawn()
+                .context("cannot start authorized target provider")?,
+        );
         // Detect ordinary replacement across spawn. This is not an atomic
         // execution guarantee against a hostile local writer on every platform.
-        if let Err(error) = verified_executable(path, &spec.provider_sha256) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
+        verified_executable(path, &spec.provider_sha256)?;
         let input = BufWriter::new(
             child
+                .0
                 .stdin
                 .take()
                 .context("target provider stdin unavailable")?,
         );
         let (requests, writes) = request_writer(input);
         let output = child
+            .0
             .stdout
             .take()
             .context("target provider stdout unavailable")?;
@@ -425,9 +432,6 @@ impl Provider {
                 }
             }
         });
-        let pure_identity = provider_declared_pure()?
-            .then(|| pure_reply_identity(spec, bits))
-            .transpose()?;
         let provider = Self {
             connection: Arc::new(Mutex::new(Connection {
                 child,
@@ -449,7 +453,7 @@ impl Provider {
             .exchange(&serde_json::json!({"operation":"initialize","input":spec.input}))?;
         Ok(provider)
     }
-    fn value(&self, u: &str) -> Result<String> {
+    fn value<T>(&self, u: &str, parse: impl FnOnce(&str) -> Result<T>) -> Result<T> {
         let key = self
             .pure_identity
             .as_ref()
@@ -459,7 +463,7 @@ impl Provider {
                 .get()
                 .and_then(|memo| memo.lock().ok()?.values.get(key).cloned())
             {
-                return Ok(value);
+                return parse(&value);
             }
         }
         let reply = self
@@ -472,14 +476,16 @@ impl Provider {
             .and_then(|v| v.as_str())
             .map(str::to_owned)
             .context("external target provider omitted its value")?;
-        // Only successful replies are remembered; a failing point is asked again.
+        // A string-shaped reply can still be invalid for the scalar backend.
+        // Only validated replies are remembered; a failing point is asked again.
+        let parsed = parse(&value)?;
         if let Some(key) = key {
             let memo = PURE_REPLIES.get_or_init(|| Mutex::new(PureReplies::default()));
             if let Ok(mut memo) = memo.lock() {
                 memo.remember(key, &value, PURE_REPLY_MEMO_ENTRIES, PURE_REPLY_MEMO_BYTES);
             }
         }
-        Ok(value)
+        Ok(parsed)
     }
 }
 fn parse_scalar_f64(text: &str) -> Result<f64> {
@@ -526,7 +532,7 @@ impl CompiledF64 {
     }
     pub(super) fn raw(&self, u: f64) -> Result<f64> {
         anyhow::ensure!(u.is_finite() && u > 0.0, "target requires finite u > 0");
-        parse_scalar_f64(&self.provider.value(&u.to_string())?)
+        self.provider.value(&u.to_string(), parse_scalar_f64)
     }
 }
 #[cfg(feature = "hp")]
@@ -591,8 +597,10 @@ pub(super) mod hp {
         pub(crate) fn raw(&self, u: &Float) -> Result<Float> {
             anyhow::ensure!(u.is_finite() && u > &0, "target requires finite u > 0");
             let provider_u = Float::with_val(self.bits.max(u.prec()), u);
-            let text = self.provider.value(&provider_u.to_string_radix(10, None))?;
-            parse_scalar(&text, self.bits)
+            self.provider
+                .value(&provider_u.to_string_radix(10, None), |text| {
+                    parse_scalar(text, self.bits)
+                })
         }
     }
 }
@@ -700,6 +708,29 @@ mod tests {
             let error = validate_reply(&wrong, 1, 256, "test-nonce", "evaluate").unwrap_err();
             assert!(!error.to_string().contains("private detail"));
         }
+    }
+    #[test]
+    fn protocol_version_errors_never_render_response_values() {
+        for version in [
+            serde_json::json!("private-version-marker"),
+            serde_json::json!({"private-version-marker": "private-response-marker"}),
+            serde_json::json!(["private-response-marker"]),
+            serde_json::Value::Null,
+            serde_json::json!(3),
+        ] {
+            let mut wrong = reply(1);
+            wrong["protocol_version"] = version;
+            let error = validate_reply(&wrong, 1, 256, "test-nonce", "evaluate")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "target provider protocol version mismatch: expected protocol 2 (with request_nonce)"
+            );
+        }
+        let mut missing = reply(1);
+        missing.as_object_mut().unwrap().remove("protocol_version");
+        assert!(validate_reply(&missing, 1, 256, "test-nonce", "evaluate").is_err());
     }
     #[test]
     fn external_policy_rejects_invalid_cutoff_precision_and_digest() {

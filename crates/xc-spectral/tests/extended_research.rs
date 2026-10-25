@@ -929,6 +929,449 @@ fn cluster_projection_handles_nonorthogonal_vectors_and_cross_n_embedding() {
     assert!(number(&r.values["source_cluster_leakage_squared"]) < 1e-80);
     near(&r.rows[0].values["largest_previous_overlap"], 1., 1e-14);
 }
+fn unavailable_cluster_assessment(m: &ArtifactManifest) -> ClusterPreparationAssessment {
+    ClusterPreparationAssessment {
+        source_eigenpair: m.content_digest.clone(),
+        source_matrix: m.dependencies[0].content_digest.clone(),
+        source_precision_bits: 128,
+        requested_eigenpairs_per_sector: 1,
+        eigenvalue_route: "selected".into(),
+        origin: "declared_prior_capture_policy".into(),
+        evidence_digest: ContentDigest::sha256(b"synthetic prior request: no sector analysis"),
+        reason: "the prior acquisition did not request individual sector eigenvectors".into(),
+    }
+}
+#[test]
+fn cluster_absence_requires_an_explicit_source_bound_assessment() {
+    let (s, m, matrix) = fixture();
+    let mut input = inputs(&m);
+    let old_bytes = serde_json::to_vec(&input).unwrap();
+    assert!(!serde_json::to_value(&input)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("cluster_preparation_assessment"));
+    assert_eq!(
+        run("spectral_cluster", &s, Some(&matrix), Some(&input)).outcome,
+        "missing_input"
+    );
+    input.run_once = Some(xc_spectral::ccm::convergence_capture::RunOnceInputs {
+        producer_notes: vec![
+            "sector inputs unavailable: CCM sector resolution limit: supplied note only".into(),
+        ],
+        ..Default::default()
+    });
+    assert_eq!(
+        run("spectral_cluster", &s, Some(&matrix), Some(&input)).outcome,
+        "missing_input"
+    );
+    input.run_once = None;
+    input.cluster_preparation_assessment = None;
+    assert_eq!(serde_json::to_vec(&input).unwrap(), old_bytes);
+}
+#[test]
+fn cluster_policy_assessment_measures_the_source_and_keeps_science_unresolved() {
+    let (s, m, matrix) = fixture();
+    let mut input = inputs(&m);
+    input.cluster_preparation_assessment = Some(unavailable_cluster_assessment(&m));
+    let result = capture_extended(
+        "spectral_cluster",
+        &s,
+        Some(&matrix),
+        None,
+        Some(&input),
+        &ExtensionOptions::for_source(&s),
+        &[],
+        &context(),
+    )
+    .unwrap();
+    let report = &result.value.data;
+    assert_eq!(report.outcome, "partial_unresolved");
+    assert_eq!(report.rows.len(), 1);
+    assert_eq!(report.rows[0].outcome, "unresolved");
+    assert!(report
+        .reason
+        .as_ref()
+        .unwrap()
+        .contains("not a replayed sector calculation"));
+    assert_eq!(report.values["sector_attempted"], "0");
+    assert_eq!(report.values["retained_cluster_vector_count"], "0");
+    assert_eq!(report.values["cluster_projection_available"], "0");
+    assert_eq!(report.values["certifies_spectral_cluster"], "0");
+    near(&report.values["retained_source_norm_squared"], 1., 1e-14);
+    near(
+        &report.values["retained_source_rayleigh_quotient"],
+        3.,
+        1e-14,
+    );
+    near(&report.values["retained_source_residual_norm"], 0., 1e-14);
+    assert!(!report.values.contains_key("source_cluster_leakage_squared"));
+    assert!(result.value.request["unavailable_cluster_assessment"].is_string());
+    assert_eq!(
+        run("spectral_cluster", &s, None, Some(&input)).outcome,
+        "missing_input"
+    );
+    let mut limited = ExtensionOptions::for_source(&s);
+    limited.maximum_working_bytes = Some(1);
+    let report = capture_extended(
+        "spectral_cluster",
+        &s,
+        Some(&matrix),
+        None,
+        Some(&input),
+        &limited,
+        &[],
+        &context(),
+    )
+    .unwrap();
+    assert_eq!(report.value.data.outcome, "unresolved");
+    assert!(!report
+        .value
+        .data
+        .values
+        .contains_key("retained_source_rayleigh_quotient"));
+}
+#[test]
+fn cluster_attempt_assessment_rejects_unbound_or_invalid_provenance() {
+    let (s, m, matrix) = fixture();
+    let mut input = inputs(&m);
+    let mut assessment = unavailable_cluster_assessment(&m);
+    assessment.origin = "automatic_sector_attempt".into();
+    input.cluster_preparation_assessment = Some(assessment.clone());
+    assert!(input.validate().is_err());
+    assessment.reason =
+        "CCM sector resolution limit: synthetic index enclosures overlap at 128 working bits"
+            .into();
+    input.cluster_preparation_assessment = Some(assessment.clone());
+    let report = run("spectral_cluster", &s, Some(&matrix), Some(&input));
+    assert_eq!(report.values["sector_attempted"], "1");
+    assert_eq!(report.rows[0].outcome, "unresolved");
+    for bad in [
+        ClusterPreparationAssessment {
+            source_eigenpair: ContentDigest::sha256(b"another state"),
+            ..assessment.clone()
+        },
+        ClusterPreparationAssessment {
+            source_matrix: ContentDigest::sha256(b"another matrix"),
+            ..assessment.clone()
+        },
+        ClusterPreparationAssessment {
+            source_precision_bits: 96,
+            ..assessment.clone()
+        },
+        ClusterPreparationAssessment {
+            requested_eigenpairs_per_sector: 0,
+            ..assessment.clone()
+        },
+        ClusterPreparationAssessment {
+            eigenvalue_route: "invented".into(),
+            ..assessment.clone()
+        },
+    ] {
+        input.cluster_preparation_assessment = Some(bad);
+        assert!(capture_extended(
+            "spectral_cluster",
+            &s,
+            Some(&matrix),
+            None,
+            Some(&input),
+            &ExtensionOptions::for_source(&s),
+            &[],
+            &context()
+        )
+        .is_err());
+    }
+}
+#[test]
+fn cluster_source_assessment_measures_a_nonzero_retained_residual() {
+    let (_, prior, matrix) = fixture();
+    let (mut manifest, bytes) = source(
+        "ccm_weil_eigenpair",
+        json!({"schema_version":3,"lambda_squared":"9","n_modes":1,"precision_bits":128,"force_even":true,"eigenvalue":"3","eigenvector":["1","0","1"]}),
+    );
+    manifest.dependencies = prior.dependencies;
+    let state = RetainedState::from_payload(
+        &manifest,
+        &bytes,
+        std::slice::from_ref(&manifest.content_digest),
+    )
+    .unwrap();
+    let mut input = inputs(&manifest);
+    input.cluster_preparation_assessment = Some(unavailable_cluster_assessment(&manifest));
+    let report = run("spectral_cluster", &state, Some(&matrix), Some(&input));
+    near(&report.values["retained_source_norm_squared"], 1., 1e-14);
+    near(
+        &report.values["retained_source_rayleigh_quotient"],
+        4.,
+        1e-14,
+    );
+    near(&report.values["retained_source_residual_norm"], 1., 1e-14);
+    assert_eq!(report.outcome, "partial_unresolved");
+    assert_eq!(report.rows[0].outcome, "unresolved");
+}
+
+fn cluster_assessment_fixture(
+    precision: u32,
+    eigenvalue: &str,
+) -> (
+    RetainedState,
+    RetainedMatrix<'static>,
+    ExternalResearchInputs,
+) {
+    let (matrix_manifest, matrix_bytes) = source(
+        "ccm_tau_matrix",
+        json!({"schema_version":2,"lambda_squared":"9","n_modes":1,
+            "precision_bits":precision,
+            "entries":["4","0","0","0",eigenvalue,"0","0","0","4"]}),
+    );
+    let (mut manifest, bytes) = source(
+        "ccm_weil_eigenpair",
+        json!({"schema_version":3,"lambda_squared":"9","n_modes":1,
+            "precision_bits":precision,"force_even":true,
+            "eigenvalue":eigenvalue,"eigenvector":["0","1","0"]}),
+    );
+    manifest.dependencies.push(DependencyRef {
+        key: matrix_manifest.key.clone(),
+        content_digest: matrix_manifest.content_digest.clone(),
+        required_quality: CacheQuality::Validated,
+    });
+    let state = RetainedState::from_payload(
+        &manifest,
+        &bytes,
+        std::slice::from_ref(&manifest.content_digest),
+    )
+    .unwrap();
+    let matrix = RetainedMatrix::from_payload(
+        &matrix_manifest,
+        &matrix_bytes,
+        std::slice::from_ref(&matrix_manifest.content_digest),
+    )
+    .unwrap();
+    let mut input = inputs(&manifest);
+    input.precision_bits = precision;
+    let mut assessment = unavailable_cluster_assessment(&manifest);
+    assessment.source_precision_bits = precision;
+    input.cluster_preparation_assessment = Some(assessment);
+    (state, matrix, input)
+}
+
+#[test]
+fn cluster_assessment_nondyadic_eigenvalue_roundtrips_source_precision_cold_and_warm() {
+    let dir = xc_core::test_support::TestDir::new("cluster-source-precision-replay");
+    for (case, (precision, eigenvalue)) in [
+        (128, "0.1"),
+        (128, "-0.1"),
+        (3386, "1.234567890123456789e-1020"),
+        (3386, "-1.234567890123456789e-1020"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (state, matrix, input) = cluster_assessment_fixture(precision, eigenvalue);
+        let expected = Float::with_val(precision, Float::parse(eigenvalue).unwrap());
+        for guard in [0, 64, 128] {
+            let resolver = CacheResolver::new(vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "local",
+                    dir.join(format!("{case}-{guard}")),
+                    true,
+                    CacheVisibility::Local,
+                )),
+            }]);
+            let policy = CachePolicy {
+                current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                minimum_quality: CacheQuality::Validated,
+                accepted_schema_versions: vec![1],
+                allow_deprecated: false,
+                allow_quarantined: false,
+                allowed_visibilities: vec![CacheVisibility::Local],
+            };
+            let mut cache = ArtifactCacheContext {
+                resolver: Some(&resolver),
+                acceptance: Some(&policy),
+                ordered_overlays: vec!["local".into()],
+                mode: ArtifactExecutionCacheMode::PreferReuse,
+                write_on_miss: true,
+                ..context()
+            };
+            let mut options = ExtensionOptions::for_source(&state);
+            options.working_precision_bits = precision + guard;
+            let capture = |cache: &ArtifactCacheContext<'_>| {
+                capture_extended(
+                    "spectral_cluster",
+                    &state,
+                    Some(&matrix),
+                    None,
+                    Some(&input),
+                    &options,
+                    &[],
+                    cache,
+                )
+            };
+            let cold = capture(&cache).unwrap_or_else(|error| {
+                panic!("source={precision}, guard={guard}, eigenvalue={eigenvalue}: {error:#}")
+            });
+            assert!(cold.produced_manifest.is_some());
+            let report = &cold.value.data;
+            assert_eq!(report.outcome, "partial_unresolved");
+            assert_eq!(report.rows[0].outcome, "unresolved");
+            assert_eq!(report.values["certifies_spectral_cluster"], "0");
+            let encoded = &report.values["retained_source_eigenvalue"];
+            assert_eq!(*encoded, xc_numerics::prefix::lossless_decimal(&expected));
+            assert_eq!(
+                Float::with_val(precision, Float::parse(encoded).unwrap()),
+                expected
+            );
+            assert_eq!(number(&report.values["retained_source_residual_norm"]), 0.0);
+            cache.mode = ArtifactExecutionCacheMode::RequireReuse;
+            cache.write_on_miss = false;
+            let warm = capture(&cache).unwrap();
+            assert!(warm.reused_manifest.is_some());
+            assert_eq!(
+                serde_json::to_value(cold.value).unwrap(),
+                serde_json::to_value(warm.value).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn cluster_assessment_rejects_a_different_finite_cached_source_eigenvalue() {
+    let dir = xc_core::test_support::TestDir::new("cluster-source-eigenvalue-tamper");
+    let (state, matrix, input) = cluster_assessment_fixture(128, "0.1");
+    let mut options = ExtensionOptions::for_source(&state);
+    options.working_precision_bits = 192;
+    let producer = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(FilesystemCacheStore::new(
+            "authentic",
+            dir.join("authentic"),
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let mut cache = ArtifactCacheContext {
+        resolver: Some(&producer),
+        acceptance: Some(&policy),
+        ordered_overlays: vec!["authentic".into()],
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        ..context()
+    };
+    let cold = capture_extended(
+        "spectral_cluster",
+        &state,
+        Some(&matrix),
+        None,
+        Some(&input),
+        &options,
+        &[],
+        &cache,
+    )
+    .unwrap();
+    let manifest = cold.produced_manifest.as_ref().unwrap();
+    cache.mode = ArtifactExecutionCacheMode::RequireReuse;
+    cache.write_on_miss = false;
+    let warm = capture_extended(
+        "spectral_cluster",
+        &state,
+        Some(&matrix),
+        None,
+        Some(&input),
+        &options,
+        &[],
+        &cache,
+    )
+    .unwrap();
+    assert!(warm.reused_manifest.is_some());
+    assert_eq!(
+        serde_json::to_value(&cold.value).unwrap(),
+        serde_json::to_value(warm.value).unwrap()
+    );
+    // Keep the authentic cached report's input-admission identity. Change only
+    // this finite source value by one source-precision ULP, with valid hashes.
+    let mut foreign = serde_json::to_value(&cold.value).unwrap();
+    let mut wrong = Float::with_val(128, Float::parse("0.1").unwrap());
+    wrong.next_up();
+    foreign["data"]["values"]["retained_source_eigenvalue"] =
+        json!(xc_numerics::prefix::lossless_decimal(&wrong));
+    let store = FilesystemCacheStore::new(
+        "tampered",
+        dir.join("tampered"),
+        true,
+        CacheVisibility::Local,
+    );
+    store
+        .put(
+            &ArtifactDraft {
+                schema_version: manifest.schema_version,
+                key: manifest.key.clone(),
+                producer_toolkit_version: manifest.producer_toolkit_version.clone(),
+                minimum_reader_version: manifest.minimum_reader_version.clone(),
+                maximum_reader_version: manifest.maximum_reader_version.clone(),
+                quality: manifest.quality,
+                visibility: manifest.visibility,
+                immutable: true,
+                dependencies: manifest.dependencies.clone(),
+                tags: manifest.tags.clone(),
+                provenance_digest: manifest.provenance_digest.clone(),
+            },
+            &serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+    let resolver = CacheResolver::new(vec![
+        CacheLayer {
+            precedence: 0,
+            store: Box::new(store),
+        },
+        // Input admission must reuse the original authenticated input artifact
+        // before the altered analysis is looked up in the first layer.
+        CacheLayer {
+            precedence: 1,
+            store: Box::new(FilesystemCacheStore::new(
+                "authentic",
+                dir.join("authentic"),
+                false,
+                CacheVisibility::Local,
+            )),
+        },
+    ]);
+    let resolved = resolver.resolve(&manifest.key, &policy).unwrap();
+    assert_eq!(resolved.layer_name, "tampered");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&resolved.payload).unwrap(),
+        foreign
+    );
+    cache.resolver = Some(&resolver);
+    cache.ordered_overlays = vec!["tampered".into(), "authentic".into()];
+    cache.mode = ArtifactExecutionCacheMode::RequireReuse;
+    cache.write_on_miss = false;
+    let error = capture_extended(
+        "spectral_cluster",
+        &state,
+        Some(&matrix),
+        None,
+        Some(&input),
+        &options,
+        &[],
+        &cache,
+    )
+    .err()
+    .expect("a changed finite source eigenvalue must be rejected");
+    assert!(
+        format!("{error:#}").contains("invalid unresolved cluster assessment"),
+        "the changed finite value must reach domain validation: {error:#}"
+    );
+}
 #[test]
 fn energy_allowance_never_divides_by_invalid_margin() {
     let (s, m, _) = fixture();

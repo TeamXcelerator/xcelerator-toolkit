@@ -628,7 +628,11 @@ pub mod hp {
         if maximum_kernel_residual > *validation_tolerance {
             return Err(hp_invalid(format!(
                 "shifted Weil metric does not annihilate the supplied state (residual {})",
-                maximum_kernel_residual.to_string_radix(10, Some(20))
+                xc_numerics::fmt::decimal_string_round(
+                    &maximum_kernel_residual,
+                    Some(20),
+                    rug::float::Round::Nearest
+                )
             )));
         }
 
@@ -737,7 +741,11 @@ pub mod hp {
         if maximum > *tolerance {
             return Err(hp_invalid(format!(
                 "{name} asymmetry {} exceeds validation tolerance",
-                maximum.to_string_radix(10, Some(20))
+                xc_numerics::fmt::decimal_string_round(
+                    &maximum,
+                    Some(20),
+                    rug::float::Round::Nearest
+                )
             )));
         }
         Ok(maximum)

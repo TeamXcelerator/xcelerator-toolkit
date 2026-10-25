@@ -65,6 +65,43 @@ pub struct NumericalCoverage {
     pub reason: Option<String>,
     pub recovery: Option<String>,
 }
+/// Checked cardinalities for typed diagnostic producers. JSON compatibility
+/// adapters must pass through this boundary before classifying missing rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoverageCounts {
+    retained: usize,
+    resolved: usize,
+    qualified: usize,
+    unresolved: usize,
+}
+impl CoverageCounts {
+    pub fn new(retained: usize, resolved: usize, qualified: usize) -> Result<Self, CacheError> {
+        let unresolved = retained
+            .checked_sub(resolved)
+            .and_then(|n| n.checked_sub(qualified))
+            .ok_or_else(|| {
+                CacheError::InvalidManifest("coverage counts exceed retained rows".into())
+            })?;
+        Ok(Self {
+            retained,
+            resolved,
+            qualified,
+            unresolved,
+        })
+    }
+    pub fn retained(self) -> usize {
+        self.retained
+    }
+    pub fn resolved(self) -> usize {
+        self.resolved
+    }
+    pub fn qualified(self) -> usize {
+        self.qualified
+    }
+    pub fn unresolved(self) -> usize {
+        self.unresolved
+    }
+}
 impl NumericalCoverage {
     pub fn from_value(value: &serde_json::Value) -> Self {
         let data = value.get("data").unwrap_or(value);
@@ -76,6 +113,22 @@ impl NumericalCoverage {
                 .and_then(|n| n.try_into().ok()),
             ..Self::default()
         };
+        if data.get("signed_unit_overlap").is_some() {
+            let basis = data["rhs"].as_array().map_or(0, Vec::len);
+            let fitted = data["coefficients"].as_array().map_or(0, Vec::len);
+            if fitted != 0 && fitted != basis {
+                result.retained_rows = 1 + basis;
+                result.unresolved_rows = result.retained_rows;
+                result
+                    .row_outcomes
+                    .insert("unassessed".into(), result.retained_rows);
+                result.reason =
+                    Some("invalid coverage: fit coefficient and basis cardinalities differ".into());
+                result.recovery =
+                    Some("validate the measurement schema before assessing coverage".into());
+                return result;
+            }
+        }
         if let Some(rows) = data["rows"].as_array() {
             result.retained_rows = rows.len();
             for row in rows {
@@ -104,10 +157,25 @@ impl NumericalCoverage {
         let mut outcome_override = None;
         if data["rows"].as_array().is_none_or(|rows| rows.is_empty()) {
             if let Some(shape) = shape_rows(data) {
+                let counts = CoverageCounts::new(shape.retained, shape.resolved, shape.qualified);
+                if let Some(reason) = shape.invalid_reason.or_else(|| {
+                    counts.as_ref().err().map(|_| {
+                        "invalid coverage: resolved and qualified rows exceed retained rows"
+                    })
+                }) {
+                    result.retained_rows = shape.retained;
+                    result.unresolved_rows = shape.retained;
+                    result
+                        .row_outcomes
+                        .insert("unassessed".into(), shape.retained);
+                    result.reason = Some(reason.into());
+                    result.recovery = Some("validate the measurement schema and row cardinalities before assessing coverage".into());
+                    return result;
+                };
                 result.retained_rows = shape.retained;
                 result.resolved_rows = shape.resolved;
                 result.qualified_rows = shape.qualified;
-                result.unresolved_rows = shape.retained - shape.resolved - shape.qualified;
+                result.unresolved_rows = counts.expect("checked coverage counts").unresolved();
                 for (label, count) in [
                     (shape.outcome, shape.resolved),
                     ("qualified", shape.qualified),
@@ -184,6 +252,8 @@ struct ShapeRows {
     qualified: usize,
     /// Outcome of a resolved row.
     outcome: &'static str,
+    /// Invalid children must not be canceled by another child's unresolved rows.
+    invalid_reason: Option<&'static str>,
 }
 
 fn shape(
@@ -197,6 +267,9 @@ fn shape(
         resolved,
         qualified,
         outcome,
+        invalid_reason: CoverageCounts::new(retained, resolved, qualified)
+            .err()
+            .map(|_| "invalid coverage: resolved and qualified rows exceed retained rows"),
     })
 }
 
@@ -235,17 +308,36 @@ fn shape_rows(data: &serde_json::Value) -> Option<ShapeRows> {
             resolved: 0,
             qualified: 0,
             outcome: "point_measurement",
+            invalid_reason: None,
         };
+        let mut recognized = true;
+        let mut same_outcome = true;
         for (index, item) in items.iter().enumerate() {
-            let rows = shape_rows(item)?;
+            let Some(rows) = shape_rows(item) else {
+                recognized = false;
+                continue;
+            };
             if index == 0 {
                 total.outcome = rows.outcome;
             } else if total.outcome != rows.outcome {
-                return None;
+                same_outcome = false;
             }
-            total.retained += rows.retained;
-            total.resolved += rows.resolved;
-            total.qualified += rows.qualified;
+            total.invalid_reason = total.invalid_reason.or(rows.invalid_reason);
+            for (sum, count) in [
+                (&mut total.retained, rows.retained),
+                (&mut total.resolved, rows.resolved),
+                (&mut total.qualified, rows.qualified),
+            ] {
+                if let Some(combined) = sum.checked_add(count) {
+                    *sum = combined;
+                } else {
+                    *sum = usize::MAX;
+                    total.invalid_reason = Some("invalid coverage: row cardinalities overflow");
+                }
+            }
+        }
+        if total.invalid_reason.is_none() && (!recognized || !same_outcome) {
+            return None;
         }
         return Some(total);
     }
@@ -272,6 +364,18 @@ fn shape_rows(data: &serde_json::Value) -> Option<ShapeRows> {
         // when a fit basis was supplied; a requested fit that did not solve is
         // unresolved.
         let basis = data["rhs"].as_array().map_or(0, Vec::len);
+        let fitted_count = data["coefficients"].as_array().map_or(0, Vec::len);
+        if fitted_count != 0 && fitted_count != basis {
+            return Some(ShapeRows {
+                retained: 1 + basis,
+                resolved: 0,
+                qualified: 0,
+                outcome: "point_measurement",
+                invalid_reason: Some(
+                    "invalid coverage: fit coefficient and basis cardinalities differ",
+                ),
+            });
+        }
         let overlap = usize::from(strings(
             data,
             &["signed_unit_overlap", "difference_norm_squared"],
@@ -291,12 +395,19 @@ fn shape_rows(data: &serde_json::Value) -> Option<ShapeRows> {
             .iter()
             .filter(|key| data[**key].as_bool() == Some(true))
             .count();
-        return shape(
-            rows.retained + verdicts.len(),
-            rows.resolved + met,
+        let retained = rows.retained.checked_add(verdicts.len());
+        let resolved = rows.resolved.checked_add(met);
+        let mut combined = shape(
+            retained.unwrap_or(usize::MAX),
+            resolved.unwrap_or(usize::MAX),
             rows.qualified,
             rows.outcome,
-        );
+        )?;
+        combined.invalid_reason = rows.invalid_reason.or(combined.invalid_reason);
+        if retained.is_none() || resolved.is_none() {
+            combined.invalid_reason = Some("invalid coverage: row cardinalities overflow");
+        }
+        return Some(combined);
     }
     if let Some(rows) = data["refinements"].as_array() {
         let resolved = count(rows, |row| row["tolerance_met"].as_bool() == Some(true));
@@ -386,11 +497,22 @@ fn shape_rows(data: &serde_json::Value) -> Option<ShapeRows> {
     if let (Some(points), Some(missing)) =
         (data["points"].as_array(), data["missing_count"].as_u64())
     {
-        let missing = usize::try_from(missing).ok()?;
+        let Some(retained) = usize::try_from(missing)
+            .ok()
+            .and_then(|missing| points.len().checked_add(missing))
+        else {
+            return Some(ShapeRows {
+                retained: usize::MAX,
+                resolved: 0,
+                qualified: 0,
+                outcome: "point_measurement",
+                invalid_reason: Some("invalid coverage: row cardinalities overflow"),
+            });
+        };
         let resolved = count(points, |row| {
             row["source_status"].as_str() == Some(CONVERGED)
         });
-        return shape(points.len() + missing, resolved, 0, "point_measurement");
+        return shape(retained, resolved, 0, "point_measurement");
     }
     if let (Some(rows), true) = (
         data["outcomes"].as_array(),
@@ -1898,6 +2020,132 @@ mod tests {
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
+    #[test]
+    fn inconsistent_fit_cardinality_is_unassessed_without_panicking() {
+        assert!(CoverageCounts::new(usize::MAX, usize::MAX, 1).is_err());
+        assert!(CoverageCounts::new(0, 1, 0).is_err());
+        assert_eq!(CoverageCounts::new(7, 3, 2).unwrap().unresolved(), 2);
+        for (rhs, coefficients) in [(vec![], vec!["1"]), (vec!["1", "2"], vec!["1"])] {
+            let value = serde_json::json!({"signed_unit_overlap":"1", "difference_norm_squared":"0", "rhs":rhs, "coefficients":coefficients});
+            let coverage = NumericalCoverage::from_value(&value);
+            assert_eq!(coverage.outcome, "unassessed");
+            assert_eq!(coverage.resolved_rows, 0);
+            assert_eq!(coverage.unresolved_rows, coverage.retained_rows);
+            assert!(coverage.reason.unwrap().contains("cardinalities"));
+        }
+    }
+
+    #[test]
+    fn nested_invalid_fit_cannot_be_canceled_by_unresolved_rows() {
+        let invalid = serde_json::json!({
+            "signed_unit_overlap":"1", "difference_norm_squared":"0",
+            "rhs":[], "coefficients":["1"]
+        });
+        let unsolved = serde_json::json!({
+            "signed_unit_overlap":"1", "difference_norm_squared":"0",
+            "rhs":["1"], "coefficients":[]
+        });
+        for items in [
+            serde_json::json!([invalid.clone(), unsolved.clone()]),
+            serde_json::json!([unsolved, invalid.clone()]),
+        ] {
+            let wrapped = serde_json::json!({
+                "outcome":"point_measurement",
+                "reported_resolution_tolerance_met":true,
+                "refinement_ladder_tolerance_met":true,
+                "retained_evidence":items.clone()
+            });
+            for (value, retained) in [(items, 3), (wrapped, 5)] {
+                let coverage = NumericalCoverage::from_value(&value);
+                assert_eq!(coverage.outcome, "unassessed");
+                assert_eq!(coverage.retained_rows, retained);
+                assert_eq!(coverage.resolved_rows, 0);
+                assert_eq!(coverage.qualified_rows, 0);
+                assert_eq!(coverage.unresolved_rows, retained);
+                assert!(coverage.reason.unwrap().contains("cardinalities"));
+            }
+        }
+        // Unknown or differently classified siblings cannot hide invalid evidence.
+        for sibling in [
+            serde_json::json!({"unknown":true}),
+            serde_json::json!({
+                "certifies_finite_ground_state_simple":true,
+                "certifies_finite_matrix_positive_definite":true
+            }),
+        ] {
+            let value = serde_json::json!([sibling, invalid.clone()]);
+            let coverage = NumericalCoverage::from_value(&value);
+            assert_eq!(coverage.outcome, "unassessed");
+            assert_eq!(coverage.resolved_rows, 0);
+            assert!(coverage.reason.unwrap().contains("cardinalities"));
+        }
+    }
+
+    #[test]
+    fn valid_nested_fit_coverage_is_preserved() {
+        let fit = |rhs, coefficients| {
+            serde_json::json!({
+                "signed_unit_overlap":"1", "difference_norm_squared":"0",
+                "rhs":rhs, "coefficients":coefficients
+            })
+        };
+        for (coefficients, outcome, resolved, unresolved) in [
+            (serde_json::json!(["1"]), "point_measurement", 3, 0),
+            (serde_json::json!([]), "partial_unresolved", 2, 1),
+            (serde_json::Value::Null, "partial_unresolved", 2, 1),
+        ] {
+            let items = serde_json::json!([
+                fit(serde_json::json!([]), serde_json::json!([])),
+                fit(serde_json::json!(["1"]), coefficients)
+            ]);
+            let wrapped = serde_json::json!({
+                "reported_resolution_tolerance_met":true,
+                "refinement_ladder_tolerance_met":true,
+                "retained_evidence":items.clone()
+            });
+            for (value, extra) in [(items, 0), (wrapped, 2)] {
+                let coverage = NumericalCoverage::from_value(&value);
+                assert_eq!(coverage.outcome, outcome);
+                assert_eq!(coverage.retained_rows, 3 + extra);
+                assert_eq!(coverage.resolved_rows, resolved + extra);
+                assert_eq!(coverage.qualified_rows, 0);
+                assert_eq!(coverage.unresolved_rows, unresolved);
+                assert!(coverage.reason.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn overflowing_coverage_cardinalities_are_unassessed() {
+        let maximum = serde_json::json!({"points":[], "missing_count":usize::MAX});
+        let value = NumericalCoverage::from_value(&maximum);
+        assert_eq!(value.outcome, "partial_unresolved");
+        assert_eq!(value.retained_rows, usize::MAX);
+        assert_eq!(value.unresolved_rows, usize::MAX);
+        for value in [
+            serde_json::json!({
+                "points":[{"source_status":"converged"}], "missing_count":u64::MAX
+            }),
+            serde_json::json!([
+                maximum.clone(),
+                {"points":[{"source_status":"converged"}], "missing_count":0}
+            ]),
+            serde_json::json!({
+                "outcome":"point_measurement",
+                "reported_resolution_tolerance_met":true,
+                "refinement_ladder_tolerance_met":true,
+                "retained_evidence":maximum
+            }),
+        ] {
+            let coverage = NumericalCoverage::from_value(&value);
+            assert_eq!(coverage.outcome, "unassessed");
+            assert_eq!(coverage.resolved_rows, 0);
+            assert_eq!(coverage.qualified_rows, 0);
+            assert_eq!(coverage.unresolved_rows, coverage.retained_rows);
+            assert!(coverage.reason.unwrap().contains("cardinalities overflow"));
+        }
+    }
+
     #[test]
     fn acquired_rows_are_not_automatically_resolved() {
         let c = NumericalCoverage::from_value(

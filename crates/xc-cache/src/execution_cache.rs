@@ -523,6 +523,7 @@ struct CompletedManagedPublicationKey {
     target: xc_core::PublicationTarget,
     manifest_digest: ContentDigest,
     transport_digest: ContentDigest,
+    assessment_digest: ContentDigest,
 }
 
 fn completed_managed_publications() -> &'static Mutex<BTreeSet<CompletedManagedPublicationKey>> {
@@ -549,6 +550,15 @@ fn pending_publication_closure(
     let mut keep = Vec::with_capacity(staged.len());
     for draft in &staged {
         keep.push(!completed(draft)?);
+    }
+    // No closure walk is needed when every input is new, or when the previous
+    // publication completed every input. This also avoids repeatedly building
+    // an identity graph for the cumulative set after a no-op finalization.
+    if keep.iter().all(|keep| *keep) {
+        return Ok(staged);
+    }
+    if keep.iter().all(|keep| !*keep) {
+        return Ok(Vec::new());
     }
     let mut by_identity = BTreeMap::new();
     for (index, draft) in staged.iter().enumerate() {
@@ -599,12 +609,18 @@ fn managed_publication_key(
     repository_owner: &str,
     target: xc_core::PublicationTarget,
 ) -> Result<CompletedManagedPublicationKey, CacheError> {
+    let facts = crate::production_staging::authenticated_draft_facts(draft)?;
     Ok(CompletedManagedPublicationKey {
         staging_root: staging_root.to_path_buf(),
         repository_owner: repository_owner.to_owned(),
         target,
-        manifest_digest: draft.manifest.digest()?,
-        transport_digest: draft.encoding.digest()?,
+        manifest_digest: facts.manifest_digest,
+        transport_digest: facts.transport_digest,
+        assessment_digest: crate::canonical_digest(&(
+            draft.achieved_assurance,
+            draft.required_assurance,
+            &draft.assurance_evidence_digests,
+        ))?,
     })
 }
 
@@ -974,10 +990,7 @@ impl ManagedArtifactCacheSession {
                     .to_owned(),
             ));
         }
-        let maximum_bytes = resources
-            .maximum_memory_bytes
-            .unwrap_or(8u64 << 30)
-            .min(8u64 << 30);
+        let maximum_bytes = resources.maximum_memory_bytes.unwrap_or(8u64 << 30);
         let ephemeral = crate::EphemeralCacheStore::new(maximum_bytes)?;
         let mut layers = vec![crate::CacheLayer {
             precedence: 0,
@@ -986,15 +999,18 @@ impl ManagedArtifactCacheSession {
         if consults {
             layers.push(crate::CacheLayer {
                 precedence: 1,
-                store: Box::new(crate::ephemeral_store::ReadOnlyBudgetedStore::new(
-                    Box::new(crate::ZipJsonFilesystemCacheStore::new(
-                        "workstation",
-                        &config.cache_root,
-                        false,
-                        CacheVisibility::Local,
-                    )),
-                    maximum_bytes,
-                )),
+                store: Box::new(
+                    crate::ephemeral_store::ReadOnlyBudgetedStore::with_streaming_limits(
+                        Box::new(crate::ZipJsonFilesystemCacheStore::new(
+                            "workstation",
+                            &config.cache_root,
+                            false,
+                            CacheVisibility::Local,
+                        )),
+                        maximum_bytes,
+                        resources.maximum_temporary_disk_bytes,
+                    ),
+                ),
             });
         }
         // Clear all persistent sinks before construction; do not create an
@@ -1124,7 +1140,15 @@ impl ManagedArtifactCacheSession {
         )
     }
 
+    #[cfg(test)]
     fn pending_staged_drafts(&self) -> Result<Vec<crate::CanonicalProductionDraft>, CacheError> {
+        self.pending_staged_drafts_from(self.staged_drafts()?)
+    }
+
+    fn pending_staged_drafts_from(
+        &self,
+        staged: Vec<crate::CanonicalProductionDraft>,
+    ) -> Result<Vec<crate::CanonicalProductionDraft>, CacheError> {
         let Some(sink) = &self.production_sink else {
             return Ok(Vec::new());
         };
@@ -1133,7 +1157,7 @@ impl ManagedArtifactCacheSession {
                 "managed publication completion registry lock was poisoned".to_owned(),
             )
         })?;
-        pending_publication_closure(self.staged_drafts()?, |draft| {
+        pending_publication_closure(staged, |draft| {
             Ok(completed.contains(&managed_publication_key(
                 draft,
                 sink.staging_root(),
@@ -1170,6 +1194,13 @@ impl ManagedArtifactCacheSession {
     /// enabled remote mutation, executes every eligible draft through the
     /// toolkit-owned resumable GitHub publisher before returning.
     pub fn finalize_publication_inventory(&self) -> Result<Option<PathBuf>, CacheError> {
+        self.finalize_publication_inventory_from_staging(false)
+    }
+
+    fn finalize_publication_inventory_from_staging(
+        &self,
+        explicitly_retry_retained: bool,
+    ) -> Result<Option<PathBuf>, CacheError> {
         if self.output_validation.is_some() {
             return if crate::output_validation_claim_scope_is_active()? {
                 crate::checkpoint_output_validation_run().map(Some)
@@ -1181,7 +1212,10 @@ impl ManagedArtifactCacheSession {
             return Ok(None);
         };
         let observed_artifact_count = sink.observed_artifact_count()?;
-        if self.execute_remote_mutations && observed_artifact_count == 0 {
+        if self.execute_remote_mutations
+            && observed_artifact_count == 0
+            && !explicitly_retry_retained
+        {
             return Err(CacheError::InvalidTransition(format!(
                 "publication execution observed no artifacts in this process; refusing a vacuous success from staging root {}",
                 sink.staging_root().display()
@@ -1192,7 +1226,23 @@ impl ManagedArtifactCacheSession {
         // but do not repeat successful GitHub orchestration later in the same
         // process. The registry is intentionally process-local: a restarted
         // process sees every staged draft and safely resumes from its journals.
-        let pending_drafts = self.pending_staged_drafts()?;
+        let staged = self.staged_drafts()?;
+        let inventory = crate::build_managed_publication_inventory(
+            &staged,
+            self.publication_target,
+            &self.repository_owner,
+            self.profile,
+            self.requested_assurance,
+            self.certification_failure_policy,
+            self.execute_remote_mutations,
+        )?;
+        let pending_drafts = if explicitly_retry_retained {
+            // An explicit retry refreshes mutable remote state even if this
+            // process previously completed these exact staged descriptors.
+            staged
+        } else {
+            self.pending_staged_drafts_from(staged)?
+        };
         let pending_inventory = crate::build_managed_publication_inventory(
             &pending_drafts,
             self.publication_target,
@@ -1204,7 +1254,6 @@ impl ManagedArtifactCacheSession {
         )?;
         // The durable inventory remains cumulative and therefore describes
         // the complete run. Only remote execution is filtered to pending work.
-        let inventory = self.publication_inventory()?;
         let path = sink.staging_root().join("publication-inventory.json");
         let bytes = serde_json::to_vec_pretty(&inventory)?;
         crate::atomic_replace(&path, &bytes)?;
@@ -2770,7 +2819,7 @@ where
 }
 
 /// Identity of every input other than the payload bytes that a domain
-/// validator reads, for [`resolve_or_compute_json_artifact_memoized`].
+/// validator reads, for [`resolve_or_compute_json_artifact_shared`].
 ///
 /// A retained runtime value is reused only for byte-identical payloads
 /// validated under one of the contexts named here. Callers must name every
@@ -2799,180 +2848,11 @@ impl ValidatedValueMemoContext {
     }
 }
 
-/// Logical payload bytes whose validated runtime values one process retains.
-/// Eviction only causes a later use to decode and validate again.
-const VALIDATED_VALUE_MEMO_MAXIMUM_PAYLOAD_BYTES: u64 = 4 << 30;
+#[path = "validated_memo.rs"]
+mod validated_memo;
+use validated_memo::ValidatedValueMemoBinding;
+pub use validated_memo::*;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ValidatedValueMemoKey {
-    payload_type: std::any::TypeId,
-    value_type: std::any::TypeId,
-    artifact: ArtifactKey,
-    payload_digest: ContentDigest,
-    context: String,
-}
-
-struct ValidatedValueMemoEntry {
-    value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
-    payload_bytes: u64,
-    sequence: u64,
-}
-
-#[derive(Default)]
-struct ValidatedValueMemo {
-    entries: std::collections::HashMap<ValidatedValueMemoKey, ValidatedValueMemoEntry>,
-    recency: BTreeMap<u64, ValidatedValueMemoKey>,
-    retained_payload_bytes: u64,
-    next_sequence: u64,
-}
-
-static VALIDATED_VALUE_MEMO: OnceLock<Mutex<ValidatedValueMemo>> = OnceLock::new();
-
-thread_local! {
-    static VALIDATED_VALUE_MEMO_THREAD_STATISTICS: std::cell::Cell<ValidatedValueMemoStatistics> =
-        const { std::cell::Cell::new(ValidatedValueMemoStatistics { hits: 0, insertions: 0 }) };
-}
-
-/// Validated-value memo activity on the calling thread. Diagnostic only.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ValidatedValueMemoStatistics {
-    pub hits: u64,
-    pub insertions: u64,
-}
-
-#[doc(hidden)]
-pub fn validated_value_memo_thread_statistics() -> ValidatedValueMemoStatistics {
-    VALIDATED_VALUE_MEMO_THREAD_STATISTICS.with(std::cell::Cell::get)
-}
-
-fn record_validated_value_memo_event(hit: bool) {
-    VALIDATED_VALUE_MEMO_THREAD_STATISTICS.with(|statistics| {
-        let mut current = statistics.get();
-        if hit {
-            current.hits += 1;
-        } else {
-            current.insertions += 1;
-        }
-        statistics.set(current);
-    });
-}
-
-/// Memo binding for one execution: the decoded payload type, the runtime
-/// value type and the validator contexts. Built only by the memoized entry
-/// point, where both types are known to be `'static`.
-struct ValidatedValueMemoBinding<'a> {
-    payload_type: std::any::TypeId,
-    context: &'a ValidatedValueMemoContext,
-}
-
-impl ValidatedValueMemoBinding<'_> {
-    fn key(
-        &self,
-        value_type: std::any::TypeId,
-        artifact: &ArtifactKey,
-        payload_digest: &ContentDigest,
-        context: &str,
-    ) -> ValidatedValueMemoKey {
-        ValidatedValueMemoKey {
-            payload_type: self.payload_type,
-            value_type,
-            artifact: artifact.clone(),
-            payload_digest: payload_digest.clone(),
-            context: context.to_owned(),
-        }
-    }
-
-    /// Return a value previously validated from exactly these payload bytes
-    /// under this call's reuse context or a stronger one.
-    fn lookup<R: Clone + Send + Sync + 'static>(
-        &self,
-        artifact: &ArtifactKey,
-        payload_digest: &ContentDigest,
-    ) -> Option<R> {
-        let memo = VALIDATED_VALUE_MEMO.get()?;
-        let retained = {
-            let mut memo = memo.lock().ok()?;
-            let memo = &mut *memo;
-            let found = std::iter::once(&self.context.reuse)
-                .chain(&self.context.stronger)
-                .map(|context| {
-                    self.key(
-                        std::any::TypeId::of::<R>(),
-                        artifact,
-                        payload_digest,
-                        context,
-                    )
-                })
-                .find(|key| memo.entries.contains_key(key))?;
-            let sequence = memo.next_sequence;
-            memo.next_sequence += 1;
-            let entry = memo.entries.get_mut(&found)?;
-            memo.recency.remove(&entry.sequence);
-            entry.sequence = sequence;
-            memo.recency.insert(sequence, found);
-            entry.value.clone()
-        };
-        let value = retained.downcast::<R>().ok()?.as_ref().clone();
-        record_validated_value_memo_event(true);
-        Some(value)
-    }
-
-    /// Retain a value that the domain validator accepted for exactly these
-    /// payload bytes under `context`.
-    fn insert<R: Clone + Send + Sync + 'static>(
-        &self,
-        artifact: &ArtifactKey,
-        payload_digest: &ContentDigest,
-        payload_bytes: u64,
-        context: &str,
-        value: &R,
-    ) {
-        if payload_bytes > VALIDATED_VALUE_MEMO_MAXIMUM_PAYLOAD_BYTES {
-            return;
-        }
-        let key = self.key(
-            std::any::TypeId::of::<R>(),
-            artifact,
-            payload_digest,
-            context,
-        );
-        let memo = VALIDATED_VALUE_MEMO.get_or_init(|| Mutex::new(ValidatedValueMemo::default()));
-        let Ok(mut memo) = memo.lock() else {
-            return;
-        };
-        let memo = &mut *memo;
-        if memo.entries.contains_key(&key) {
-            return;
-        }
-        while memo.retained_payload_bytes + payload_bytes
-            > VALIDATED_VALUE_MEMO_MAXIMUM_PAYLOAD_BYTES
-        {
-            let Some((_, oldest)) = memo.recency.pop_first() else {
-                break;
-            };
-            if let Some(evicted) = memo.entries.remove(&oldest) {
-                memo.retained_payload_bytes -= evicted.payload_bytes;
-            }
-        }
-        let sequence = memo.next_sequence;
-        memo.next_sequence += 1;
-        memo.recency.insert(sequence, key.clone());
-        memo.entries.insert(
-            key,
-            ValidatedValueMemoEntry {
-                value: std::sync::Arc::new(value.clone()),
-                payload_bytes,
-                sequence,
-            },
-        );
-        memo.retained_payload_bytes += payload_bytes;
-        record_validated_value_memo_event(false);
-    }
-}
-
-/// Decode a reused payload into the stable representation that the domain
-/// validator checks and the caller receives.
 fn decode_reused_json_payload<T>(payload: &[u8]) -> Result<T, CacheError>
 where
     T: Serialize + DeserializeOwned,
@@ -3010,21 +2890,11 @@ enum ValidatedExecutionValue<T, R> {
     Retained(R),
 }
 
-/// Memoized form of [`resolve_or_compute_json_artifact_with_dependencies`]
-/// for large payloads whose decoding and validation dominate a reuse.
-///
-/// `validate` returns the runtime value derived from the validated payload.
-/// After it succeeds, that value is retained in a bounded process-local memo
-/// keyed by the artifact key, the SHA-256 of the exact logical payload bytes
-/// computed in this process, both value types and the validator context. A
-/// later reuse of byte-identical payload bytes under a matching context
-/// returns the retained value instead of decoding and validating again.
-/// Failures are never retained and nothing is persisted.
-///
-/// Manifest selection, the verified payload read, access provenance, remote
-/// adoption, production-sink staging and cache reporting run on every call
-/// exactly as in the unmemoized form. A memo hit and a miss return equal
-/// values; scheduling can change only which of the two occurs.
+/// Compatibility entry point returning an owned validated value.
+/// This legacy API has no runtime-size estimate and therefore retains no hidden
+/// copies. Use [`resolve_or_compute_json_artifact_shared`] inside an explicit
+/// [`ValidatedValueMemo`] scope for bounded, allocation-sharing reuse. Manifest
+/// verification, provenance, and validation remain unchanged.
 pub fn resolve_or_compute_json_artifact_memoized<T, R, Compute, Validate>(
     request: &ArtifactExecutionCacheRequest<'_>,
     context: &ValidatedValueMemoContext,
@@ -3037,13 +2907,12 @@ where
     Compute: FnOnce() -> Result<(T, Vec<crate::DependencyRef>), CacheError>,
     Validate: Fn(&T) -> Result<R, CacheError>,
 {
-    let binding = ValidatedValueMemoBinding {
-        payload_type: std::any::TypeId::of::<T>(),
-        context,
-    };
+    // The owned compatibility API cannot account for arbitrary heap graphs.
+    // Retention is explicit through the shared API and its runtime estimator.
+    let _ = context;
     let result = resolve_or_compute_json_artifact_core(
         request,
-        Some(&binding),
+        None,
         || {
             compute().map(|(value, dependencies)| {
                 (value, dependencies, ArtifactProductionAssessment::default())
@@ -3919,6 +3788,120 @@ mod tests {
     }
 
     #[test]
+    fn read_only_session_honors_large_explicit_budget_without_allocating_payload() {
+        use crate::CacheStore;
+        let scratch = crate::test_support::TestDir::new("read-only-large-budget");
+        let root = scratch.join("absent");
+        let mut config = managed_verify_config(&root, "comparison");
+        config.output_validation = None;
+        config.cache_mode = ArtifactExecutionCacheMode::RequireReuse;
+        let resources = xc_core::ResourcePolicy {
+            maximum_memory_bytes: Some(128u64 << 30),
+            ..xc_core::ResourcePolicy::default()
+        };
+        let session = ManagedArtifactCacheSession::new_read_only(config, resources).unwrap();
+        assert_eq!(session.resources().maximum_memory_bytes, Some(128u64 << 30));
+        let ephemeral = crate::EphemeralCacheStore::new(16_384).unwrap();
+        let draft = ArtifactDraft {
+            schema_version: 1,
+            key: ArtifactKey::new("fixture", "large-read-fixture", b"input").unwrap(),
+            producer_toolkit_version: crate::current_toolkit_version().unwrap(),
+            minimum_reader_version: crate::current_toolkit_version().unwrap(),
+            maximum_reader_version: None,
+            quality: CacheQuality::Validated,
+            visibility: CacheVisibility::Local,
+            immutable: true,
+            dependencies: Vec::new(),
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+        };
+        let mut manifest = ephemeral.put(&draft, b"fixture").unwrap();
+        manifest.size_bytes = 20u64 << 30;
+        manifest.objects[0].size_bytes = 20u64 << 30;
+        manifest
+            .tags
+            .insert("xc_storage_encoding".into(), "zip-json-entry-v1".into());
+        manifest.validate().unwrap();
+        // A streaming metadata-only probe reaches the missing underlying file;
+        // the former 8 GiB clamp rejected it before consulting that file.
+        let overlay = &session.resolver.layers[1].store;
+        let error = overlay
+            .open_payload(&manifest, &scratch.join("spool"), 20u64 << 30)
+            .expect_err("missing object must fail");
+        assert!(matches!(error, CacheError::NotFound(_)), "{error}");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn read_only_session_streams_above_memory_with_explicit_disk_and_caller_limits() {
+        use crate::CacheStore;
+        let scratch = crate::test_support::TestDir::new("read-only-streaming-policy");
+        let root = scratch.join("absent");
+        let resources = xc_core::ResourcePolicy::default();
+        assert_eq!(resources.maximum_memory_bytes, Some(16u64 << 30));
+        assert_eq!(resources.maximum_temporary_disk_bytes, Some(100u64 << 30));
+        assert!(!resources.allow_out_of_core);
+        let ephemeral = crate::EphemeralCacheStore::new(16_384).unwrap();
+        let draft = ArtifactDraft {
+            schema_version: 1,
+            key: ArtifactKey::new("fixture", "stream-policy", b"input").unwrap(),
+            producer_toolkit_version: crate::current_toolkit_version().unwrap(),
+            minimum_reader_version: crate::current_toolkit_version().unwrap(),
+            maximum_reader_version: None,
+            quality: CacheQuality::Validated,
+            visibility: CacheVisibility::Local,
+            immutable: true,
+            dependencies: Vec::new(),
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+        };
+        let mut manifest = ephemeral.put(&draft, b"fixture").unwrap();
+        manifest.size_bytes = 25u64 << 30;
+        manifest.objects[0].size_bytes = 12u64 << 30;
+        manifest
+            .tags
+            .insert("xc_storage_encoding".into(), "zip-json-entry-v1".into());
+        for (index, (memory, disk, caller, admitted)) in [
+            (16u64 << 30, 100u64 << 30, 25u64 << 30, true),
+            (16u64 << 30, 1u64 << 30, 25u64 << 30, false),
+            (1u64 << 20, 100u64 << 30, 25u64 << 30, false),
+            (16u64 << 30, 100u64 << 30, 24u64 << 30, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut config = managed_verify_config(&root, "comparison");
+            config.output_validation = None;
+            config.cache_mode = ArtifactExecutionCacheMode::RequireReuse;
+            let session = ManagedArtifactCacheSession::new_read_only(
+                config,
+                xc_core::ResourcePolicy {
+                    maximum_memory_bytes: Some(memory),
+                    maximum_temporary_disk_bytes: Some(disk),
+                    ..resources.clone()
+                },
+            )
+            .unwrap();
+            let spool = scratch.join(format!("spool-{index}"));
+            let error = session.resolver.layers[1]
+                .store
+                .open_payload(&manifest, &spool, caller)
+                .expect_err("metadata-only missing-object probe cannot succeed");
+            if admitted {
+                assert!(matches!(error, CacheError::NotFound(_)), "{error}");
+                assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
+            } else {
+                assert!(matches!(error, CacheError::ResourceLimit(_)), "{error}");
+                assert!(
+                    !spool.exists(),
+                    "rejected metadata must not create scratch files"
+                );
+            }
+        }
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn read_only_session_policies_and_no_persistent_side_effects() {
         let scratch = crate::test_support::TestDir::new("r2-read-only-policy");
         let root = scratch.join("root").join("never-created");
@@ -4216,22 +4199,115 @@ mod tests {
     ) -> Result<ArtifactExecutionCacheResult<Vec<u64>>, CacheError> {
         let key = semantic_key();
         let policy = policy();
-        resolve_or_compute_json_artifact_memoized(
+        let result = resolve_or_compute_json_artifact_shared(
             &request(&key, resolver, &policy, mode),
             context,
             || Ok((vec![1u32, 2, 3], Vec::new())),
+            |value: &Vec<u32>| 64 + value.len() as u64 * 8,
             |value: &Vec<u32>| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(value.iter().map(|entry| u64::from(*entry) * 10).collect())
+                Ok(value
+                    .iter()
+                    .map(|entry| u64::from(*entry) * 10)
+                    .collect::<Vec<_>>())
             },
-        )
+        )?;
+        Ok(ArtifactExecutionCacheResult {
+            value: result.value.to_vec(),
+            access: result.access,
+            reused_manifest: result.reused_manifest,
+            produced_manifest: result.produced_manifest,
+        })
+    }
+
+    #[test]
+    fn shared_runtime_is_not_cloned_and_budget_tracks_expanded_heap() {
+        // Deliberately not Clone: a cache hit must share the allocation.
+        struct Heap {
+            bytes: Vec<u8>,
+            drops: std::sync::Arc<AtomicUsize>,
+        }
+        impl Drop for Heap {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let scratch = crate::test_support::TestDir::new("shared-runtime-heap");
+        let resolver = memo_fixture_resolver(&scratch.join("root"));
+        let key = semantic_key();
+        let policy = policy();
+        let request = request(
+            &key,
+            &resolver,
+            &policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let _resources = resources.enter();
+        let memo = ValidatedValueMemo::new(resources.clone(), 70_000);
+        let calls = AtomicUsize::new(0);
+        let drops = std::sync::Arc::new(AtomicUsize::new(0));
+        let resolve = |name: &str, estimate: u64| {
+            resolve_or_compute_json_artifact_shared(
+                &request,
+                &ValidatedValueMemoContext::exact(name),
+                || Ok((vec![1u32], Vec::new())),
+                |_| estimate,
+                |_: &Vec<u32>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Heap {
+                        bytes: vec![7; 65_536],
+                        drops: drops.clone(),
+                    })
+                },
+            )
+        };
+        {
+            let _memo = memo.enter();
+            let a = resolve("a", 65_600).unwrap().value;
+            let b = resolve("a", 65_600).unwrap().value;
+            assert!(a.ptr_eq(&b));
+            assert_eq!(a.bytes.len(), 65_536);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(resources.usage().retained_bytes, 66_112);
+            let other = resolve("b", 65_600).unwrap().value;
+            // The memo evicts a, but its live caller handles keep its reservation.
+            assert_eq!(memo.retained_bytes(), 66_112);
+            assert_eq!(resources.usage().retained_bytes, 132_224);
+            drop(a);
+            drop(b);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            drop(other);
+            memo.clear();
+            assert_eq!(resources.usage().retained_bytes, 0);
+            let before = calls.load(Ordering::SeqCst);
+            assert!(resolve("oversized-allocation", 2 << 20).is_err());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before,
+                "admission precedes allocation"
+            );
+        }
+        let before = calls.load(Ordering::SeqCst);
+        drop(resolve("outside", 65_600).unwrap());
+        drop(resolve("outside", 65_600).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), before + 2);
+        assert_eq!(resources.usage().retained_bytes, 0);
+        let tiny = ValidatedValueMemo::new(resources.clone(), 1024);
+        let _tiny = tiny.enter();
+        drop(resolve("too-large-for-memo", 65_600).unwrap());
+        assert_eq!(tiny.retained_bytes(), 0);
+        assert_eq!(resources.usage().retained_bytes, 0);
     }
 
     #[test]
     fn memoized_reuse_validates_each_payload_once_per_validator_context() {
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let memo = ValidatedValueMemo::new(resources, 1 << 20);
+        let _scope = memo.enter();
         let scratch = crate::test_support::TestDir::new("exec-cache-validated-memo");
         let resolver = memo_fixture_resolver(&scratch.join("root"));
-        // Contexts are unique to this test: the memo is process-wide.
+        // Contexts bind every non-payload validation input within this run.
         let context = ValidatedValueMemoContext::exact("memo-test-a");
         let calls = AtomicUsize::new(0);
         let before = validated_value_memo_thread_statistics();
@@ -4350,6 +4426,9 @@ mod tests {
 
     #[test]
     fn memoized_value_never_outlives_its_verified_payload() {
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let memo = ValidatedValueMemo::new(resources, 1 << 20);
+        let _scope = memo.enter();
         let scratch = crate::test_support::TestDir::new("exec-cache-validated-memo-fault");
         let root = scratch.join("root");
         let resolver = memo_fixture_resolver(&root);
@@ -6085,6 +6164,24 @@ mod tests {
         assert_eq!(pending.len(), 1);
         session.mark_staged_drafts_completed(&pending).unwrap();
         assert!(session.pending_staged_drafts().unwrap().is_empty());
+        let mut reassessed = pending[0].clone();
+        reassessed.required_assurance = Some(crate::ArtifactAssuranceState::Certified);
+        assert_ne!(
+            managed_publication_key(
+                &pending[0],
+                &root.join("staging"),
+                "TeamXcelerator",
+                xc_core::PublicationTarget::Private
+            )
+            .unwrap(),
+            managed_publication_key(
+                &reassessed,
+                &root.join("staging"),
+                "TeamXcelerator",
+                xc_core::PublicationTarget::Private
+            )
+            .unwrap(),
+        );
         assert_eq!(session.staged_drafts().unwrap().len(), 1);
         assert_eq!(session.publication_inventory().unwrap().entries.len(), 1);
         session.finalize_publication_inventory().unwrap();

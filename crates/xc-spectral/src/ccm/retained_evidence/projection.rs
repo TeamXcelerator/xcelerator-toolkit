@@ -98,10 +98,10 @@ fn serialized(
     }
     let digits = Some((u64::from(p) * 30103 / 100000 + 10) as usize);
     Ok((
-        mid.to_string_radix_round(10, digits, Round::Nearest),
+        xc_numerics::fmt::decimal_string_round(&mid, digits, Round::Nearest),
         [
-            lo.to_string_radix_round(10, digits, Round::Down),
-            hi.to_string_radix_round(10, digits, Round::Up),
+            xc_numerics::fmt::decimal_string_round(&lo, digits, Round::Down),
+            xc_numerics::fmt::decimal_string_round(&hi, digits, Round::Up),
         ],
     ))
 }

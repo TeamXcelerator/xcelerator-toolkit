@@ -8,6 +8,10 @@
 //! The same result contracts are intended for the HP and certified backends.
 
 mod exact_sturm_f64;
+mod operator_evidence;
+pub use operator_evidence::OperatorErrorEvidenceF64;
+#[cfg(feature = "hp-reference")]
+pub use operator_evidence::OperatorErrorEvidenceHp;
 
 use nalgebra::{DMatrix, SymmetricEigen};
 use serde::{Deserialize, Serialize};
@@ -139,6 +143,8 @@ pub struct SolverPerformanceTelemetry {
 /// extremum when the iteration has only visited a proper invariant subspace.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EigenpairReportF64 {
+    #[serde(default)]
+    pub operator_error: OperatorErrorEvidenceF64,
     /// Full-space numerical selection was performed. This is computed ordering
     /// evidence, not an interval certificate. Missing legacy evidence is false.
     #[serde(default)]
@@ -161,6 +167,7 @@ pub struct EigenpairReportF64 {
 
 impl EigenpairReportF64 {
     pub fn validate_finite(&self) -> Result<(), SolverError> {
+        self.operator_error.validate()?;
         if !self.eigenvalue.is_finite()
             || !self.residual_norm.is_finite()
             || !self.relative_residual.is_finite()
@@ -502,6 +509,10 @@ impl EigenSolverF64 for ShiftedPowerSolverF64 {
                 && (residual <= absolute_residual || backward <= backward_tolerance)
             {
                 let report = EigenpairReportF64 {
+                    operator_error: OperatorErrorEvidenceF64::from_operator(
+                        problem.operator,
+                        residual,
+                    )?,
                     global_target_ordering_established: n == 1,
                     eigenvalue: lambda,
                     eigenvector: x,
@@ -695,6 +706,10 @@ impl EigenSolverF64 for LanczosSolverF64 {
                 && (residual <= absolute_residual || backward <= backward_tolerance)
             {
                 let report = EigenpairReportF64 {
+                    operator_error: OperatorErrorEvidenceF64::from_operator(
+                        problem.operator,
+                        residual,
+                    )?,
                     global_target_ordering_established: basis.len() == n,
                     eigenvalue: lambda,
                     eigenvector: vector,
@@ -720,6 +735,10 @@ impl EigenSolverF64 for LanczosSolverF64 {
             let breakdown_threshold = f64::EPSILON.sqrt() * breakdown_scale;
             if beta <= breakdown_threshold {
                 let report = EigenpairReportF64 {
+                    operator_error: OperatorErrorEvidenceF64::from_operator(
+                        problem.operator,
+                        residual,
+                    )?,
                     global_target_ordering_established: basis.len() == n,
                     eigenvalue: lambda,
                     eigenvector: vector,
@@ -900,6 +919,8 @@ pub struct InvariantSubspaceF64 {
 /// is computed evidence; a rigorous index requires separate certification.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BlockEigenReportF64 {
+    #[serde(default)]
+    pub operator_error: OperatorErrorEvidenceF64,
     pub target: EigenTarget,
     pub requested_count: usize,
     pub returned_count: usize,
@@ -1514,7 +1535,7 @@ impl BlockSubspaceIterationF64 {
         let state = final_state.ok_or_else(|| {
             SolverError::NumericalBreakdown("block iteration produced no Ritz state".to_owned())
         })?;
-        let report = self.build_report(
+        let mut report = self.build_report(
             config,
             state,
             final_stability,
@@ -1523,6 +1544,10 @@ impl BlockSubspaceIterationF64 {
             dimension,
             seed_source,
             converged,
+        )?;
+        report.operator_error = OperatorErrorEvidenceF64::from_operator(
+            problem.operator,
+            report.maximum_residual_norm,
         )?;
         Ok(BlockSolveOutcomeF64::Complete {
             report: Box::new(report),
@@ -1760,6 +1785,7 @@ impl BlockSubspaceIterationF64 {
                 (config.block_size as u64).saturating_mul(config.block_size as u64),
             ));
         Ok(BlockEigenReportF64 {
+            operator_error: OperatorErrorEvidenceF64::default(),
             target: config.target.clone(),
             requested_count: config.requested_count,
             returned_count,
@@ -2220,6 +2246,7 @@ impl EigenSolverF64 for DenseReferenceSolverF64 {
             )
         };
         let report = EigenpairReportF64 {
+            operator_error: OperatorErrorEvidenceF64::from_operator(problem.operator, residual)?,
             global_target_ordering_established: true,
             eigenvalue: lambda,
             eigenvector: vector,
@@ -2278,7 +2305,7 @@ fn native_implementation_route(solver: &dyn EigenSolverF64) -> Result<SolverRout
     }
 }
 
-pub const NATIVE_CROSSCHECK_SEMANTICS: &str = "native_concrete_routes_fresh_image_agreement_v2";
+pub const NATIVE_CROSSCHECK_SEMANTICS: &str = "native_concrete_routes_action_error_agreement_v3";
 
 /// Compare converged finite reports from caller-selected independent routes.
 /// Registered implementation identities and structured route evidence must
@@ -3494,7 +3521,11 @@ pub(crate) fn rounded_once_sum<'a>(
 
 #[cfg(feature = "hp-reference")]
 fn hp_decimal(value: &rug::Float, significant_digits: usize) -> String {
-    value.to_string_radix(10, Some(significant_digits))
+    xc_numerics::fmt::decimal_string_round(
+        value,
+        Some(significant_digits),
+        rug::float::Round::Nearest,
+    )
 }
 
 #[cfg(feature = "hp-reference")]
@@ -4284,6 +4315,8 @@ impl GeneralizedExtremeConfigF64 {
 /// verification; it never labels that candidate Certified.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MatrixFreeGeneralizedEigenpairReportF64 {
+    #[serde(default)]
+    pub operator_error: OperatorErrorEvidenceF64,
     pub target: EigenTarget,
     pub eigenvalue: f64,
     pub eigenvector: Vec<f64>,
@@ -4658,6 +4691,12 @@ impl MatrixFreeLobpcgF64 {
                     )
                 };
                 return Ok(MatrixFreeGeneralizedEigenpairReportF64 {
+                    operator_error: OperatorErrorEvidenceF64::generalized(
+                        problem.operator,
+                        problem.metric,
+                        eigenvalue,
+                        residual_norm,
+                    )?,
                     target: config.target.clone(),
                     eigenvalue,
                     eigenvector: current.vector,
@@ -10214,19 +10253,188 @@ pub mod trial_energy {
 #[cfg(feature = "hp-reference")]
 #[doc(hidden)]
 pub mod convergence {
-    /// Largest serialized problem `analyze` accepts. Callers bound their own
-    /// workspace below this; the cap only rejects inputs no caller declared.
+    /// Historical input-size policy retained for callers that choose it.
+    /// `analyze` enforces the caller's explicit byte budget, not this ceiling.
     pub const MAXIMUM_INPUT_BYTES: usize = 16 << 30;
-    use super::trial_energy::{bounds, hash, magnitude, read_form, zero, Work as ExactWork};
+    use super::trial_energy::{bounds, magnitude, zero, Work as ExactWork};
     pub use super::trial_energy::{ExactBounds, TrialForm};
     use super::SolverError;
     use rug::{float::Round, Float, Rational};
     use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
     use xc_core::CancellationToken;
     use xc_numerics::interval::RationalInterval as I;
     use xc_numerics::mpfr_interval::MpfrInterval as M;
 
     const SEMANTICS: &str = "finite-convergence-witnesses-v3";
+    /// Supplies the exact serialized spelling of one symmetric matrix entry.
+    /// All row-major traversals must return identical entries. The generated
+    /// analysis route authenticates their spellings across its size, arithmetic,
+    /// and request-identity passes; it does not authenticate the external source.
+    pub trait MatrixEntrySource {
+        fn entry(&self, row: usize, column: usize) -> Result<ExactBounds, SolverError>;
+    }
+    struct GeneratedEntries<'a> {
+        source: &'a dyn MatrixEntrySource,
+        dimension: usize,
+        digest: std::cell::RefCell<Option<[u8; 32]>>,
+        serialization_error: std::cell::RefCell<Option<SolverError>>,
+    }
+    fn digest_entry(digest: &mut Sha256, entry: &ExactBounds) {
+        // Length framing binds the spelling, not just its rational value.
+        for text in [&entry.lower, &entry.upper] {
+            digest.update((text.len() as u64).to_le_bytes());
+            digest.update(text.as_bytes());
+        }
+    }
+    impl GeneratedEntries<'_> {
+        fn check_digest(&self, digest: Sha256) -> Result<(), SolverError> {
+            let digest: [u8; 32] = digest.finalize().into();
+            let mut expected = self.digest.borrow_mut();
+            if let Some(expected) = *expected {
+                if expected != digest {
+                    return Err(invalid("generated matrix entries changed between passes"));
+                }
+            } else {
+                *expected = Some(digest);
+            }
+            Ok(())
+        }
+        fn serialize_error<E: serde::ser::Error>(&self, error: SolverError) -> E {
+            let text = error.to_string();
+            *self.serialization_error.borrow_mut() = Some(error);
+            E::custom(text)
+        }
+        fn take_error(&self, fallback: SolverError) -> SolverError {
+            self.serialization_error
+                .borrow_mut()
+                .take()
+                .unwrap_or(fallback)
+        }
+    }
+    impl Serialize for GeneratedEntries<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            let count = matrix_len(self.dimension).map_err(|e| self.serialize_error(e))?;
+            let mut seq = serializer.serialize_seq(Some(count))?;
+            let mut digest = Sha256::new();
+            for row in 0..self.dimension {
+                for column in 0..self.dimension {
+                    let entry = self
+                        .source
+                        .entry(row, column)
+                        .map_err(|e| self.serialize_error(e))?;
+                    digest_entry(&mut digest, &entry);
+                    seq.serialize_element(&entry)?;
+                }
+            }
+            self.check_digest(digest)
+                .map_err(|e| self.serialize_error(e))?;
+            seq.end()
+        }
+    }
+    struct GeneratedForm<'a> {
+        form: &'a TrialForm,
+        entries: &'a GeneratedEntries<'a>,
+    }
+    impl Serialize for GeneratedForm<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeStruct;
+            let mut value = serializer.serialize_struct("TrialForm", 5)?;
+            value.serialize_field("source_id", &self.form.source_id)?;
+            value.serialize_field("basis_id", &self.form.basis_id)?;
+            value.serialize_field("normalization_id", &self.form.normalization_id)?;
+            value.serialize_field("dimension", &self.form.dimension)?;
+            value.serialize_field("entries", self.entries)?;
+            value.end()
+        }
+    }
+    struct GeneratedInput<'a> {
+        problem: &'a Problem,
+        entries: &'a GeneratedEntries<'a>,
+    }
+    impl Serialize for GeneratedInput<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::{Error, SerializeStruct};
+            match self.problem {
+                Problem::Directional(p) => {
+                    let mut value = serializer.serialize_struct("DirectionalProblem", 6)?;
+                    value.serialize_field(
+                        "matrix",
+                        &GeneratedForm {
+                            form: &p.matrix,
+                            entries: self.entries,
+                        },
+                    )?;
+                    value.serialize_field("rhs", &p.rhs)?;
+                    value.serialize_field("approximate_solution", &p.approximate_solution)?;
+                    value.serialize_field("functional", &p.functional)?;
+                    value.serialize_field("approximate_dual", &p.approximate_dual)?;
+                    value.serialize_field("coercivity_lower", &p.coercivity_lower)?;
+                    value.end()
+                }
+                Problem::TailBlock(p) => {
+                    let mut value = serializer.serialize_struct("TailBlockProblem", 4)?;
+                    value.serialize_field(
+                        "matrix",
+                        &GeneratedForm {
+                            form: &p.matrix,
+                            entries: self.entries,
+                        },
+                    )?;
+                    value.serialize_field("retained_dimension", &p.retained_dimension)?;
+                    value.serialize_field("shift", &p.shift)?;
+                    value.serialize_field("gap_lower", &p.gap_lower)?;
+                    value.end()
+                }
+                Problem::Cluster(p) => {
+                    let mut value = serializer.serialize_struct("ClusterProblem", 6)?;
+                    value.serialize_field(
+                        "matrix",
+                        &GeneratedForm {
+                            form: &p.matrix,
+                            entries: self.entries,
+                        },
+                    )?;
+                    value.serialize_field("spectral_window", &p.spectral_window)?;
+                    value.serialize_field("columns", &p.columns)?;
+                    value.serialize_field("shifts", &p.shifts)?;
+                    value.serialize_field("gram_lower", &p.gram_lower)?;
+                    value.serialize_field("previous_columns", &p.previous_columns)?;
+                    value.end()
+                }
+                _ => Err(S::Error::custom("unsupported generated matrix problem")),
+            }
+        }
+    }
+    struct Request<'a> {
+        problem: &'a Problem,
+        generated: Option<&'a GeneratedEntries<'a>>,
+    }
+    impl Serialize for Request<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::{Error, SerializeStruct};
+            let Some(entries) = self.generated else {
+                return self.problem.serialize(serializer);
+            };
+            let kind = match self.problem {
+                Problem::Directional(_) => "directional",
+                Problem::TailBlock(_) => "tail_block",
+                Problem::Cluster(_) => "cluster",
+                _ => return Err(S::Error::custom("unsupported generated matrix problem")),
+            };
+            let mut value = serializer.serialize_struct("Problem", 2)?;
+            value.serialize_field("kind", kind)?;
+            value.serialize_field(
+                "input",
+                &GeneratedInput {
+                    problem: self.problem,
+                    entries,
+                },
+            )?;
+            value.end()
+        }
+    }
     fn default_precision() -> u32 {
         512
     }
@@ -10342,8 +10550,49 @@ pub mod convergence {
     fn invalid(s: &str) -> SolverError {
         SolverError::InvalidConfiguration(format!("convergence: {s}"))
     }
+    fn matrix_len(n: usize) -> Result<usize, SolverError> {
+        if n == 0 {
+            return Err(invalid("empty matrix"));
+        }
+        n.checked_mul(n)
+            .ok_or_else(|| invalid("matrix shape overflow"))
+    }
+    fn reserved_values<T>(length: usize) -> Result<Vec<T>, SolverError> {
+        let mut values = Vec::new();
+        values.try_reserve_exact(length).map_err(|_| {
+            SolverError::IterationBudgetExhausted("convergence: allocation capacity limit".into())
+        })?;
+        Ok(values)
+    }
+    fn inertia_operations(n: usize) -> Result<u64, SolverError> {
+        if n < 2 {
+            return Ok(0);
+        }
+        let n = n as u128;
+        // The prior ordered sum is n(n-1)(n+2)/2. Divide its even factor
+        // first and check both multiplication and the operation-counter width.
+        let (left, right) = if n.is_multiple_of(2) {
+            (n / 2, n - 1)
+        } else {
+            (n, (n - 1) / 2)
+        };
+        left.checked_mul(right)
+            .and_then(|v| v.checked_mul(n + 2))
+            .and_then(|v| u64::try_from(v).ok())
+            .ok_or_else(|| {
+                SolverError::IterationBudgetExhausted(
+                    "convergence: inertia operation count overflow".into(),
+                )
+            })
+    }
     fn premise_metric_check(g: &[I], n: usize, w: &mut Work<'_>) -> Result<String, SolverError> {
-        let count = inertia(g, n, w).map_err(|e| match e {
+        premise_metric_check_view(MatrixView::dense(g, n)?, w)
+    }
+    fn premise_metric_check_view(
+        g: MatrixView<'_>,
+        w: &mut Work<'_>,
+    ) -> Result<String, SolverError> {
+        let count = inertia_view(g, w).map_err(|e| match e {
             SolverError::PremiseNotVerified(reason) => SolverError::PremiseNotVerified(format!(
                 "positive definiteness unresolved: {reason}"
             )),
@@ -10388,7 +10637,11 @@ pub mod convergence {
         if v.is_empty() || v.len() > w.options.maximum_dimension {
             return Err(invalid("vector dimension limit"));
         }
-        v.iter().map(|x| w.read(x)).collect()
+        let mut values = reserved_values(v.len())?;
+        for x in v {
+            values.push(w.read(x)?);
+        }
+        Ok(values)
     }
     fn dot(x: &[I], y: &[I], w: &mut Work<'_>) -> Result<I, SolverError> {
         if x.len() != y.len() {
@@ -10410,29 +10663,120 @@ pub mod convergence {
         Ok(s)
     }
     fn matvec(a: &[I], x: &[I], w: &mut Work<'_>) -> Result<Vec<I>, SolverError> {
-        if a.len() != x.len() * x.len() {
+        if a.len() != matrix_len(x.len())? {
             return Err(invalid("matrix/vector shape"));
         }
-        a.chunks_exact(x.len()).map(|row| dot(row, x, w)).collect()
+        let mut values = reserved_values(x.len())?;
+        for row in a.chunks_exact(x.len()) {
+            values.push(dot(row, x, w)?);
+        }
+        Ok(values)
     }
-    fn form(a: &TrialForm, w: &Work<'_>) -> Result<Vec<I>, SolverError> {
+    fn form(
+        a: &TrialForm,
+        w: &Work<'_>,
+        generated: Option<&GeneratedEntries<'_>>,
+    ) -> Result<Vec<I>, SolverError> {
         if a.dimension == 0
             || a.dimension > w.options.maximum_dimension
-            || a.entries.len() != a.dimension * a.dimension
+            || if generated.is_some() {
+                !a.entries.is_empty()
+            } else {
+                a.entries.len() != matrix_len(a.dimension)?
+            }
             || [&a.source_id, &a.basis_id, &a.normalization_id]
                 .iter()
                 .any(|s| s.trim().is_empty() || s.len() > 4096)
         {
             return Err(invalid("matrix shape, coordinates or identity"));
         }
-        read_form(a, w)
-    }
-    fn shifted(a: &[I], n: usize, shift: &I, w: &mut Work<'_>) -> Result<Vec<I>, SolverError> {
-        let mut b = a.to_vec();
-        for i in 0..n {
-            b[i * n + i] = w.sub(&b[i * n + i], shift)?;
+        let mut values = reserved_values(matrix_len(a.dimension)?)?;
+        if let Some(generated) = generated {
+            let mut digest = Sha256::new();
+            for row in 0..a.dimension {
+                for column in 0..a.dimension {
+                    let entry = generated.source.entry(row, column)?;
+                    digest_entry(&mut digest, &entry);
+                    values.push(w.read(&entry)?);
+                }
+            }
+            generated.check_digest(digest)?;
+        } else {
+            for entry in &a.entries {
+                values.push(w.read(entry)?);
+            }
         }
-        Ok(b)
+        for i in 0..a.dimension {
+            for j in 0..i {
+                if values[i * a.dimension + j] != values[j * a.dimension + i] {
+                    // Preserve the shared reference reader's refusal text.
+                    return Err(SolverError::InvalidConfiguration(
+                        "trial energy: form intervals are not exactly symmetric".into(),
+                    ));
+                }
+            }
+        }
+        Ok(values)
+    }
+    #[derive(Clone, Copy)]
+    struct MatrixView<'a> {
+        entries: &'a [I],
+        dimension: usize,
+        stride: usize,
+        offset: usize,
+        diagonal: Option<&'a [I]>,
+    }
+    impl<'a> MatrixView<'a> {
+        fn dense(entries: &'a [I], dimension: usize) -> Result<Self, SolverError> {
+            if entries.len() != matrix_len(dimension)? {
+                return Err(invalid("inertia matrix shape"));
+            }
+            Ok(Self {
+                entries,
+                dimension,
+                stride: dimension,
+                offset: 0,
+                diagonal: None,
+            })
+        }
+        fn trailing(self, first: usize) -> Result<Self, SolverError> {
+            if first >= self.dimension || self.diagonal.is_some() {
+                return Err(invalid("inertia matrix shape"));
+            }
+            Ok(Self {
+                dimension: self.dimension - first,
+                offset: self.offset + first * self.stride + first,
+                ..self
+            })
+        }
+        fn with_diagonal(self, diagonal: &'a [I]) -> Result<Self, SolverError> {
+            if diagonal.len() != self.dimension {
+                return Err(invalid("shifted matrix shape"));
+            }
+            Ok(Self {
+                diagonal: Some(diagonal),
+                ..self
+            })
+        }
+        fn entry(self, row: usize, column: usize) -> &'a I {
+            if row == column {
+                if let Some(diagonal) = self.diagonal {
+                    return &diagonal[row];
+                }
+            }
+            &self.entries[self.offset + row * self.stride + column]
+        }
+    }
+    fn shifted_diagonal(
+        a: MatrixView<'_>,
+        shift: &I,
+        w: &mut Work<'_>,
+    ) -> Result<Vec<I>, SolverError> {
+        let mut diagonal = reserved_values(a.dimension)?;
+        for i in 0..a.dimension {
+            diagonal.push(w.sub(a.entry(i, i), shift)?);
+        }
+        Ok(diagonal)
     }
     // Interval LDL with symmetric diagonal pivoting (the largest rigorously
     // separated pivot, `symmetric_inertia::inertia_stable`) is a sufficient
@@ -10443,9 +10787,21 @@ pub mod convergence {
     // count it resolved is unchanged. The budget is charged the operation
     // count of that elimination; the kernel's parallel rows keep a fixed
     // per-entry order.
+    #[cfg(test)]
     fn inertia(a: &[I], n: usize, w: &mut Work<'_>) -> Result<usize, SolverError> {
-        use xc_numerics::symmetric_inertia::{inertia_stable, MpfrInertiaResult};
-        let mut a: Vec<_> = a.iter().map(|x| w.mpfr(x)).collect::<Result<_, _>>()?;
+        inertia_view(MatrixView::dense(a, n)?, w)
+    }
+    fn inertia_view(a: MatrixView<'_>, w: &mut Work<'_>) -> Result<usize, SolverError> {
+        use xc_numerics::symmetric_inertia::{inertia_stable_owned, MpfrInertiaResult};
+        let n = a.dimension;
+        w.charge(inertia_operations(n)?)?;
+        let mut converted = reserved_values(matrix_len(n)?)?;
+        for row in 0..n {
+            for column in 0..n {
+                converted.push(w.mpfr(a.entry(row, column))?);
+            }
+        }
+        let mut a = converted;
         // The elimination read the lower triangle; mirror it so the kernel
         // sees the same exactly symmetric enclosure.
         for i in 0..n {
@@ -10453,11 +10809,9 @@ pub mod convergence {
                 a[i * n + j] = a[j * n + i].clone();
             }
         }
-        let operations = (0..n as u64)
-            .map(|i| 3 * i + (n as u64 - 1 - i) * (3 * i + 1))
-            .sum();
-        w.charge(operations)?;
-        match inertia_stable(&a, n, w.precision).map_err(|_| invalid("inertia arithmetic range"))? {
+        match inertia_stable_owned(a, n, w.precision)
+            .map_err(|_| invalid("inertia arithmetic range"))?
+        {
             MpfrInertiaResult::Conclusive { negative, .. } => Ok(negative),
             MpfrInertiaResult::Inconclusive { .. } => Err(SolverError::PremiseNotVerified(
                 "shifted inertia pivot unresolved".into(),
@@ -10685,8 +11039,9 @@ pub mod convergence {
     fn directional(
         p: &DirectionalProblem,
         w: &mut Work<'_>,
+        generated: Option<&GeneratedEntries<'_>>,
     ) -> Result<DirectionalReport, SolverError> {
-        let a = form(&p.matrix, w)?;
+        let a = form(&p.matrix, w, generated)?;
         let n = p.matrix.dimension;
         let x = vector(&p.approximate_solution, w)?;
         let z = vector(&p.approximate_dual, w)?;
@@ -10699,8 +11054,10 @@ pub mod convergence {
         if g == 0 {
             return Err(invalid("positive coercivity required"));
         }
-        let shifted = shifted(&a, n, &I::point(g.clone()), w)?;
-        premise_metric_check(&shifted, n, w)?;
+        let view = MatrixView::dense(&a, n)?;
+        let diagonal = shifted_diagonal(view, &I::point(g.clone()), w)?;
+        premise_metric_check_view(view.with_diagonal(&diagonal)?, w)?;
+        drop(diagonal);
         let ax = matvec(&a, &x, w)?;
         let az = matvec(&a, &z, w)?;
         let r: Vec<_> = b
@@ -10748,8 +11105,12 @@ pub mod convergence {
         pub coupling_squared_upper: String,
         pub schur_correction_norm_upper: String,
     }
-    fn tail_block(p: &TailBlockProblem, w: &mut Work<'_>) -> Result<TailBlockReport, SolverError> {
-        let a = form(&p.matrix, w)?;
+    fn tail_block(
+        p: &TailBlockProblem,
+        w: &mut Work<'_>,
+        generated: Option<&GeneratedEntries<'_>>,
+    ) -> Result<TailBlockReport, SolverError> {
+        let a = form(&p.matrix, w, generated)?;
         let n = p.matrix.dimension;
         let k = p.retained_dimension;
         if k == 0 || k >= n {
@@ -10761,16 +11122,12 @@ pub mod convergence {
             return Err(invalid("positive tail gap required"));
         }
         let m = n - k;
-        let mut block = vec![zero(); m * m];
+        let block = MatrixView::dense(&a, n)?.trailing(k)?;
         let mut coupling = zero();
-        for i in k..n {
-            for j in k..n {
-                block[(i - k) * m + j - k] = a[i * n + j].clone();
-            }
-        }
         let boundary = w.add(&I::point(shift.upper().clone()), &I::point(g.clone()))?;
-        let block = shifted(&block, m, &boundary, w)?;
-        premise_metric_check(&block, m, w)?;
+        let diagonal = shifted_diagonal(block, &boundary, w)?;
+        premise_metric_check_view(block.with_diagonal(&diagonal)?, w)?;
+        drop(diagonal);
         for i in 0..k {
             for j in k..n {
                 let t = w.square(&a[i * n + j])?;
@@ -11180,7 +11537,9 @@ pub mod convergence {
     }
     fn gram(q: &[Vec<I>], w: &mut Work<'_>) -> Result<Vec<I>, SolverError> {
         let k = q.len();
-        let mut g = vec![zero(); k * k];
+        let count = matrix_len(k)?;
+        let mut g = reserved_values(count)?;
+        g.resize(count, zero());
         for i in 0..k {
             for j in 0..=i {
                 let v = if i == j {
@@ -11205,8 +11564,12 @@ pub mod convergence {
         }
         Ok(maximum)
     }
-    fn cluster(p: &ClusterProblem, w: &mut Work<'_>) -> Result<ClusterReport, SolverError> {
-        let a = form(&p.matrix, w)?;
+    fn cluster(
+        p: &ClusterProblem,
+        w: &mut Work<'_>,
+        generated: Option<&GeneratedEntries<'_>>,
+    ) -> Result<ClusterReport, SolverError> {
+        let a = form(&p.matrix, w, generated)?;
         let n = p.matrix.dimension;
         let q = columns(&p.columns, n, w)?;
         let k = q.len();
@@ -11217,10 +11580,14 @@ pub mod convergence {
         if window.lower() >= window.upper() {
             return Err(invalid("empty spectral window"));
         }
-        let low = shifted(&a, n, &I::point(window.lower().clone()), w)?;
-        let high = shifted(&a, n, &I::point(window.upper().clone()), w)?;
-        let below = inertia(&low, n, w)?;
-        let above = inertia(&high, n, w)?;
+        let view = MatrixView::dense(&a, n)?;
+        // Preserve both ordered diagonal evaluations before the first inertia
+        // admission or pivot. Only the changed entries need separate owners.
+        let low = shifted_diagonal(view, &I::point(window.lower().clone()), w)?;
+        let high = shifted_diagonal(view, &I::point(window.upper().clone()), w)?;
+        let below = inertia_view(view.with_diagonal(&low)?, w)?;
+        let above = inertia_view(view.with_diagonal(&high)?, w)?;
+        drop((low, high));
         if above < below || above - below != k {
             return Err(SolverError::PremiseNotVerified(
                 "cluster count does not match trial rank".into(),
@@ -11231,8 +11598,10 @@ pub mod convergence {
         if beta == 0 {
             return Err(invalid("positive Gram lower bound required"));
         }
-        let test = shifted(&g, k, &I::point(beta.clone()), w)?;
-        premise_metric_check(&test, k, w)?;
+        let gram_view = MatrixView::dense(&g, k)?;
+        let test = shifted_diagonal(gram_view, &I::point(beta.clone()), w)?;
+        premise_metric_check_view(gram_view.with_diagonal(&test)?, w)?;
+        drop(test);
         let mut error = zero();
         let mut residuals = Vec::new();
         for (q, s) in q.iter().zip(&p.shifts) {
@@ -11330,22 +11699,109 @@ pub mod convergence {
         pub output: Output,
         pub interval_operations: u64,
     }
+    struct InputCounter {
+        length: usize,
+        maximum: usize,
+        exceeded: bool,
+    }
+    impl std::io::Write for InputCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(length) = self
+                .length
+                .checked_add(bytes.len())
+                .filter(|length| *length <= self.maximum)
+            else {
+                self.exceeded = true;
+                return Err(std::io::Error::other("convergence input byte limit"));
+            };
+            self.length = length;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct RequestHash(Sha256);
+    impl std::io::Write for RequestHash {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn request_hash(problem: &impl Serialize, options: &Options) -> Result<String, SolverError> {
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, RequestHash(Sha256::new()));
+        // The tuple and serde traversal are exactly the prior hash input;
+        // only the destination changes from a complete Vec to a digest sink.
+        serde_json::to_writer(&mut writer, &(SEMANTICS, problem, options))
+            .map_err(|_| invalid("identity serialization"))?;
+        let writer = writer
+            .into_inner()
+            .map_err(|_| invalid("identity serialization"))?;
+        Ok(format!("{:x}", writer.0.finalize()))
+    }
     pub fn analyze(
         problem: &Problem,
         options: &Options,
         token: &CancellationToken,
     ) -> Result<Report, SolverError> {
+        analyze_impl(problem, None, options, token)
+    }
+    /// Analyzes a directional, tail-block, or cluster problem without retaining
+    /// its dense matrix text. The matrix identities and dimension remain in the
+    /// problem; its `entries` must be empty. Size, arithmetic, and identity
+    /// passes use the same row-major entries and refuse changing spellings.
+    /// For a stable source the report and request digest equal `analyze` on the
+    /// fully materialized problem, including the operation count and byte limit.
+    pub fn analyze_generated_matrix(
+        problem: &Problem,
+        source: &dyn MatrixEntrySource,
+        options: &Options,
+        token: &CancellationToken,
+    ) -> Result<Report, SolverError> {
+        analyze_impl(problem, Some(source), options, token)
+    }
+    fn analyze_impl(
+        problem: &Problem,
+        source: Option<&dyn MatrixEntrySource>,
+        options: &Options,
+        token: &CancellationToken,
+    ) -> Result<Report, SolverError> {
         if options.maximum_dimension == 0
-            || options.maximum_dimension > 512
             || options.maximum_input_bytes == 0
-            || options.maximum_input_bytes > MAXIMUM_INPUT_BYTES
-            || options.maximum_interval_operations > 1_000_000_000
+            || options.maximum_interval_operations == 0
             || !(64..=65_536).contains(&options.maximum_rational_bits)
             || !(64..=32_768).contains(&options.working_precision_bits)
             || options.working_precision_bits > options.maximum_rational_bits
         {
             return Err(invalid("unsupported work limits"));
         }
+        let generated = source
+            .map(|source| {
+                let matrix = match problem {
+                    Problem::Directional(p) => &p.matrix,
+                    Problem::TailBlock(p) => &p.matrix,
+                    Problem::Cluster(p) => &p.matrix,
+                    _ => return Err(invalid("unsupported generated matrix problem")),
+                };
+                matrix_len(matrix.dimension)?;
+                if matrix.dimension > options.maximum_dimension || !matrix.entries.is_empty() {
+                    return Err(invalid("generated matrix dimension or nonempty entries"));
+                }
+                Ok(GeneratedEntries {
+                    source,
+                    dimension: matrix.dimension,
+                    digest: std::cell::RefCell::new(None),
+                    serialization_error: std::cell::RefCell::new(None),
+                })
+            })
+            .transpose()?;
+        let request = Request {
+            problem,
+            generated: generated.as_ref(),
+        };
         let limits = super::trial_energy::TrialEnergyOptions {
             maximum_dimension: options.maximum_dimension,
             maximum_parts: options.maximum_parts,
@@ -11364,21 +11820,39 @@ pub mod convergence {
         w.cancel()?;
         // Serialization is also the identity representation; input size bounds
         // include strings and analytic hypotheses, not merely scalar payloads.
-        let bytes = serde_json::to_vec(problem).map_err(|_| invalid("request serialization"))?;
-        if bytes.len() > options.maximum_input_bytes {
+        let mut input = InputCounter {
+            length: 0,
+            maximum: options.maximum_input_bytes,
+            exceeded: false,
+        };
+        let serialized = serde_json::to_writer(&mut input, &request);
+        if input.exceeded {
             return Err(invalid("input byte limit"));
         }
+        serialized.map_err(|_| {
+            let error = invalid("request serialization");
+            match &generated {
+                Some(g) => g.take_error(error),
+                None => error,
+            }
+        })?;
         let output = match problem {
             Problem::Root(p) => Output::Root(root(p, &mut w)?),
-            Problem::Directional(p) => Output::Directional(directional(p, &mut w)?),
-            Problem::TailBlock(p) => Output::TailBlock(tail_block(p, &mut w)?),
+            Problem::Directional(p) => {
+                Output::Directional(directional(p, &mut w, generated.as_ref())?)
+            }
+            Problem::TailBlock(p) => Output::TailBlock(tail_block(p, &mut w, generated.as_ref())?),
             Problem::Budget(p) => Output::Budget(budget(p, &mut w)?),
             Problem::Normalization(p) => Output::Normalization(normalize(p, &mut w)?),
             Problem::Profile(p) => Output::Profile(profile(p, &mut w)?),
-            Problem::Cluster(p) => Output::Cluster(cluster(p, &mut w)?),
+            Problem::Cluster(p) => Output::Cluster(cluster(p, &mut w, generated.as_ref())?),
         };
         w.cancel()?;
-        Ok(Report{semantics:SEMANTICS.into(),request_sha256:hash(&(SEMANTICS,problem,options))?,
+        let request_sha256 = request_hash(&request, options).map_err(|error| match &generated {
+            Some(g) => g.take_error(error),
+            None => error,
+        })?;
+        Ok(Report{semantics:SEMANTICS.into(),request_sha256,
             scope:"finite_interval_arithmetic_conditional_on_declared_input_enclosures_and_explicit_analytic_hypotheses_no_source_authentication".into(),output,interval_operations:w.operations})
     }
     pub fn verify(
@@ -11391,5 +11865,711 @@ pub mod convergence {
             return Err(invalid("report replay mismatch"));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod convergence_limits_tests {
+        use super::*;
+
+        // Frozen b11e440 arithmetic reference: shifted dense clones and the
+        // borrowed MPFR kernel. Keep this independent of MatrixView.
+        fn legacy_shifted(
+            a: &[I],
+            n: usize,
+            shift: &I,
+            w: &mut Work<'_>,
+        ) -> Result<Vec<I>, SolverError> {
+            if a.len() != matrix_len(n)? {
+                return Err(invalid("shifted matrix shape"));
+            }
+            let mut b = reserved_values(a.len())?;
+            b.extend_from_slice(a);
+            for i in 0..n {
+                b[i * n + i] = w.sub(&b[i * n + i], shift)?;
+            }
+            Ok(b)
+        }
+
+        fn legacy_inertia(a: &[I], n: usize, w: &mut Work<'_>) -> Result<usize, SolverError> {
+            use xc_numerics::symmetric_inertia::{inertia_stable, MpfrInertiaResult};
+            if a.len() != matrix_len(n)? {
+                return Err(invalid("inertia matrix shape"));
+            }
+            w.charge(inertia_operations(n)?)?;
+            let mut converted = reserved_values(a.len())?;
+            for x in a {
+                converted.push(w.mpfr(x)?);
+            }
+            let mut a = converted;
+            // The elimination read the lower triangle; mirror it so the kernel
+            // sees the same exactly symmetric enclosure.
+            for i in 0..n {
+                for j in i + 1..n {
+                    a[i * n + j] = a[j * n + i].clone();
+                }
+            }
+            match inertia_stable(&a, n, w.precision)
+                .map_err(|_| invalid("inertia arithmetic range"))?
+            {
+                MpfrInertiaResult::Conclusive { negative, .. } => Ok(negative),
+                MpfrInertiaResult::Inconclusive { .. } => Err(SolverError::PremiseNotVerified(
+                    "shifted inertia pivot unresolved".into(),
+                )),
+            }
+        }
+
+        fn legacy_premise_metric_check(
+            g: &[I],
+            n: usize,
+            w: &mut Work<'_>,
+        ) -> Result<String, SolverError> {
+            let count = legacy_inertia(g, n, w).map_err(|e| match e {
+                SolverError::PremiseNotVerified(reason) => SolverError::PremiseNotVerified(
+                    format!("positive definiteness unresolved: {reason}"),
+                ),
+                e => e,
+            })?;
+            if count != 0 {
+                return Err(SolverError::PremiseNotVerified(
+                    "finite form is not positive definite".into(),
+                ));
+            }
+            Ok("positive_directed_interval_ldl".into())
+        }
+
+        fn legacy_directional(
+            p: &DirectionalProblem,
+            w: &mut Work<'_>,
+        ) -> Result<DirectionalReport, SolverError> {
+            let a = form(&p.matrix, w, None)?;
+            let n = p.matrix.dimension;
+            let x = vector(&p.approximate_solution, w)?;
+            let z = vector(&p.approximate_dual, w)?;
+            let b = vector(&p.rhs, w)?;
+            let c = vector(&p.functional, w)?;
+            if [&x, &z, &b, &c].iter().any(|v| v.len() != n) {
+                return Err(invalid("directional shape"));
+            }
+            let g = nonnegative(&p.coercivity_lower, w)?;
+            if g == 0 {
+                return Err(invalid("positive coercivity required"));
+            }
+            let shifted = legacy_shifted(&a, n, &I::point(g.clone()), w)?;
+            legacy_premise_metric_check(&shifted, n, w)?;
+            let ax = matvec(&a, &x, w)?;
+            let az = matvec(&a, &z, w)?;
+            let r: Vec<_> = b
+                .iter()
+                .zip(&ax)
+                .map(|(b, a)| w.sub(b, a))
+                .collect::<Result<_, _>>()?;
+            let d: Vec<_> = c
+                .iter()
+                .zip(&az)
+                .map(|(c, a)| w.sub(c, a))
+                .collect::<Result<_, _>>()?;
+            let rn = norm2(&r, w)?;
+            let dn = norm2(&d, w)?;
+            let product = w.mul(&rn, &dn)?;
+            let error = sqrt_upper(product.upper(), w)?;
+            let error = w.div(&I::point(error), &I::point(g))?;
+            let signed = dot(&z, &r, w)?;
+            let nominal = dot(&c, &x, w)?;
+            let corrected = w.add(&nominal, &signed)?;
+            let enclosure = w.checked(widen(&corrected, error.upper()))?;
+            Ok(DirectionalReport {
+                signed_correction: bounds(&signed),
+                residual_squared_norm: bounds(&rn),
+                dual_residual_squared_norm: bounds(&dn),
+                correction_error_upper: error.upper().to_string(),
+                exact_functional_enclosure: bounds(&enclosure),
+            })
+        }
+
+        fn legacy_tail_block(
+            p: &TailBlockProblem,
+            w: &mut Work<'_>,
+        ) -> Result<TailBlockReport, SolverError> {
+            let a = form(&p.matrix, w, None)?;
+            let n = p.matrix.dimension;
+            let k = p.retained_dimension;
+            if k == 0 || k >= n {
+                return Err(invalid("nonempty retained and omitted blocks required"));
+            }
+            let shift = w.read(&p.shift)?;
+            let g = nonnegative(&p.gap_lower, w)?;
+            if g == 0 {
+                return Err(invalid("positive tail gap required"));
+            }
+            let m = n - k;
+            let count = matrix_len(m)?;
+            let mut block = reserved_values(count)?;
+            block.resize(count, zero());
+            let mut coupling = zero();
+            for i in k..n {
+                for j in k..n {
+                    block[(i - k) * m + j - k] = a[i * n + j].clone();
+                }
+            }
+            let boundary = w.add(&I::point(shift.upper().clone()), &I::point(g.clone()))?;
+            let block = legacy_shifted(&block, m, &boundary, w)?;
+            legacy_premise_metric_check(&block, m, w)?;
+            for i in 0..k {
+                for j in k..n {
+                    let t = w.square(&a[i * n + j])?;
+                    coupling = w.add(&coupling, &t)?;
+                }
+            }
+            let error = w.div(&coupling, &I::point(g))?;
+            Ok(TailBlockReport {
+                omitted_dimension: m,
+                coupling_squared_upper: coupling.upper().to_string(),
+                schur_correction_norm_upper: error.upper().to_string(),
+            })
+        }
+
+        fn legacy_cluster(
+            p: &ClusterProblem,
+            w: &mut Work<'_>,
+        ) -> Result<ClusterReport, SolverError> {
+            let a = form(&p.matrix, w, None)?;
+            let n = p.matrix.dimension;
+            let q = columns(&p.columns, n, w)?;
+            let k = q.len();
+            if p.shifts.len() != k {
+                return Err(invalid("cluster shifts shape"));
+            }
+            let window = w.read(&p.spectral_window)?;
+            if window.lower() >= window.upper() {
+                return Err(invalid("empty spectral window"));
+            }
+            let low = legacy_shifted(&a, n, &I::point(window.lower().clone()), w)?;
+            let high = legacy_shifted(&a, n, &I::point(window.upper().clone()), w)?;
+            let below = legacy_inertia(&low, n, w)?;
+            let above = legacy_inertia(&high, n, w)?;
+            if above < below || above - below != k {
+                return Err(SolverError::PremiseNotVerified(
+                    "cluster count does not match trial rank".into(),
+                ));
+            }
+            let g = gram(&q, w)?;
+            let beta = nonnegative(&p.gram_lower, w)?;
+            if beta == 0 {
+                return Err(invalid("positive Gram lower bound required"));
+            }
+            let test = legacy_shifted(&g, k, &I::point(beta.clone()), w)?;
+            legacy_premise_metric_check(&test, k, w)?;
+            let mut error = zero();
+            let mut residuals = Vec::new();
+            for (q, s) in q.iter().zip(&p.shifts) {
+                let s = w.scalar(s)?;
+                let gap =
+                    Rational::from(&s - window.lower()).min(Rational::from(window.upper() - &s));
+                if gap <= 0 {
+                    return Err(invalid("cluster shift outside window"));
+                }
+                let aq = matvec(&a, q, w)?;
+                let mut residual = Vec::new();
+                for (a, x) in aq.iter().zip(q) {
+                    let sx = w.mul(&I::point(s.clone()), x)?;
+                    residual.push(w.sub(a, &sx)?);
+                }
+                let nr = norm2(&residual, w)?;
+                let gap2 = w.square(&I::point(gap))?;
+                let term = w.div(&nr, &gap2)?;
+                error = w.add(&error, &term)?;
+                residuals.push(bounds(&nr));
+            }
+            let error = w.div(&error, &I::point(beta))?;
+            let distance = error.upper().clone().min(Rational::from(k));
+            let previous = if let Some(raw) = &p.previous_columns {
+                let v = columns(raw, n, w)?;
+                if v.len() != k {
+                    return Err(invalid("tracking ranks differ"));
+                }
+                let vg = gram(&v, w)?;
+                legacy_premise_metric_check(&vg, k, w)?;
+                let mut overlap = zero();
+                for x in &q {
+                    for y in &v {
+                        let xy = dot(x, y, w)?;
+                        let sq = w.square(&xy)?;
+                        overlap = w.add(&overlap, &sq)?;
+                    }
+                }
+                let g_bound = row_sum_bound(&g, k, w)?;
+                let vg_bound = row_sum_bound(&vg, k, w)?;
+                let den = w.mul(&I::point(g_bound), &I::point(vg_bound))?;
+                let lower = w.div(&overlap, &den)?;
+                Some(
+                    ((Rational::from(k) - lower.lower()).max(Rational::from(0)) * 2i32).to_string(),
+                )
+            } else {
+                None
+            };
+            Ok(ClusterReport {
+                eigenvalues_below: below,
+                eigenvalues_in_window: k,
+                contains_ground: below == 0,
+                simple_ground: below == 0 && k == 1,
+                projector_frobenius_squared_upper: (distance * 2i32).to_string(),
+                residual_squared_norms: residuals,
+                previous_trial_projector_frobenius_squared_upper: previous,
+            })
+        }
+
+        fn problem() -> Problem {
+            Problem::Directional(DirectionalProblem {
+                matrix: TrialForm {
+                    source_id: "small exact fixture".into(),
+                    basis_id: "orthonormal".into(),
+                    normalization_id: "euclidean".into(),
+                    dimension: 2,
+                    entries: ["2", "0", "0", "4"].map(ExactBounds::point).to_vec(),
+                },
+                rhs: ["1", "2"].map(ExactBounds::point).to_vec(),
+                approximate_solution: ["0", "0"].map(ExactBounds::point).to_vec(),
+                functional: ["1", "-1"].map(ExactBounds::point).to_vec(),
+                approximate_dual: ["1/2", "-1/4"].map(ExactBounds::point).to_vec(),
+                coercivity_lower: "1".into(),
+            })
+        }
+
+        fn matrix_problem_fixtures() -> Vec<Problem> {
+            let directional = problem();
+            let Problem::Directional(p) = &directional else {
+                unreachable!()
+            };
+            vec![
+                directional.clone(),
+                Problem::TailBlock(TailBlockProblem {
+                    matrix: p.matrix.clone(),
+                    retained_dimension: 1,
+                    shift: ExactBounds::point("1"),
+                    gap_lower: "1".into(),
+                }),
+                Problem::Cluster(ClusterProblem {
+                    matrix: p.matrix.clone(),
+                    spectral_window: ExactBounds {
+                        lower: "1".into(),
+                        upper: "3".into(),
+                    },
+                    columns: vec![["1", "0"].map(ExactBounds::point).to_vec()],
+                    shifts: vec!["2".into()],
+                    gram_lower: "1/2".into(),
+                    previous_columns: Some(vec![["1", "0"].map(ExactBounds::point).to_vec()]),
+                }),
+            ]
+        }
+        fn matrix_mut(problem: &mut Problem) -> &mut TrialForm {
+            match problem {
+                Problem::Directional(p) => &mut p.matrix,
+                Problem::TailBlock(p) => &mut p.matrix,
+                Problem::Cluster(p) => &mut p.matrix,
+                _ => unreachable!(),
+            }
+        }
+        struct Source(TrialForm);
+        impl MatrixEntrySource for Source {
+            fn entry(&self, row: usize, column: usize) -> Result<ExactBounds, SolverError> {
+                Ok(self.0.entries[row * self.0.dimension + column].clone())
+            }
+        }
+        fn legacy_report(
+            problem: &Problem,
+            options: &Options,
+            token: &CancellationToken,
+        ) -> Result<Report, SolverError> {
+            let limits = super::super::trial_energy::TrialEnergyOptions {
+                maximum_dimension: options.maximum_dimension,
+                maximum_parts: options.maximum_parts,
+                maximum_input_bytes: options.maximum_input_bytes,
+                maximum_interval_operations: options.maximum_interval_operations,
+                maximum_rational_bits: options.maximum_rational_bits,
+            };
+            let mut work = Work {
+                exact: ExactWork {
+                    options: &limits,
+                    token,
+                    operations: 0,
+                },
+                precision: options.working_precision_bits,
+            };
+            let output = match problem {
+                Problem::Directional(p) => Output::Directional(legacy_directional(p, &mut work)?),
+                Problem::TailBlock(p) => Output::TailBlock(legacy_tail_block(p, &mut work)?),
+                Problem::Cluster(p) => Output::Cluster(legacy_cluster(p, &mut work)?),
+                _ => unreachable!(),
+            };
+            Ok(Report { semantics: SEMANTICS.into(), request_sha256: request_hash(problem, options)?,
+                scope: "finite_interval_arithmetic_conditional_on_declared_input_enclosures_and_explicit_analytic_hypotheses_no_source_authentication".into(),
+                output, interval_operations: work.operations })
+        }
+        fn comparable(result: Result<Report, SolverError>) -> Result<Vec<u8>, String> {
+            result
+                .map(|report| serde_json::to_vec(&report).unwrap())
+                .map_err(|error| error.to_string())
+        }
+
+        #[test]
+        fn diagonal_views_match_released_dense_clones_for_reports_and_first_errors() {
+            let token = CancellationToken::new();
+            let mut fixtures = matrix_problem_fixtures();
+            for retained_dimension in [1, 2] {
+                fixtures.push(Problem::TailBlock(TailBlockProblem {
+                    matrix: TrialForm {
+                        source_id: "strided omitted block".into(),
+                        basis_id: "orthonormal".into(),
+                        normalization_id: "euclidean".into(),
+                        dimension: 4,
+                        entries: [
+                            "4", "1/4", "1/8", "1/16", "1/4", "5", "1/4", "1/8", "1/8", "1/4", "6",
+                            "1/4", "1/16", "1/8", "1/4", "7",
+                        ]
+                        .map(ExactBounds::point)
+                        .to_vec(),
+                    },
+                    retained_dimension,
+                    shift: ExactBounds::point("1"),
+                    gap_lower: "1".into(),
+                }));
+            }
+            for mut problem in matrix_problem_fixtures() {
+                // An unresolved matrix and an asymmetric refusal also exercise
+                // exact validation and pivot-error precedence.
+                matrix_mut(&mut problem).entries[0] = ExactBounds {
+                    lower: "-1".into(),
+                    upper: "3".into(),
+                };
+                fixtures.push(problem.clone());
+                matrix_mut(&mut problem).entries[1] = ExactBounds::point("1/8");
+                fixtures.push(problem);
+            }
+            for problem in fixtures {
+                for precision in [64, 128, 512] {
+                    let options = Options {
+                        working_precision_bits: precision,
+                        ..Default::default()
+                    };
+                    let complete = analyze(&problem, &options, &token);
+                    assert_eq!(
+                        comparable(complete),
+                        comparable(legacy_report(&problem, &options, &token))
+                    );
+                    for maximum_interval_operations in 1..=80 {
+                        let limited = Options {
+                            maximum_interval_operations,
+                            ..options.clone()
+                        };
+                        assert_eq!(
+                            comparable(analyze(&problem, &limited, &token)),
+                            comparable(legacy_report(&problem, &limited, &token)),
+                            "precision={precision}, operations={maximum_interval_operations}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn generated_matrices_preserve_complete_request_bytes_reports_and_byte_limits() {
+            let token = CancellationToken::new();
+            for dense in matrix_problem_fixtures() {
+                let mut generated = dense.clone();
+                let source = Source(matrix_mut(&mut generated).clone());
+                matrix_mut(&mut generated).entries.clear();
+                let options = Options::default();
+                let expected_bytes = serde_json::to_vec(&dense).unwrap();
+                let entries = GeneratedEntries {
+                    source: &source,
+                    dimension: source.0.dimension,
+                    digest: std::cell::RefCell::new(None),
+                    serialization_error: std::cell::RefCell::new(None),
+                };
+                let request = Request {
+                    problem: &generated,
+                    generated: Some(&entries),
+                };
+                assert_eq!(serde_json::to_vec(&request).unwrap(), expected_bytes);
+                for maximum_input_bytes in [
+                    expected_bytes.len(),
+                    expected_bytes.len() + 1,
+                    options.maximum_input_bytes,
+                ] {
+                    let limits = Options {
+                        maximum_input_bytes,
+                        ..options.clone()
+                    };
+                    assert_eq!(
+                        analyze_generated_matrix(&generated, &source, &limits, &token).unwrap(),
+                        analyze(&dense, &limits, &token).unwrap()
+                    );
+                }
+                let short = Options {
+                    maximum_input_bytes: expected_bytes.len() - 1,
+                    ..options
+                };
+                assert_eq!(
+                    comparable(analyze_generated_matrix(
+                        &generated, &source, &short, &token
+                    )),
+                    comparable(analyze(&dense, &short, &token))
+                );
+            }
+        }
+
+        #[test]
+        fn generated_matrix_rejects_changed_spelling_in_arithmetic_and_identity_passes() {
+            struct Changing {
+                calls: std::cell::Cell<usize>,
+                changed_pass: usize,
+                source: Source,
+            }
+            impl MatrixEntrySource for Changing {
+                fn entry(&self, row: usize, column: usize) -> Result<ExactBounds, SolverError> {
+                    let call = self.calls.get();
+                    self.calls.set(call + 1);
+                    let mut entry = self.source.entry(row, column)?;
+                    if call / 4 == self.changed_pass && row == 0 && column == 0 {
+                        // Same rational value: only exact request spelling changes.
+                        entry = ExactBounds::point("4/2");
+                    }
+                    Ok(entry)
+                }
+            }
+            for changed_pass in [1, 2] {
+                let mut problem = problem();
+                let source = Changing {
+                    calls: std::cell::Cell::new(0),
+                    changed_pass,
+                    source: Source(matrix_mut(&mut problem).clone()),
+                };
+                matrix_mut(&mut problem).entries.clear();
+                let error = analyze_generated_matrix(
+                    &problem,
+                    &source,
+                    &Options::default(),
+                    &CancellationToken::new(),
+                )
+                .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("generated matrix entries changed between passes"));
+                assert_eq!(source.calls.get(), (changed_pass + 1) * 4);
+            }
+        }
+
+        #[test]
+        fn generated_matrix_refuses_invalid_shape_and_propagates_each_pass_error() {
+            struct Failing {
+                calls: std::cell::Cell<usize>,
+                fail_at: usize,
+                source: Source,
+            }
+            impl MatrixEntrySource for Failing {
+                fn entry(&self, row: usize, column: usize) -> Result<ExactBounds, SolverError> {
+                    let call = self.calls.get();
+                    self.calls.set(call + 1);
+                    if call == self.fail_at {
+                        return Err(SolverError::PremiseNotVerified("source refusal".into()));
+                    }
+                    self.source.entry(row, column)
+                }
+            }
+            let token = CancellationToken::new();
+            for fail_at in [0, 4, 8] {
+                let mut problem = problem();
+                let source = Failing {
+                    calls: std::cell::Cell::new(0),
+                    fail_at,
+                    source: Source(matrix_mut(&mut problem).clone()),
+                };
+                matrix_mut(&mut problem).entries.clear();
+                assert!(
+                    matches!(analyze_generated_matrix(&problem, &source, &Options::default(), &token),
+                    Err(SolverError::PremiseNotVerified(message)) if message == "source refusal")
+                );
+            }
+            let mut problem = problem();
+            let source = Source(matrix_mut(&mut problem).clone());
+            assert!(
+                analyze_generated_matrix(&problem, &source, &Options::default(), &token).is_err()
+            );
+            matrix_mut(&mut problem).entries.clear();
+            matrix_mut(&mut problem).dimension = usize::MAX;
+            let options = Options {
+                maximum_dimension: usize::MAX,
+                ..Default::default()
+            };
+            assert!(
+                analyze_generated_matrix(&problem, &source, &options, &token)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("matrix shape overflow")
+            );
+        }
+
+        #[test]
+        fn larger_declared_budgets_preserve_small_arithmetic_and_request_bytes() {
+            let problem = problem();
+            let token = CancellationToken::new();
+            let original = Options::default();
+            let expected = analyze(&problem, &original, &token).unwrap();
+            assert_eq!(
+                expected.request_sha256,
+                super::super::trial_energy::hash(&(SEMANTICS, &problem, &original)).unwrap()
+            );
+            for dimension in [512, 1001, 2501] {
+                let options = Options {
+                    maximum_dimension: dimension,
+                    maximum_interval_operations: 20_000_000_000,
+                    maximum_input_bytes: MAXIMUM_INPUT_BYTES + 1,
+                    ..original.clone()
+                };
+                let actual = analyze(&problem, &options, &token).unwrap();
+                assert_eq!(actual.output, expected.output);
+                assert_eq!(actual.interval_operations, expected.interval_operations);
+                assert_eq!(
+                    actual.request_sha256,
+                    super::super::trial_energy::hash(&(SEMANTICS, &problem, &options)).unwrap()
+                );
+                verify(&problem, &options, &actual, &token).unwrap();
+            }
+        }
+
+        #[test]
+        fn caller_dimension_operation_and_input_limits_remain_enforced() {
+            let problem = problem();
+            let token = CancellationToken::new();
+            let options = Options::default();
+            for rejected in [
+                Options {
+                    maximum_dimension: 0,
+                    ..options.clone()
+                },
+                Options {
+                    maximum_dimension: 1,
+                    ..options.clone()
+                },
+                Options {
+                    maximum_interval_operations: 0,
+                    ..options.clone()
+                },
+                Options {
+                    maximum_input_bytes: 0,
+                    ..options.clone()
+                },
+            ] {
+                assert!(matches!(
+                    analyze(&problem, &rejected, &token),
+                    Err(SolverError::InvalidConfiguration(_))
+                ));
+            }
+            let limited = Options {
+                maximum_interval_operations: 1,
+                ..options.clone()
+            };
+            assert!(matches!(
+                analyze(&problem, &limited, &token),
+                Err(SolverError::IterationBudgetExhausted(_))
+            ));
+            let bytes = serde_json::to_vec(&problem).unwrap();
+            let exact = Options {
+                maximum_input_bytes: bytes.len(),
+                ..options.clone()
+            };
+            let actual = analyze(&problem, &exact, &token).unwrap();
+            assert_eq!(
+                actual.request_sha256,
+                super::super::trial_energy::hash(&(SEMANTICS, &problem, &exact)).unwrap()
+            );
+            let short = Options {
+                maximum_input_bytes: bytes.len() - 1,
+                ..options
+            };
+            assert!(analyze(&problem, &short, &token)
+                .unwrap_err()
+                .to_string()
+                .contains("convergence: input byte limit"));
+        }
+
+        #[test]
+        fn operation_formula_matches_old_loop_and_large_metadata() {
+            for n in 0usize..=512 {
+                let old: u64 = (0..n as u64)
+                    .map(|i| 3 * i + (n as u64 - 1 - i) * (3 * i + 1))
+                    .sum();
+                assert_eq!(inertia_operations(n).unwrap(), old, "n={n}");
+            }
+            assert_eq!(inertia_operations(1001).unwrap(), 502_001_500);
+            assert_eq!(inertia_operations(2501).unwrap(), 7_825_003_750);
+            assert!(matches!(
+                inertia_operations(usize::MAX),
+                Err(SolverError::IterationBudgetExhausted(_))
+            ));
+        }
+
+        #[test]
+        fn malformed_matrix_and_capacity_overflows_fail_without_allocation() {
+            assert!(matrix_len(0).is_err());
+            assert!(matrix_len(usize::MAX).is_err());
+            assert!(reserved_values::<I>(usize::MAX).is_err());
+            let Problem::Directional(mut malformed) = problem() else {
+                unreachable!()
+            };
+            malformed.matrix.dimension = usize::MAX;
+            malformed.matrix.entries.clear();
+            let options = Options {
+                maximum_dimension: usize::MAX,
+                ..Options::default()
+            };
+            let error = analyze(
+                &Problem::Directional(malformed),
+                &options,
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("matrix shape overflow"));
+            use std::io::Write;
+            let mut counter = InputCounter {
+                length: usize::MAX - 1,
+                maximum: usize::MAX,
+                exceeded: false,
+            };
+            assert!(counter.write_all(b"xx").is_err());
+            assert!(counter.exceeded);
+            assert_eq!(counter.length, usize::MAX - 1);
+        }
+
+        #[test]
+        fn inertia_uses_exact_charge_and_refuses_insufficient_remaining_operations() {
+            let token = CancellationToken::new();
+            let a = [point(-1), point(0), point(0), point(2)];
+            for (budget, prior, succeeds) in [(4, 0, true), (3, 0, false), (4, 1, false)] {
+                let limits = super::super::trial_energy::TrialEnergyOptions {
+                    maximum_interval_operations: budget,
+                    ..Default::default()
+                };
+                let mut work = Work {
+                    exact: ExactWork {
+                        options: &limits,
+                        token: &token,
+                        operations: prior,
+                    },
+                    precision: 128,
+                };
+                let result = inertia(&a, 2, &mut work);
+                if succeeds {
+                    assert_eq!(result.unwrap(), 1);
+                    assert_eq!(work.operations, 4);
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(SolverError::IterationBudgetExhausted(_))
+                    ));
+                    assert_eq!(work.operations, prior);
+                }
+            }
+        }
     }
 }

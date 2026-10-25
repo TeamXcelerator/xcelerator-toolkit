@@ -4,6 +4,8 @@
 use super::{extended_research::*, retained_evidence::*, state_geometry::RetainedState};
 use anyhow::{ensure, Result};
 use rug::{float::Constant, Float};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 use xc_cache::ContentDigest;
 use xc_numerics::prefix::lossless_decimal as dec;
 
@@ -35,13 +37,17 @@ pub(super) fn prepare(
         input.matches(state)?;
         return Ok((reference, input));
     }
-    let target = crate::target::hp::TargetEvaluator::from_spec(spec, p)?;
+    let target = {
+        let _phase = super::capture_runtime::Stage::new("runtime target evaluator setup");
+        crate::target::hp::TargetEvaluator::from_spec(spec, p)?
+    };
     let cutoff = scalar(&state.cutoff, p)?;
     target.validate_lambda(&cutoff.clone().sqrt())?;
     let l = cutoff.clone().ln();
     let definition = ContentDigest(spec.digest()?);
     let workers = sample_workers(spec, intervals + 1)?;
     let values = sample_values(&target, spec, p, &cutoff, &l, intervals, workers)?;
+    let projection_phase = super::capture_runtime::Stage::new("runtime target Fourier projection");
     let mut samples = Vec::with_capacity(intervals + 1);
     let mut fine = vec![Float::with_val(p, 0); state.modes + 1];
     let mut coarse = fine.clone();
@@ -79,6 +85,9 @@ pub(super) fn prepare(
     let coefficients = (0..=2 * state.modes)
         .map(|j| dec(&fine[j.abs_diff(state.modes)]))
         .collect();
+    drop(projection_phase);
+    let _phase =
+        super::capture_runtime::Stage::new("runtime target output validation and checkpoint");
     let scope = format!("supplied runtime target sampled on {intervals} uniform log-coordinate intervals; finite even Fourier projection through mode {}; composite trapezoid; maximum coefficient change on half grid={}; this measured refinement is not a quadrature, source-error, or infinite-tail certificate", state.modes, dec(&refinement));
     let reference = ResearchInputs {
         schema_version: 1,
@@ -171,14 +180,17 @@ fn sample_values(
     intervals: usize,
     workers: usize,
 ) -> Result<Vec<Float>> {
-    let points = (0..=intervals)
-        .map(|j| (Float::with_val(p, l) * j / (2 * intervals)).exp())
-        .collect::<Vec<_>>();
+    let points = {
+        let _phase = super::capture_runtime::Stage::new("runtime target sample nodes");
+        (0..=intervals)
+            .map(|j| (Float::with_val(p, l) * j / (2 * intervals)).exp())
+            .collect::<Vec<_>>()
+    };
     target_values_at(target, spec, p, &cutoff.clone().sqrt(), &points, workers)
 }
 
 /// Target values at `points`, in order. With several workers, each evaluates
-/// one contiguous range of points through its own provider process. The
+/// interleaved points through its own persistent provider process. The
 /// values, and the sums a caller forms from them in point order, are identical
 /// to sequential evaluation; an error is reported for the lowest failing point,
 /// as sequentially.
@@ -190,35 +202,193 @@ pub(crate) fn target_values_at(
     points: &[Float],
     workers: usize,
 ) -> Result<Vec<Float>> {
-    if workers <= 1 || points.len() <= 1 {
-        return points.iter().map(|u| target.try_value(u)).collect();
+    let _phase = super::capture_runtime::Stage::new("runtime target point evaluation");
+    let parallel = workers > 1
+        && points.len() > 1
+        && spec.external_profile.is_some()
+        && crate::target::provider_declared_pure()?;
+    let workers = if parallel {
+        workers.min(points.len())
+    } else {
+        1
+    };
+    let progress = SampleProgress::new(points.len(), workers);
+    if !parallel {
+        let result = points
+            .iter()
+            .map(|u| {
+                let value = target.try_value(u)?;
+                progress.point_done();
+                Ok(value)
+            })
+            .collect();
+        progress.finish();
+        return result;
     }
-    let chunk = points.len().div_ceil(workers);
+    let result = balanced_samples(
+        points.len(),
+        workers,
+        |_| {
+            let start = Instant::now();
+            let worker = crate::target::hp::TargetEvaluator::from_spec(spec, p)?;
+            worker.validate_lambda(lambda)?;
+            progress.provider_ready(start.elapsed());
+            Ok(worker)
+        },
+        |worker, index| {
+            let value = worker.try_value(&points[index])?;
+            progress.point_done();
+            Ok(value)
+        },
+    );
+    progress.finish();
+    result
+}
+
+/// Every worker visits its indices in increasing order. An initialization
+/// failure is associated with its first index, and all results are joined
+/// before selecting the lowest failed index, independently of completion order.
+fn balanced_samples<T: Send, W, I, E>(
+    points: usize,
+    workers: usize,
+    initialize: I,
+    evaluate: E,
+) -> Result<Vec<T>>
+where
+    I: Fn(usize) -> Result<W> + Sync,
+    E: Fn(&W, usize) -> Result<T> + Sync,
+{
+    if points == 0 {
+        return Ok(Vec::new());
+    }
+    let workers = workers.max(1).min(points);
+    let resources = xc_core::RunResources::current();
+    let capture = xc_core::current_message_capture();
     let parts = std::thread::scope(|scope| {
-        let handles = points
-            .chunks(chunk)
-            .map(|part| {
-                scope.spawn(move || -> Result<Vec<Float>> {
-                    let worker = crate::target::hp::TargetEvaluator::from_spec(spec, p)?;
-                    worker.validate_lambda(lambda)?;
-                    part.iter().map(|u| worker.try_value(u)).collect()
+        let handles = (0..workers)
+            .map(|first| {
+                let initialize = &initialize;
+                let evaluate = &evaluate;
+                let resources = resources.clone();
+                let capture = capture.clone();
+                scope.spawn(move || {
+                    xc_core::with_message_capture(capture, || {
+                        let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+                        let worker = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            initialize(first)
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("target sampling worker panicked")))
+                        .map_err(|error| (first, error))?;
+                        let mut values = Vec::with_capacity((points - first).div_ceil(workers));
+                        for index in (first..points).step_by(workers) {
+                            let value =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    evaluate(&worker, index)
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!("target sampling worker panicked"))
+                                })
+                                .map_err(|error| (index, error))?;
+                            values.push((index, value));
+                        }
+                        Ok::<_, (usize, anyhow::Error)>(values)
+                    })
                 })
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("target sampling worker panicked")))
+            .enumerate()
+            .map(|(first, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    Err((first, anyhow::anyhow!("target sampling worker panicked")))
+                })
             })
             .collect::<Vec<_>>()
     });
-    let mut values = Vec::with_capacity(points.len());
+    let mut values = (0..points).map(|_| None).collect::<Vec<_>>();
+    let mut failure: Option<(usize, anyhow::Error)> = None;
     for part in parts {
-        values.extend(part?);
+        match part {
+            Ok(part) => {
+                for (index, value) in part {
+                    values[index] = Some(value);
+                }
+            }
+            Err((index, error)) => {
+                if failure.as_ref().is_none_or(|(first, _)| index < *first) {
+                    failure = Some((index, error));
+                }
+            }
+        }
     }
-    Ok(values)
+    if let Some((_, error)) = failure {
+        return Err(error);
+    }
+    Ok(values
+        .into_iter()
+        .map(|value| value.expect("every sampling index was joined"))
+        .collect())
+}
+
+/// Operational counters only; no source values or timing enter artifact bytes.
+struct SampleProgress {
+    start: Instant,
+    next_report: AtomicU64,
+    completed: AtomicUsize,
+    initialized: AtomicUsize,
+    setup_max_ms: AtomicU64,
+    points: usize,
+    workers: usize,
+}
+impl SampleProgress {
+    fn new(points: usize, workers: usize) -> Self {
+        xc_core::progress_message!("target sampling: {points} points; {workers} worker(s)");
+        Self {
+            start: Instant::now(),
+            next_report: AtomicU64::new(30_000_000_000),
+            completed: AtomicUsize::new(0),
+            initialized: AtomicUsize::new(0),
+            setup_max_ms: AtomicU64::new(0),
+            points,
+            workers,
+        }
+    }
+    fn provider_ready(&self, elapsed: std::time::Duration) {
+        self.initialized.fetch_add(1, Ordering::Relaxed);
+        self.setup_max_ms.fetch_max(
+            elapsed.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+    fn point_done(&self) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        let elapsed = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let next = self.next_report.load(Ordering::Relaxed);
+        if elapsed >= next
+            && self
+                .next_report
+                .compare_exchange(
+                    next,
+                    elapsed.saturating_add(30_000_000_000),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            xc_core::progress_message!(
+                "target sampling: {}/{} points completed; {:.1}s elapsed",
+                self.completed.load(Ordering::Relaxed),
+                self.points,
+                self.start.elapsed().as_secs_f64()
+            );
+        }
+    }
+    fn finish(&self) {
+        xc_core::progress_message!("target sampling: {}/{} points completed with {} worker(s); {} new providers initialized; maximum provider setup {:.3}s; {:.3}s elapsed",
+            self.completed.load(Ordering::Relaxed), self.points, self.workers,
+            self.initialized.load(Ordering::Relaxed), self.setup_max_ms.load(Ordering::Relaxed) as f64 / 1000., self.start.elapsed().as_secs_f64());
+    }
 }
 
 #[cfg(test)]
@@ -226,8 +396,145 @@ mod tests {
     use super::*;
 
     #[test]
+    fn balanced_sampling_preserves_order_at_uneven_worker_counts() {
+        for points in [0, 1, 2, 17, 65] {
+            for workers in [1, 2, 4, 8, 16] {
+                let actual = balanced_samples(points, workers, Ok, |first, index| {
+                    assert_eq!(index % workers.min(points).max(1), *first);
+                    Ok(index * index)
+                })
+                .unwrap();
+                assert_eq!(actual, (0..points).map(|i| i * i).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(
+            balanced_samples(3, 80, Ok, |_, index| Ok(index)).unwrap(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn balanced_sampling_selects_lowest_failed_point_not_first_worker() {
+        let error = balanced_samples(
+            12,
+            2,
+            |_| Ok(()),
+            |_, index| {
+                if index == 3 || index == 4 {
+                    anyhow::bail!("failed point {index}");
+                }
+                Ok(index)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "failed point 3");
+        // Initialization belongs to its first point; lower point failures win.
+        let error = balanced_samples(
+            12,
+            2,
+            |first| {
+                if first == 1 {
+                    anyhow::bail!("initialization failed");
+                }
+                Ok(())
+            },
+            |_, index| -> Result<usize> { anyhow::bail!("failed point {index}") },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "failed point 0");
+        let error = balanced_samples(
+            12,
+            2,
+            |first| {
+                if first == 0 {
+                    anyhow::bail!("initialization failed");
+                }
+                Ok(())
+            },
+            |_, index| -> Result<usize> { anyhow::bail!("failed point {index}") },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "initialization failed");
+    }
+
+    #[test]
+    fn balanced_sampling_associates_panics_with_the_actual_point() {
+        let error = balanced_samples(
+            12,
+            2,
+            |_| Ok(()),
+            |_, index| {
+                assert_ne!(index, 3, "point panic");
+                if index == 4 {
+                    anyhow::bail!("higher point failed");
+                }
+                Ok(index)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "target sampling worker panicked");
+        let error = balanced_samples(
+            12,
+            2,
+            |_| Ok(()),
+            |_, index| {
+                assert_ne!(index, 4, "higher point panic");
+                if index == 3 {
+                    anyhow::bail!("lower point failed");
+                }
+                Ok(index)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "lower point failed");
+        let error = balanced_samples(
+            12,
+            2,
+            |first| {
+                assert_ne!(first, 0, "initialization panic");
+                Ok(())
+            },
+            |_, index| Ok(index),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "target sampling worker panicked");
+    }
+
+    #[test]
+    fn balanced_sampling_inherits_the_run_owner() {
+        let owner = xc_core::RunResources::with_worker_limit(123456, 4).unwrap();
+        let _scope = owner.enter();
+        let values = balanced_samples(
+            9,
+            4,
+            |_| {
+                assert_eq!(
+                    xc_core::RunResources::current().unwrap().maximum_bytes(),
+                    123456
+                );
+                Ok(())
+            },
+            |_, index| {
+                assert_eq!(xc_core::RunResources::current().unwrap().worker_limit(), 4);
+                Ok(index)
+            },
+        )
+        .unwrap();
+        assert_eq!(values, (0..9).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn concurrent_pure_provider_sampling_equals_sequential_sampling() {
         use std::{fs, process::Command};
+        struct RestoreEnvironment(&'static str, Option<std::ffi::OsString>);
+        impl Drop for RestoreEnvironment {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
         let root_dir = xc_core::test_support::TestDir::new("parallel-target-samples");
         let root = root_dir.to_path_buf();
         let source = root.join("provider.rs");
@@ -263,8 +570,16 @@ fn main(){
             String::from_utf8_lossy(&output.stderr)
         );
         let digest = ContentDigest::sha256(&fs::read(&executable).unwrap()).0;
-        let previous = std::env::var_os("XC_TARGET_PROVIDER_EXECUTABLE");
+        let _previous = RestoreEnvironment(
+            "XC_TARGET_PROVIDER_EXECUTABLE",
+            std::env::var_os("XC_TARGET_PROVIDER_EXECUTABLE"),
+        );
+        let _previous_pure = RestoreEnvironment(
+            "XC_TARGET_PROVIDER_PURE",
+            std::env::var_os("XC_TARGET_PROVIDER_PURE"),
+        );
         std::env::set_var("XC_TARGET_PROVIDER_EXECUTABLE", &executable);
+        std::env::set_var("XC_TARGET_PROVIDER_PURE", "1");
         let spec = crate::target::TargetProfileSpec::from_json(
             &serde_json::to_vec(&serde_json::json!({
                 "schema_version":3,"profile_id":"parallel-samples","external_profile":{
@@ -279,14 +594,17 @@ fn main(){
         let l = cutoff.clone().ln();
         let target = crate::target::hp::TargetEvaluator::from_spec(&spec, p).unwrap();
         let sequential = sample_values(&target, &spec, p, &cutoff, &l, 64, 1);
-        let concurrent = sample_values(&target, &spec, p, &cutoff, &l, 64, 7);
-        match previous {
-            Some(value) => std::env::set_var("XC_TARGET_PROVIDER_EXECUTABLE", value),
-            None => std::env::remove_var("XC_TARGET_PROVIDER_EXECUTABLE"),
-        }
+        let concurrent = sample_values(&target, &spec, p, &cutoff, &l, 64, 4);
+        // A direct caller asking for parallelism must still use the existing
+        // evaluator if purity is undeclared. No new process can initialize
+        // once executable authorization is removed.
+        std::env::set_var("XC_TARGET_PROVIDER_PURE", "0");
+        std::env::remove_var("XC_TARGET_PROVIDER_EXECUTABLE");
+        let undeclared = sample_values(&target, &spec, p, &cutoff, &l, 64, 8);
         let (sequential, concurrent) = (sequential.unwrap(), concurrent.unwrap());
         assert_eq!(sequential.len(), 65);
         assert_eq!(sequential, concurrent);
+        assert_eq!(sequential, undeclared.unwrap());
         assert!(sequential.windows(2).all(|pair| pair[0] < pair[1]));
     }
     #[test]
@@ -327,6 +645,10 @@ fn main(){
             selection_policy: None,
         };
         let (reference, input) = prepare(&state, &spec, 256).unwrap();
+        eprintln!(
+            "target preparation fixture digest: {}",
+            ContentDigest::sha256_json(&(&reference, &input)).unwrap().0
+        );
         assert_eq!(input.source_eigenpair, state.manifest.content_digest);
         assert_eq!(input.definition_digest.0, spec.digest().unwrap());
         assert_eq!(reference.reference.coefficients.len(), 2 * state.modes + 1);

@@ -1,10 +1,93 @@
 //! Correct rounding of response dot products and Euclidean/Frobenius norms.
 //! Exact stored points only; this does not bound source or linear-solve error.
+use super::root_response_math::GuardPolicy;
 use crate::ccm::retained_evidence::finite_math::{scale, scale_float};
 use anyhow::{bail, Result};
 use rug::{float::Round, Float};
 use xc_numerics::mpfr_interval::MpfrInterval as I;
 const GUARDS: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+
+// The established prefix keeps its existing admission. An extended attempt
+// owns its additional scratch until all interval temporaries have dropped.
+// Sources are already owned by the caller and are not charged twice here.
+fn reserve_extended_attempt(guard: u32, bytes: u128) -> Result<Option<xc_core::MemoryReservation>> {
+    if guard <= 4096 {
+        return Ok(None);
+    }
+    reserve_point_workspace(bytes)
+}
+fn reserve_point_workspace(bytes: u128) -> Result<Option<xc_core::MemoryReservation>> {
+    let bytes = u64::try_from(bytes).map_err(|_| {
+        anyhow::anyhow!("run memory budget exceeded: response point workspace overflow")
+    })?;
+    if let Some(resources) = xc_core::RunResources::current() {
+        // Never wait for an owner that may already hold prepared sources.
+        Ok(Some(resources.try_reserve_working(bytes)?))
+    } else if u128::from(bytes) > super::source_working_budget()? {
+        bail!("run memory budget exceeded: response point workspace requested={bytes}")
+    } else {
+        Ok(None)
+    }
+}
+fn vector_workspace_bytes(count: usize, work: u32) -> u128 {
+    (count as u128 * 32 + 128) * (u128::from(work).div_ceil(8) + 96)
+}
+fn dense_scratch_bytes(entries: usize, vectors: usize, work: u32, floats: u128) -> u128 {
+    (entries as u128 * floats + vectors as u128 * 32 + 128) * (u128::from(work).div_ceil(8) + 96)
+}
+
+// Bound both the product storage and a full exponent-span accumulator before
+// asking MPFR to sum. This deliberately overcharges its sparse summation
+// scratch, including pointers and simultaneous normalized scalar operands.
+fn exact_dot_workspace(left: &[Float], right: &[Float], le: i64, re: i64, p: u32) -> Result<u128> {
+    let mut product_bytes = 0u128;
+    let mut largest = 0u128;
+    let mut low = 0i64;
+    let mut high = 0i64;
+    for (a, b) in left.iter().zip(right) {
+        let bits = a
+            .prec()
+            .checked_add(b.prec())
+            .ok_or_else(|| anyhow::anyhow!("response exact product precision overflow"))?;
+        let bytes = u128::from(bits).div_ceil(8) + 96;
+        product_bytes += bytes;
+        largest = largest.max(bytes);
+        if let (Some(ae), Some(be)) = (a.get_exp(), b.get_exp()) {
+            let upper = i64::from(ae) - le + i64::from(be) - re;
+            high = high.max(upper);
+            low = low.min(upper - i64::from(bits));
+        }
+    }
+    let carry = u64::from(usize::BITS - left.len().max(1).leading_zeros());
+    let span = u128::try_from(high - low)? + u128::from(carry) + u128::from(p) + 2;
+    Ok((product_bytes + largest * 4 + span.div_ceil(8) * 4 + left.len() as u128 * 32 + 512) * 4)
+}
+
+fn exact_dot(left: &[Float], right: &[Float], p: u32, le: i64, re: i64) -> Result<Float> {
+    let _reservation = reserve_point_workspace(exact_dot_workspace(left, right, le, re, p)?)?;
+    let mut products = Vec::with_capacity(left.len());
+    for (a, b) in left.iter().zip(right) {
+        let bits = a
+            .prec()
+            .checked_add(b.prec())
+            .ok_or_else(|| anyhow::anyhow!("response exact product precision overflow"))?;
+        let a = scale_float(a, -le, a.prec())?;
+        let b = scale_float(b, -re, b.prec())?;
+        let (product, direction) = Float::with_val_round(bits, &a * &b, Round::Nearest);
+        if !product.is_finite()
+            || direction != std::cmp::Ordering::Equal
+            || (product.is_zero() && !a.is_zero() && !b.is_zero())
+        {
+            bail!("response exact dot product exceeds the intermediate range");
+        }
+        products.push(product);
+    }
+    let (value, direction) = Float::with_val_round(p, Float::sum(products.iter()), Round::Nearest);
+    if !value.is_finite() || (value.is_zero() && direction != std::cmp::Ordering::Equal) {
+        bail!("response exact dot product exceeds the output range");
+    }
+    scale_float(&value, le + re, p)
+}
 
 fn precision<'a>(values: impl Iterator<Item = &'a Float>, p: u32, count: usize) -> Result<u32> {
     if !(64..=1_000_000).contains(&p) {
@@ -108,6 +191,22 @@ pub(super) fn dot(left: &[Float], right: &[Float], p: u32) -> Result<Float> {
         .filter_map(Float::get_exp)
         .max()
         .map_or(0, i64::from);
+    if let Some(value) = interval_dot(left, right, p, base, le, re)? {
+        return Ok(value);
+    }
+    // Multiplying stored binary points at the sum of their precisions is exact.
+    // Round the complete exact product sum only once; interval widening cannot
+    // otherwise settle extreme cancellation or a rounding-boundary equality.
+    exact_dot(left, right, p, le, re)
+}
+fn interval_dot(
+    left: &[Float],
+    right: &[Float],
+    p: u32,
+    base: u32,
+    le: i64,
+    re: i64,
+) -> Result<Option<Float>> {
     for guard in GUARDS {
         let work = base + guard;
         let products = left
@@ -119,18 +218,21 @@ pub(super) fn dot(left: &[Float], right: &[Float], p: u32) -> Result<Float> {
             .collect::<Result<Vec<_>>>()?;
         let value = scale(&sum(&products, work)?, le + re)?;
         if let Some(value) = rounded(&value, p)? {
-            return Ok(value);
+            return Ok(Some(value));
         }
     }
-    bail!("response dot product rounding unresolved within 4096 guard bits")
+    Ok(None)
 }
 pub(super) fn norm(values: &[Float], p: u32) -> Result<Float> {
     if values.len() > 16385 {
         bail!("response vector norm shape exceeds the supported limit");
     }
     let base = precision(values.iter(), p, values.len())?;
-    for guard in GUARDS {
+    let policy = GuardPolicy::configured(p)?;
+    for guard in policy.guards() {
         let work = base + guard;
+        let _reservation =
+            reserve_extended_attempt(guard, vector_workspace_bytes(values.len(), work))?;
         let points = values
             .iter()
             .map(|v| I::point(Float::with_val(work, v)))
@@ -140,7 +242,10 @@ pub(super) fn norm(values: &[Float], p: u32) -> Result<Float> {
             return Ok(value);
         }
     }
-    bail!("response norm rounding unresolved within 4096 guard bits")
+    bail!(
+        "response norm rounding unresolved within {} guard bits",
+        policy.maximum_guard_bits()
+    )
 }
 pub(super) fn shifted_norm(
     matrix: &[Float],
@@ -157,9 +262,14 @@ pub(super) fn shifted_norm(
         p,
         dimension + 1,
     )?;
-    for guard in GUARDS {
+    let policy = GuardPolicy::configured(p)?;
+    for guard in policy.guards() {
         let work = base + guard;
         dense_workspace(matrix.len(), dimension + 1, base, work, 4)?;
+        let _reservation = reserve_extended_attempt(
+            guard,
+            dense_scratch_bytes(matrix.len(), dimension + 1, work, 4),
+        )?;
         let eigenvalue = I::point(Float::with_val(work, eigenvalue));
         // Subtract the common diagonal before choosing the norm's scale so a
         // huge common shift cannot erase tiny off-diagonal feedback.
@@ -180,7 +290,10 @@ pub(super) fn shifted_norm(
             return Ok(value);
         }
     }
-    bail!("shifted response norm rounding unresolved within 4096 guard bits")
+    bail!(
+        "shifted response norm rounding unresolved within {} guard bits",
+        policy.maximum_guard_bits()
+    )
 }
 
 // Keep binary exponents separate so residual and denominator products need not
@@ -294,9 +407,12 @@ pub(super) fn bordered_residual(
     if supplied_norm < &0 {
         bail!("bordered response matrix norm is negative");
     }
-    for guard in GUARDS {
+    let policy = GuardPolicy::configured(p)?;
+    for guard in policy.guards() {
         let work = base + guard;
         dense_workspace(matrix.len(), 3 * n + 3, base, work, 6)?;
+        let _reservation =
+            reserve_extended_attempt(guard, dense_scratch_bytes(matrix.len(), 3 * n + 3, work, 6))?;
         let points = |values: &[Float]| {
             values
                 .iter()
@@ -388,7 +504,10 @@ pub(super) fn bordered_residual(
         }
         return Ok(bound);
     }
-    bail!("bordered response residual bound unresolved within 4096 guard bits")
+    bail!(
+        "bordered response residual bound unresolved within {} guard bits",
+        policy.maximum_guard_bits()
+    )
 }
 
 /// Correctly rounded a_i - u_i * eigenvalue_response for exact stored points.
@@ -397,6 +516,21 @@ pub(super) fn projected_forcing(
     unit: &[Float],
     eigenvalue_response: &Float,
     p: u32,
+) -> Result<Vec<Float>> {
+    projected_forcing_with_policy(
+        action,
+        unit,
+        eigenvalue_response,
+        p,
+        GuardPolicy::configured(p)?,
+    )
+}
+fn projected_forcing_with_policy(
+    action: &[Float],
+    unit: &[Float],
+    eigenvalue_response: &Float,
+    p: u32,
+    policy: GuardPolicy,
 ) -> Result<Vec<Float>> {
     if action.len() != unit.len() || action.len() > 16385 {
         bail!("response forcing projection shape is invalid");
@@ -409,8 +543,10 @@ pub(super) fn projected_forcing(
         p,
         2 * action.len() + 1,
     )?;
-    for guard in GUARDS {
+    for guard in policy.guards() {
         let work = base + guard;
+        let _reservation =
+            reserve_extended_attempt(guard, vector_workspace_bytes(2 * action.len() + 1, work))?;
         let eigenvalue_response = Scaled::point(eigenvalue_response, work)?;
         let mut result = Vec::with_capacity(action.len());
         for (a, u) in action.iter().zip(unit) {
@@ -426,7 +562,10 @@ pub(super) fn projected_forcing(
             return Ok(result);
         }
     }
-    bail!("response forcing projection rounding unresolved within 4096 guard bits")
+    bail!(
+        "response forcing projection rounding unresolved within {} guard bits",
+        policy.maximum_guard_bits()
+    )
 }
 
 /// MPFR rounds the complete exact stored sum once, including cancellation.
@@ -466,8 +605,11 @@ pub(super) fn normalization_tangent(
     if *supplied_sum != point_sum(unit, p)? {
         bail!("response normalization sum does not match the stored state");
     }
-    for guard in GUARDS {
+    let policy = GuardPolicy::configured(p)?;
+    for guard in policy.guards() {
         let work = base + guard;
+        let _reservation =
+            reserve_extended_attempt(guard, vector_workspace_bytes(2 * unit.len() + 3, work))?;
         let total = |v: &[Float]| {
             Scaled::sum(
                 &v.iter()
@@ -494,7 +636,10 @@ pub(super) fn normalization_tangent(
             return Ok(point);
         }
     }
-    bail!("response normalization tangent rounding unresolved within 4096 guard bits")
+    bail!(
+        "response normalization tangent rounding unresolved within {} guard bits",
+        policy.maximum_guard_bits()
+    )
 }
 
 /// Correctly rounded components xi_i / sqrt(sum_j xi_j^2), for exact stored xi.
@@ -507,8 +652,10 @@ pub(super) fn unit_state(xi: &[Float], p: u32) -> Result<Vec<Float>> {
     if xi.iter().all(Float::is_zero) {
         bail!("response unit state is zero");
     }
-    for guard in GUARDS {
+    let policy = GuardPolicy::configured(p)?;
+    for guard in policy.guards() {
         let work = base + guard;
+        let _reservation = reserve_extended_attempt(guard, vector_workspace_bytes(xi.len(), work))?;
         let points = xi
             .iter()
             .map(|v| Scaled::point(v, work))
@@ -530,7 +677,10 @@ pub(super) fn unit_state(xi: &[Float], p: u32) -> Result<Vec<Float>> {
             return Ok(out);
         }
     }
-    bail!("response unit-state rounding unresolved within 4096 guard bits")
+    bail!(
+        "response unit-state rounding unresolved within {} guard bits",
+        policy.maximum_guard_bits()
+    )
 }
 
 /// Correctly rounded sqrt(L) / exact_sum(unit). L and unit are stored points;
@@ -543,8 +693,11 @@ pub(super) fn normalization_scale(unit: &[Float], l: &Float, p: u32) -> Result<F
     if l <= &0 {
         bail!("response normalization cutoff must be positive");
     }
-    for guard in GUARDS {
+    let policy = GuardPolicy::configured(p)?;
+    for guard in policy.guards() {
         let work = base + guard;
+        let _reservation =
+            reserve_extended_attempt(guard, vector_workspace_bytes(unit.len() + 1, work))?;
         let denominator = Scaled::sum(
             &unit
                 .iter()
@@ -566,7 +719,10 @@ pub(super) fn normalization_scale(unit: &[Float], l: &Float, p: u32) -> Result<F
             return Ok(value);
         }
     }
-    bail!("response normalization scale rounding unresolved within 4096 guard bits")
+    bail!(
+        "response normalization scale rounding unresolved within {} guard bits",
+        policy.maximum_guard_bits()
+    )
 }
 
 /// Correctly rounded 1 / (2 sqrt(L)) for the exact stored positive cutoff L.
@@ -575,8 +731,10 @@ pub(super) fn target_velocity(l: &Float, p: u32) -> Result<Float> {
     if l <= &0 {
         bail!("response normalization cutoff must be positive");
     }
-    for guard in GUARDS {
+    let policy = GuardPolicy::configured(p)?;
+    for guard in policy.guards() {
         let work = base + guard;
+        let _reservation = reserve_extended_attempt(guard, vector_workspace_bytes(1, work))?;
         let mut denominator = Scaled::point(l, work)?.sqrt()?;
         denominator.exponent += 1;
         let value = Scaled::point(&Float::with_val(work, 1), work)?
@@ -586,13 +744,192 @@ pub(super) fn target_velocity(l: &Float, p: u32) -> Result<Float> {
             return Ok(value);
         }
     }
-    bail!("response target velocity rounding unresolved within 4096 guard bits")
+    bail!(
+        "response target velocity rounding unresolved within {} guard bits",
+        policy.maximum_guard_bits()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rug::{float::Special, Rational};
+
+    fn severe_dot_cancellation() -> ([Float; 2], [Float; 2]) {
+        let p = 8192;
+        let epsilon = Float::with_val(p, 1) >> (p - 1);
+        (
+            [Float::with_val(p, 1 + &epsilon), Float::with_val(p, 1)],
+            [Float::with_val(p, 1 - &epsilon), Float::with_val(p, -1)],
+        )
+    }
+
+    #[test]
+    fn response_dot_exact_fallback_resolves_cancellation_beyond_legacy_guards() {
+        let (left, right) = severe_dot_cancellation();
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let _scope = resources.enter();
+        assert!(interval_dot(&left, &right, 8192, 8192, 1, 1)
+            .unwrap()
+            .is_none());
+        let exact = left
+            .iter()
+            .zip(&right)
+            .fold(Rational::from(0), |acc, (a, b)| {
+                acc + a.to_rational().unwrap() * b.to_rational().unwrap()
+            });
+        let result = dot(&left, &right, 8192).unwrap();
+        assert_eq!(result, Float::with_val(8192, exact));
+        assert!(!result.is_zero());
+        assert!(resources.usage().peak_bytes > 0);
+        assert_eq!(resources.usage().working_bytes, 0);
+    }
+
+    #[test]
+    fn response_dot_exact_fallback_ties_zero_and_legacy_bytes() {
+        for p in [64, 128, 256] {
+            for numerator in [-3, -1, 0, 1, 3] {
+                let left = [Float::with_val(p, 1), Float::with_val(p, numerator) >> p];
+                let right = [Float::with_val(p, 1), Float::with_val(p, 1)];
+                let exact = left
+                    .iter()
+                    .zip(&right)
+                    .fold(Rational::from(0), |acc, (a, b)| {
+                        acc + a.to_rational().unwrap() * b.to_rational().unwrap()
+                    });
+                let result = exact_dot(&left, &right, p, 1, 1).unwrap();
+                assert_eq!(result, Float::with_val(p, exact));
+                let old = interval_dot(&left, &right, p, p, 1, 1).unwrap().unwrap();
+                assert_eq!(
+                    super::super::lossless_hp_decimal(&old),
+                    super::super::lossless_hp_decimal(&dot(&left, &right, p).unwrap())
+                );
+            }
+            let left = [Float::with_val(p, 1), Float::with_val(p, -1)];
+            let right = [Float::with_val(p, 1), Float::with_val(p, 1)];
+            let zero = exact_dot(&left, &right, p, 1, 1).unwrap();
+            assert!(zero.is_zero());
+            assert!(!zero.is_sign_negative());
+        }
+    }
+
+    #[test]
+    fn response_dot_exact_midpoints_and_zero_beyond_legacy_guards() {
+        let source_p = 8192;
+        let epsilon = Float::with_val(source_p, 1) >> (source_p - 1);
+        for numerator in [1, 3] {
+            for sign in [-1, 1] {
+                // The first two exact products sum to one, but their narrow
+                // interval straddles it until the 16382-bit term is retained.
+                let left = [
+                    Float::with_val(source_p, 1 + &epsilon) * sign,
+                    Float::with_val(source_p, &epsilon * sign),
+                    Float::with_val(source_p, numerator * sign) >> 64u32,
+                ];
+                let right = [
+                    Float::with_val(source_p, 1 - &epsilon),
+                    epsilon.clone(),
+                    Float::with_val(source_p, 1),
+                ];
+                assert!(interval_dot(&left, &right, 64, source_p, 1, 1)
+                    .unwrap()
+                    .is_none());
+                let exact = left
+                    .iter()
+                    .zip(&right)
+                    .fold(Rational::from(0), |acc, (a, b)| {
+                        acc + a.to_rational().unwrap() * b.to_rational().unwrap()
+                    });
+                assert_eq!(dot(&left, &right, 64).unwrap(), Float::with_val(64, exact));
+            }
+        }
+        let left = [
+            Float::with_val(source_p, 1 + &epsilon),
+            epsilon.clone(),
+            Float::with_val(source_p, 1),
+        ];
+        let right = [
+            Float::with_val(source_p, 1 - &epsilon),
+            epsilon,
+            Float::with_val(source_p, -1),
+        ];
+        assert!(interval_dot(&left, &right, 64, source_p, 1, 1)
+            .unwrap()
+            .is_none());
+        let zero = dot(&left, &right, 64).unwrap();
+        assert!(zero.is_zero());
+        assert!(!zero.is_sign_negative());
+    }
+
+    #[test]
+    fn response_dot_exact_fallback_admission_and_exponent_refusals_release_ownership() {
+        let (left, right) = severe_dot_cancellation();
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let _scope = resources.enter();
+        let occupied = resources.try_reserve_retained((1 << 20) - 1).unwrap();
+        assert!(dot(&left, &right, 8192)
+            .unwrap_err()
+            .to_string()
+            .contains("memory budget"));
+        assert_eq!(resources.usage().working_bytes, 0);
+        assert_eq!(resources.usage().retained_bytes, (1 << 20) - 1);
+        drop(occupied);
+        for exponent in [-700_000_000i64, 700_000_000] {
+            let value = scale_float(&Float::with_val(128, 1), exponent, 128).unwrap();
+            assert!(exact_dot(
+                std::slice::from_ref(&value),
+                std::slice::from_ref(&value),
+                128,
+                exponent + 1,
+                exponent + 1
+            )
+            .is_err());
+            assert_eq!(resources.usage().working_bytes, 0);
+        }
+        // An extreme component span is refused before constructing products.
+        let wide = [
+            Float::with_val(128, 1),
+            Float::with_val(128, 1) >> 700_000_000u32,
+        ];
+        assert!(exact_dot(&wide, &wide, 128, 1, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("memory budget"));
+        assert_eq!(resources.usage().working_bytes, 0);
+    }
+
+    #[test]
+    fn response_projection_extended_guards_are_admitted_and_preserve_exact_rounding() {
+        let (left, right) = severe_dot_cancellation();
+        let action = [Float::with_val(8192, 1)];
+        let unit = &left[..1];
+        let eigenvalue = &right[0];
+        let old = GuardPolicy::new(8192, 4096).unwrap();
+        assert!(
+            projected_forcing_with_policy(&action, unit, eigenvalue, 8192, old)
+                .unwrap_err()
+                .to_string()
+                .contains("4096")
+        );
+        let policy = GuardPolicy::new(8192, 8192).unwrap();
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let _scope = resources.enter();
+        let result =
+            projected_forcing_with_policy(&action, unit, eigenvalue, 8192, policy).unwrap();
+        let exact =
+            Rational::from(1) - unit[0].to_rational().unwrap() * eigenvalue.to_rational().unwrap();
+        assert_eq!(result, vec![Float::with_val(8192, exact)]);
+        assert!(resources.usage().peak_bytes > 0);
+        assert_eq!(resources.usage().working_bytes, 0);
+        let _occupied = resources.try_reserve_retained((1 << 20) - 1).unwrap();
+        assert!(
+            projected_forcing_with_policy(&action, unit, eigenvalue, 8192, policy)
+                .unwrap_err()
+                .to_string()
+                .contains("memory budget")
+        );
+        assert_eq!(resources.usage().working_bytes, 0);
+    }
 
     #[test]
     fn response_normalization_exact_rational_oracles() {

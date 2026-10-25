@@ -109,14 +109,14 @@ pub(super) fn polish(
         // system singular before the unshifted vector necessarily meets the
         // residual floor. Continue from the best state within the original
         // unshifted-step budget; each phase retains its actual shifted outcome.
-        let candidate = xc_numerics::linalg::inverse_iteration_from_factors_detailed(
+        let candidate = xc_numerics::linalg::inverse_iteration_auto_detailed(
             a,
-            factors,
             n,
             p,
             steps.saturating_sub(used_steps),
             false,
             Some(vector.clone()),
+            Some(factors),
         )?;
         if candidate.diagnostics.unshifted_steps == 0
             || candidate.diagnostics.unshifted_steps > steps.saturating_sub(used_steps)

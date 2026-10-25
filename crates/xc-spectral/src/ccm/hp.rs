@@ -9,7 +9,7 @@
 //! - Solve the spectrum equation with Halley's method by default, with
 //!   explicit Newton selection available for controlled comparisons.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use rug::{ops::Pow, Float};
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,7 @@ pub use assembly_error::{
     CcmExactFormRoot, CcmExactFormRoots, ASSEMBLY_ERROR_SEMANTICS,
 };
 mod checkpoint_spectra;
+mod root_execution;
 pub use checkpoint_spectra::{
     checkpoint_low_spectra, checkpoint_low_spectra_via_cache, CcmCheckpointEigenvalue,
     CcmCheckpointSpectra, CcmCheckpointSpectrumRow, CHECKPOINT_SPECTRA_SEMANTICS,
@@ -178,7 +179,7 @@ enum CcmCacheRoute<'a> {
 }
 
 struct RetainedCcmSource {
-    tau: Vec<Float>,
+    tau: xc_cache::SharedValidated<Vec<Float>>,
     tau_manifest: Option<ArtifactManifest>,
     eigenpair_manifest: Option<ArtifactManifest>,
     secular_manifest: Option<ArtifactManifest>,
@@ -379,6 +380,11 @@ struct PortableArchimedeanIntegrals {
     precision_bits: u32,
     #[serde(default)]
     quadrature_policy: super::research::QuadraturePolicy,
+    #[serde(
+        default,
+        skip_serializing_if = "xc_numerics::quadrature::GaussLegendreGenerator::is_legacy"
+    )]
+    quadrature_generator: xc_numerics::quadrature::GaussLegendreGenerator,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     quadrature_orders: Vec<usize>,
     alpha: Vec<String>,
@@ -561,14 +567,14 @@ struct ComputedArchimedeanIntegrals {
     gamma: Vec<Float>,
 }
 
-struct ComputedCcmMatrixComponents {
+struct ComputedCcmMatrixComponents<P = Vec<Float>> {
     pole: Vec<Float>,
     archimedean: Vec<Float>,
-    prime: Vec<Float>,
+    prime: P,
 }
 
-fn assemble_tau_components(
-    components: &ComputedCcmMatrixComponents,
+fn assemble_tau_components<P: AsRef<[Float]> + Sync>(
+    components: &ComputedCcmMatrixComponents<P>,
     prec: u32,
 ) -> Result<Vec<Float>> {
     matrix_point_math::total(components, prec)
@@ -620,6 +626,15 @@ pub struct CcmGroundIndexAdmission {
 }
 
 impl CcmGroundIndexAdmission {
+    fn admitted_outcome(&self) -> anyhow::Result<ground_index::Outcome> {
+        match (self.established, self.reason.as_deref()) {
+            (true, None) => Ok(ground_index::Outcome::Proven),
+            (false, Some(reason)) if !reason.trim().is_empty() => {
+                Ok(ground_index::Outcome::NotEstablished(reason.into()))
+            }
+            _ => anyhow::bail!("inconsistent ground-index admission record"),
+        }
+    }
     fn from_outcome(outcome: ground_index::Outcome) -> Self {
         match outcome {
             ground_index::Outcome::Proven => Self {
@@ -777,7 +792,7 @@ fn lossless_hp_decimal(value: &Float) -> String {
         .saturating_mul(30_103)
         .div_ceil(100_000)
         .saturating_add(4) as usize;
-    value.to_string_radix(10, Some(digits))
+    xc_numerics::fmt::decimal_string_round(value, Some(digits), rug::float::Round::Nearest)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1428,6 +1443,11 @@ pub struct HighPrecConfig {
     pub quad_points: usize,
     #[doc(hidden)]
     pub research_quadrature_policy: super::research::QuadraturePolicy,
+    /// Generator for the Archimedean Gauss-Legendre tables. The legacy default
+    /// preserves existing artifacts. `ArbCertified` requires the `arb` feature
+    /// and has a separate identity throughout the matrix dependency graph.
+    /// Certified table rounding does not certify quadrature truncation error.
+    pub archimedean_gl_generator: xc_numerics::quadrature::GaussLegendreGenerator,
     /// Number of positive CCM secular roots to discover independently and
     /// refine. Zero requests an explicit source-only run.
     pub n_eigenvalues: usize,
@@ -1577,11 +1597,32 @@ fn add_adaptive_parity_parameter(parameters: &mut serde_json::Value, policy: Ccm
     }
 }
 
+fn primary_lu_dimension(n_modes: usize, policy: CcmParityPolicy) -> Option<usize> {
+    match policy {
+        CcmParityPolicy::EvenSector => n_modes.checked_add(1),
+        CcmParityPolicy::Natural | CcmParityPolicy::AdaptiveEven => {
+            n_modes.checked_mul(2).and_then(|n| n.checked_add(1))
+        }
+    }
+}
+
+fn add_dense_lu_arithmetic(parameters: &mut serde_json::Value, dimension: usize) {
+    if let Some(arithmetic) = xc_numerics::linalg::dense_lu_arithmetic(dimension) {
+        parameters["dense_lu_arithmetic"] = serde_json::json!(arithmetic);
+    }
+}
+
+#[cfg(test)]
+mod dense_lu_primary_tests;
+
 /// CCM eigenstate algorithm policy. This is deliberately explicit because the
 /// two routes can differ in low-order bits and therefore never share an
 /// eigenpair cache identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CcmEigenstateSolver {
+    /// Inverse iteration without the Krylov outer solver. Both solver routes
+    /// use the dimension-bound default dense-LU arithmetic; this name does not
+    /// select the historical low-level unblocked factorization.
     LegacyInverseIteration,
     ShiftInvertKrylov,
     /// Prefer an exact Krylov artifact, then an exact legacy artifact. On a
@@ -1691,6 +1732,7 @@ impl HighPrecConfig {
     /// resources remain checked when their inputs become available.
     #[doc(hidden)]
     pub fn validate_source_admission(&self, params: &CcmParams) -> Result<()> {
+        self.archimedean_gl_generator.ensure_available()?;
         validate_source_shape(params.n_modes, self.precision_bits, self.quad_points)?;
         ground_index::preflight(
             params.matrix_size(),
@@ -1720,7 +1762,7 @@ impl HighPrecConfig {
         if !length.is_finite() || length <= &0 || length.prec() < self.precision_bits {
             bail!("invalid quadrature source length");
         }
-        match self.research_quadrature_policy {
+        let orders = match self.research_quadrature_policy {
             super::research::QuadraturePolicy::AdaptiveFloor => {
                 super::research::quadrature_orders_for_length(
                     n_modes,
@@ -1736,7 +1778,14 @@ impl HighPrecConfig {
                 }
                 Ok(vec![order; n_modes + 1])
             }
+        }?;
+        if !self.archimedean_gl_generator.is_legacy() {
+            for &order in &orders {
+                self.archimedean_gl_generator
+                    .validate_rule(order, self.precision_bits)?;
+            }
         }
+        Ok(orders)
     }
     /// Construct a config from a target decimal-digit working precision.
     ///
@@ -1774,6 +1823,7 @@ impl HighPrecConfig {
                 .saturating_mul(QUAD_POINTS_PER_DIGIT)
                 .clamp(MIN_QUAD_POINTS, MAX_QUAD_POINTS),
             research_quadrature_policy: super::research::QuadraturePolicy::AdaptiveFloor,
+            archimedean_gl_generator: Default::default(),
             n_eigenvalues: 50,
             cache_mode: xc_numerics::quadrature::CacheMode::default(),
             force_even: true,
@@ -2936,6 +2986,45 @@ fn euler(prec: u32) -> Float {
 /// Force exact symmetry on a finite square row-major HP matrix.
 /// Each pair is replaced by its correctly rounded stored-point average at
 /// the greater input precision. Unrepresentable arithmetic is an error.
+fn runtime_float_bytes(length: usize, precision: u32) -> u64 {
+    (length as u64)
+        .saturating_mul(64 + u64::from(precision).div_ceil(64) * 8)
+        .saturating_add(64)
+}
+fn shared_float_vector(values: Vec<Float>) -> Result<xc_cache::SharedValidated<Vec<Float>>> {
+    let bytes = values.iter().fold(64u64, |sum, v| {
+        sum.saturating_add(64 + u64::from(v.prec()).div_ceil(64) * 8)
+    });
+    Ok(xc_cache::SharedValidated::new(values, bytes)?)
+}
+fn force_shared_symmetric(
+    matrix: &mut xc_cache::SharedValidated<Vec<Float>>,
+    dim: usize,
+) -> Result<()> {
+    if dim.checked_mul(dim) == Some(matrix.len())
+        && (0..dim).all(|i| {
+            (i..dim).all(|j| {
+                let a = &matrix[i * dim + j];
+                let b = &matrix[j * dim + i];
+                a == b && a.prec() == b.prec() && a.is_sign_negative() == b.is_sign_negative()
+            })
+        })
+    {
+        if matrix
+            .iter()
+            .any(|x| !x.is_finite() || x.prec() > 1_000_000)
+            || dim == 0
+        {
+            bail!("invalid symmetry source shape, finite values or precision");
+        }
+        return Ok(());
+    }
+    let mut owned = matrix.to_vec();
+    force_symmetric(&mut owned, dim)?;
+    *matrix = shared_float_vector(owned)?;
+    Ok(())
+}
+
 fn force_symmetric(matrix: &mut [Float], dim: usize) -> Result<()> {
     if dim == 0
         || dim.checked_mul(dim) != Some(matrix.len())
@@ -3274,14 +3363,25 @@ fn decode_prime_component(
     Ok(matrix)
 }
 
+// Bind before any parent-cache lookup: recording this only on child tables
+// would allow a legacy integral or Tau hit to bypass the selected generator.
+// The default deliberately contributes no new field, preserving released keys.
+fn bind_archimedean_generator(key: &mut SemanticKeyEnvelope, cfg: &HighPrecConfig) {
+    if !cfg.archimedean_gl_generator.is_legacy() {
+        key.resolved_mathematical_parameters["quadrature_generator"] =
+            serde_json::json!(cfg.archimedean_gl_generator.semantic_id());
+    }
+}
+
 fn resolve_archimedean_integrals_via_cache(
     params: &CcmParams,
     l: &Float,
     cfg: &HighPrecConfig,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<(ComputedArchimedeanIntegrals, ArtifactManifest)> {
+    cfg.archimedean_gl_generator.ensure_available()?;
     let precision_bits = cfg.precision_bits;
-    let semantic_key = SemanticKeyEnvelope {
+    let mut semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_archimedean_integrals".to_owned(),
         mathematical_semantics_version: "ccm-archimedean-integrals-length-aware-order-v3"
@@ -3301,6 +3401,7 @@ fn resolve_archimedean_integrals_via_cache(
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some("adaptive_gauss_legendre_by_mode".to_owned()),
     };
+    bind_archimedean_generator(&mut semantic_key, cfg);
     let logical_key = format!(
         "ccm/archimedean-integrals/{}/{}/{}",
         lambda_squared_cache_identity(params),
@@ -3320,7 +3421,13 @@ fn resolve_archimedean_integrals_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
+        minimum_reader_version: ToolkitVersion::parse(
+            if cfg.archimedean_gl_generator.is_legacy() {
+                xc_cache::CLEAN_SLATE
+            } else {
+                "0.17.0"
+            },
+        )?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3351,6 +3458,7 @@ fn resolve_archimedean_integrals_via_cache(
                     n_modes: params.n_modes,
                     precision_bits,
                     quadrature_policy: cfg.research_quadrature_policy,
+                    quadrature_generator: cfg.archimedean_gl_generator,
                     quadrature_orders: cfg
                         .resolved_archimedean_orders(params.n_modes, l)
                         .map_err(|e| CacheError::InvalidManifest(e.to_string()))?,
@@ -3363,6 +3471,7 @@ fn resolve_archimedean_integrals_via_cache(
         },
         |artifact| {
             if artifact.quadrature_policy != cfg.research_quadrature_policy
+                || artifact.quadrature_generator != cfg.archimedean_gl_generator
                 || artifact.quadrature_orders
                     != cfg
                         .resolved_archimedean_orders(params.n_modes, l)
@@ -3392,7 +3501,7 @@ fn resolve_prime_component_via_cache(
     l: &Float,
     cfg: &HighPrecConfig,
     cache: &ArtifactCacheContext<'_>,
-) -> Result<(Vec<Float>, ArtifactManifest)> {
+) -> Result<(xc_cache::SharedValidated<Vec<Float>>, ArtifactManifest)> {
     let precision_bits = cfg.precision_bits;
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
@@ -3444,7 +3553,7 @@ fn resolve_prime_component_via_cache(
     let memo_context = xc_cache::ValidatedValueMemoContext::exact(with_mpfr_exponent_range(format!(
         "ccm_prime_component/decode_prime_component/v1 params={params:?} precision_bits={precision_bits}"
     )));
-    let resolved = xc_cache::resolve_or_compute_json_artifact_memoized(
+    let resolved = xc_cache::resolve_or_compute_json_artifact_shared(
         &request,
         &memo_context,
         || {
@@ -3477,6 +3586,9 @@ fn resolve_prime_component_via_cache(
                 Vec::new(),
             ))
         },
+        |artifact: &PortablePrimeComponent| {
+            runtime_float_bytes(artifact.entries.len(), precision_bits)
+        },
         |artifact| decode_prime_component(artifact, params, precision_bits),
     )?;
     let manifest = resolved
@@ -3491,12 +3603,12 @@ fn build_tau_hp_via_cache(
     l: &Float,
     cfg: &HighPrecConfig,
     cache: &ArtifactCacheContext<'_>,
-) -> Result<(Vec<Float>, ArtifactManifest)> {
+) -> Result<(xc_cache::SharedValidated<Vec<Float>>, ArtifactManifest)> {
     validate_managed_source_length(params, cfg, l)?;
     matrix_point_math::preflight(params.n_modes, l, cfg.precision_bits)?;
     let prec = cfg.precision_bits;
     let lambda_identity = lambda_squared_cache_identity(params);
-    let semantic_key = SemanticKeyEnvelope {
+    let mut semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_tau_matrix".to_owned(),
         mathematical_semantics_version: "ccm-weil-form-source-bound-length-aware-arch-v4"
@@ -3518,6 +3630,7 @@ fn build_tau_hp_via_cache(
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: None,
     };
+    bind_archimedean_generator(&mut semantic_key, cfg);
     let logical_key = format!(
         "ccm/tau/{}/{}/{}",
         lambda_squared_cache_identity(params),
@@ -3537,7 +3650,13 @@ fn build_tau_hp_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
+        minimum_reader_version: ToolkitVersion::parse(
+            if cfg.archimedean_gl_generator.is_legacy() {
+                xc_cache::CLEAN_SLATE
+            } else {
+                "0.17.0"
+            },
+        )?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3554,7 +3673,7 @@ fn build_tau_hp_via_cache(
     let memo_context = xc_cache::ValidatedValueMemoContext::exact(with_mpfr_exponent_range(
         format!("ccm_tau_matrix/decode_tau_artifact/v1 params={params:?} precision_bits={prec}"),
     ));
-    let resolved = xc_cache::resolve_or_compute_json_artifact_memoized(
+    let resolved = xc_cache::resolve_or_compute_json_artifact_shared(
         &request,
         &memo_context,
         || {
@@ -3586,6 +3705,7 @@ fn build_tau_hp_via_cache(
                 dependencies,
             ))
         },
+        |artifact: &PortableTauMatrix| runtime_float_bytes(artifact.entries.len(), prec),
         |artifact| decode_tau_artifact(artifact, params, prec),
     )?;
     let manifest = resolved
@@ -3812,6 +3932,7 @@ fn decode_weil_eigenpair_admitted(
             ));
         }
     }
+    let mut admitted_outcome = ground_index::Outcome::Proven;
     match (cfg.ground_index_policy, &artifact.ground_index) {
         (CcmGroundIndexPolicy::Require, None) => {
             if prove_ground_index {
@@ -3827,6 +3948,9 @@ fn decode_weil_eigenpair_admitted(
             }
         }
         (CcmGroundIndexPolicy::RecordOutcome, Some(recorded)) => {
+            admitted_outcome = recorded
+                .admitted_outcome()
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
             if prove_ground_index {
                 let replayed = CcmGroundIndexAdmission::from_outcome(
                     ground_index::outcome_with_residual(
@@ -3855,7 +3979,7 @@ fn decode_weil_eigenpair_admitted(
     let resolution =
         stored_resolution::bounds_with_residual(tau, &xi, &eps_n, prec, parity_policy, &residual)
             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?
-            .record;
+            .admit(&admitted_outcome, cfg.ground_index_policy);
     if artifact.stored_state_resolution.as_ref() != Some(&resolution) {
         return Err(CacheError::InvalidManifest(
             "CCM stored-state resolution failed source replay".into(),
@@ -4012,7 +4136,7 @@ fn resolve_even_sector_matrix_via_cache(
     tau: &[Float],
     tau_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
-) -> Result<(Vec<Float>, ArtifactManifest)> {
+) -> Result<(xc_cache::SharedValidated<Vec<Float>>, ArtifactManifest)> {
     let dimension = params.n_modes + 1;
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
@@ -4065,7 +4189,7 @@ fn resolve_even_sector_matrix_via_cache(
         cfg.precision_bits,
         hp_values_memo_identity(tau)
     )));
-    let resolved = xc_cache::resolve_or_compute_json_artifact_memoized(
+    let resolved = xc_cache::resolve_or_compute_json_artifact_shared(
         &request,
         &memo_context,
         || {
@@ -4086,6 +4210,9 @@ fn resolve_even_sector_matrix_via_cache(
                     required_quality: CacheQuality::Validated,
                 }],
             ))
+        },
+        |artifact: &PortableEvenSectorMatrix| {
+            runtime_float_bytes(artifact.entries.len(), cfg.precision_bits)
         },
         |artifact| {
             if artifact.schema_version != 1
@@ -4122,7 +4249,7 @@ fn resolve_odd_sector_matrix_via_cache(
     tau: &[Float],
     tau_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
-) -> Result<(Vec<Float>, ArtifactManifest)> {
+) -> Result<(xc_cache::SharedValidated<Vec<Float>>, ArtifactManifest)> {
     let dimension = params.n_modes;
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
@@ -4175,7 +4302,7 @@ fn resolve_odd_sector_matrix_via_cache(
         cfg.precision_bits,
         hp_values_memo_identity(tau)
     )));
-    let resolved = xc_cache::resolve_or_compute_json_artifact_memoized(
+    let resolved = xc_cache::resolve_or_compute_json_artifact_shared(
         &request,
         &memo_context,
         || {
@@ -4201,6 +4328,9 @@ fn resolve_odd_sector_matrix_via_cache(
                     required_quality: CacheQuality::Validated,
                 }],
             ))
+        },
+        |artifact: &PortableOddSectorMatrix| {
+            runtime_float_bytes(artifact.entries.len(), cfg.precision_bits)
         },
         |artifact| {
             if artifact.schema_version != 1
@@ -6221,7 +6351,7 @@ fn analyze_sector_gap_inner(
         }
     } else {
         RetainedCcmSource {
-            tau: build_tau_hp(params, &l, cfg)?,
+            tau: shared_float_vector(build_tau_hp(params, &l, cfg)?)?,
             tau_manifest: None,
             eigenpair_manifest: None,
             secular_manifest: None,
@@ -6311,7 +6441,7 @@ fn analyze_sector_gap_from_retained_source(
             anyhow::anyhow!("managed retained CCM source is missing its Tau manifest")
         })?;
         let mut tau = source.tau;
-        force_symmetric(&mut tau, params.matrix_size())?;
+        force_shared_symmetric(&mut tau, params.matrix_size())?;
         let (even_matrix, even_matrix_manifest) =
             resolve_even_sector_matrix_via_cache(params, cfg, &tau, &tau_manifest, cache)?;
         let (odd_matrix, odd_matrix_manifest) =
@@ -6361,7 +6491,7 @@ fn analyze_sector_gap_from_retained_source(
         })
     } else {
         let mut tau = source.tau;
-        force_symmetric(&mut tau, params.matrix_size())?;
+        force_shared_symmetric(&mut tau, params.matrix_size())?;
         let even_matrix = build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits)?;
         let odd_matrix = build_odd_sector_matrix(&tau, params.n_modes, cfg.precision_bits)?;
         let (even, odd) = rayon::join(
@@ -6931,6 +7061,10 @@ mod validation_capacity_repair {
             ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
             ZipJsonFilesystemCacheStore,
         };
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let memo = xc_cache::ValidatedValueMemo::new(resources.clone(), 1 << 29);
+        let _resources = resources.enter();
+        let _memo = memo.enter();
         let root_dir = xc_core::test_support::TestDir::new("ccm-validated-value-memo");
         let root = root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
@@ -6971,7 +7105,7 @@ mod validation_capacity_repair {
         let l = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
         let (cold_tau, tau_manifest) = build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
         let mut symmetric_tau = cold_tau.clone();
-        force_symmetric(&mut symmetric_tau, params.matrix_size()).unwrap();
+        force_shared_symmetric(&mut symmetric_tau, params.matrix_size()).unwrap();
         let (cold_sector, sector_manifest) = resolve_even_sector_matrix_via_cache(
             &params,
             &cfg,
@@ -7009,6 +7143,8 @@ mod validation_capacity_repair {
                 .unwrap();
             for _ in 0..3 {
                 pool.install(|| {
+                    let _resources = resources.enter();
+                    let _memo = memo.enter();
                     let before = xc_cache::validated_value_memo_thread_statistics();
                     let (tau, manifest) =
                         build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
@@ -7068,7 +7204,7 @@ mod validation_capacity_repair {
         );
         // A different Tau operand is a different validator context: the
         // stored eigenpair is decoded again, replayed against it and refused.
-        let mut perturbed = symmetric_tau.clone();
+        let mut perturbed = symmetric_tau.to_vec();
         perturbed[0].next_up();
         let before = xc_cache::validated_value_memo_thread_statistics();
         assert!(weil_eigenpair_via_cache_with_seed(
@@ -7358,23 +7494,18 @@ mod validation_capacity_repair {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn resolve_factorization_via_cache(
+fn factorization_cache_identity(
     params: &CcmParams,
     cfg: &HighPrecConfig,
-    matrix: &[Float],
     matrix_manifest: &ArtifactManifest,
     subspace: &str,
-    cache: &ArtifactCacheContext<'_>,
-    retained: &RuntimeLuFactors,
-) -> Result<(Rc<xc_numerics::linalg::LuFactors>, ArtifactManifest)> {
-    let resolution_start = Instant::now();
+) -> Result<(SemanticKeyEnvelope, String)> {
     let dimension = if subspace == "even" {
         params.n_modes + 1
     } else {
         params.matrix_size()
     };
-    let semantic_key = SemanticKeyEnvelope {
+    let mut semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_factorization".to_owned(),
         mathematical_semantics_version: "ccm-dense-lu-v0.13.0-v1".to_owned(),
@@ -7392,13 +7523,10 @@ fn resolve_factorization_via_cache(
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some("dense_lu_partial_pivoting".to_owned()),
     };
-    let retained_key = semantic_key.digest()?.0;
-    if let Some((factors, manifest)) = retained.borrow().get(&retained_key) {
-        xc_core::progress_message!(
-            "[HP] {subspace} LU factorization: retained in memory (sanity checks already passed)"
-        );
-        return Ok((Rc::clone(factors), manifest.clone()));
-    }
+    add_dense_lu_arithmetic(
+        &mut semantic_key.resolved_mathematical_parameters,
+        dimension,
+    );
     let logical_key = format!(
         "ccm/factorization/{}/{}/{}/{}",
         lambda_squared_cache_identity(params),
@@ -7406,6 +7534,34 @@ fn resolve_factorization_via_cache(
         cfg.precision_bits,
         subspace
     );
+    Ok((semantic_key, logical_key))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_factorization_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    matrix: &[Float],
+    matrix_manifest: &ArtifactManifest,
+    subspace: &str,
+    cache: &ArtifactCacheContext<'_>,
+    retained: &RuntimeLuFactors,
+) -> Result<(Rc<xc_numerics::linalg::LuFactors>, ArtifactManifest)> {
+    let resolution_start = Instant::now();
+    let dimension = if subspace == "even" {
+        params.n_modes + 1
+    } else {
+        params.matrix_size()
+    };
+    let (semantic_key, logical_key) =
+        factorization_cache_identity(params, cfg, matrix_manifest, subspace)?;
+    let retained_key = semantic_key.digest()?.0;
+    if let Some((factors, manifest)) = retained.borrow().get(&retained_key) {
+        xc_core::progress_message!(
+            "[HP] {subspace} LU factorization: retained in memory (sanity checks already passed)"
+        );
+        return Ok((Rc::clone(factors), manifest.clone()));
+    }
     let request = ArtifactExecutionCacheRequest {
         operation: "ccm.factorization.resolve_or_compute",
         semantic_key: &semantic_key,
@@ -7419,7 +7575,13 @@ fn resolve_factorization_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
+        minimum_reader_version: ToolkitVersion::parse(
+            if xc_numerics::linalg::dense_lu_arithmetic(dimension).is_some() {
+                "0.17.0"
+            } else {
+                xc_cache::CLEAN_SLATE
+            },
+        )?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -7435,8 +7597,8 @@ fn resolve_factorization_via_cache(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let factors = xc_numerics::linalg::lu_factor(matrix, dimension)
-                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            let factors = xc_numerics::linalg::lu_factor_auto(matrix, dimension)
+                .map_err(|error| CacheError::InvalidManifest(format!("{error:#}")))?;
             Ok((
                 PortableLuFactorization {
                     schema_version: 1,
@@ -7630,7 +7792,7 @@ impl SymmetricOperator<Float> for BorrowedDenseSymmetricHp<'_> {
                 "[HP] Krylov source count: dimension={}, work_precision_bits={}, shift={}",
                 self.dimension,
                 work,
-                shift.to_string_radix(10, Some(12)),
+                xc_numerics::fmt::decimal_string_round(shift, Some(12), rug::float::Round::Nearest),
             );
             match point_matrix_inertia_at(
                 self.entries,
@@ -7799,7 +7961,7 @@ pub(crate) fn resolve_canonical_even_eigenstate_via_cache(
     let log_lambda_squared = log_lambda_sq_hp(params, precision_bits)?;
     let (mut tau, tau_manifest) =
         build_tau_hp_via_cache(params, &log_lambda_squared, &even_cfg, cache)?;
-    force_symmetric(&mut tau, dimension)?;
+    force_shared_symmetric(&mut tau, dimension)?;
     let (eigenvalue, eigenvector, diagnostics, manifest, _) = weil_eigenpair_via_cache_with_seed(
         params,
         &even_cfg,
@@ -7843,6 +8005,7 @@ fn validate_managed_source_length(
     cfg: &HighPrecConfig,
     l: &Float,
 ) -> Result<()> {
+    cfg.archimedean_gl_generator.ensure_available()?;
     validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
     ground_index::preflight(
         params.matrix_size(),
@@ -7937,11 +8100,18 @@ fn weil_eigenpair_cache_identity(
     resolved_mathematical_parameters["ground_index_validation"] =
         serde_json::json!(ground_index::ARITHMETIC);
     if cfg.ground_index_policy == CcmGroundIndexPolicy::RecordOutcome {
+        resolved_mathematical_parameters["stored_resolution_arithmetic"] =
+            serde_json::json!(stored_resolution::RECORDED_OUTCOME_ARITHMETIC);
         resolved_mathematical_parameters["ground_index_admission"] =
             serde_json::json!("record_outcome_v1");
     }
     resolved_mathematical_parameters["inverse_iteration_semantics"] =
         serde_json::json!(xc_numerics::linalg::INVERSE_ITERATION_SEMANTICS);
+    add_dense_lu_arithmetic(
+        &mut resolved_mathematical_parameters,
+        primary_lu_dimension(params.n_modes, parity_policy)
+            .ok_or_else(|| anyhow::anyhow!("primary LU dimension overflow"))?,
+    );
     add_adaptive_parity_parameter(&mut resolved_mathematical_parameters, parity_policy);
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
@@ -8062,6 +8232,18 @@ fn is_retryable_auto_krylov_failure(error: &anyhow::Error) -> bool {
             )
         })
     })
+}
+
+fn krylov_polishing_error(error: anyhow::Error) -> CacheError {
+    if error.is::<xc_numerics::linalg::DenseLuExecutionFailure>() {
+        // Resource/backend failures are not evidence of an ambiguous Krylov
+        // target and must not be checkpointed as a refusal or silently retried.
+        CacheError::InvalidManifest(format!("{error:#}"))
+    } else {
+        CacheError::InvalidTransition(format!(
+            "CCM shift-invert Krylov did not produce an unambiguous converged target: polishing: {error}"
+        ))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8303,7 +8485,18 @@ fn weil_eigenpair_via_cache_with_retained_factors(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
+        minimum_reader_version: ToolkitVersion::parse(
+            if xc_numerics::linalg::dense_lu_arithmetic(
+                primary_lu_dimension(params.n_modes, parity_policy)
+                    .ok_or_else(|| anyhow::anyhow!("primary LU dimension overflow"))?,
+            )
+            .is_some()
+            {
+                "0.17.0"
+            } else {
+                xc_cache::CLEAN_SLATE
+            },
+        )?,
         maximum_reader_version: None,
         tags,
         provenance_digest: None,
@@ -8327,7 +8520,7 @@ fn weil_eigenpair_via_cache_with_retained_factors(
         produced: format!("{memo_identity} ground_index=true"),
         stronger: vec![format!("{memo_identity} ground_index=true")],
     };
-    let resolved = xc_cache::resolve_or_compute_json_artifact_memoized(
+    let resolved = xc_cache::resolve_or_compute_json_artifact_shared(
         &request,
         &memo_context,
         || {
@@ -8350,16 +8543,16 @@ fn weil_eigenpair_via_cache_with_retained_factors(
                 .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
                 match cfg.eigenstate_solver {
                     CcmEigenstateSolver::LegacyInverseIteration => {
-                        let output = xc_numerics::linalg::inverse_iteration_from_factors_detailed(
+                        let output = xc_numerics::linalg::inverse_iteration_auto_detailed(
                             &sector,
-                            &factors,
                             params.n_modes + 1,
                             prec,
                             cfg.inverse_iter_steps,
                             false,
                             None,
+                            Some(&factors),
                         )
-                        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                        .map_err(|error| CacheError::InvalidManifest(format!("{error:#}")))?;
                         let expanded =
                             expand_even_sector_vector(&output.eigenvector, params.n_modes, prec);
                         (
@@ -8420,9 +8613,14 @@ fn weil_eigenpair_via_cache_with_retained_factors(
                             scaled_backward_error_tolerance: tolerance.clone(),
                             ritz_value_stability_tolerance: tolerance.clone(),
                             boundary_cluster_tolerance: DecimalLiteral::new(
-                                stored_resolution::matrix_rounding_scale(&sector, dimension, prec)
-                                    .map_err(|e| CacheError::InvalidManifest(e.to_string()))?
-                                    .to_string_radix_round(10, None, rug::float::Round::Up),
+                                xc_numerics::fmt::decimal_string_round(
+                                    &stored_resolution::matrix_rounding_scale(
+                                        &sector, dimension, prec,
+                                    )
+                                    .map_err(|e| CacheError::InvalidManifest(e.to_string()))?,
+                                    None,
+                                    rug::float::Round::Up,
+                                ),
                             )
                             .map_err(|e| CacheError::InvalidManifest(e.to_string()))?,
                         };
@@ -8440,7 +8638,7 @@ fn weil_eigenpair_via_cache_with_retained_factors(
                                 .with(|preclusions| preclusions.set(preclusions.get() + 1));
                             return Err(CacheError::InvalidTransition(format!(
                                 "CCM shift-invert Krylov did not produce an unambiguous converged target: preflight: {count} source eigenvalues lie within {} of the target, so no Krylov boundary can verify one",
-                                radius.to_string_radix(10, Some(12)),
+                                xc_numerics::fmt::decimal_string_round(radius, Some(12), rug::float::Round::Nearest),
                             )));
                         }
                         xc_core::progress_message!(
@@ -8504,11 +8702,14 @@ fn weil_eigenpair_via_cache_with_retained_factors(
                             .map(|entry| Float::with_val(prec, entry))
                             .collect();
                         let polished = eigenstate_accuracy::polish(
-                            &sector, &factors, &candidate_value, &candidate_vector,
-                            prec, cfg.inverse_iter_steps,
-                        ).map_err(|error| CacheError::InvalidTransition(format!(
-                            "CCM shift-invert Krylov did not produce an unambiguous converged target: polishing: {error}"
-                        )))?;
+                            &sector,
+                            &factors,
+                            &candidate_value,
+                            &candidate_vector,
+                            prec,
+                            cfg.inverse_iter_steps,
+                        )
+                        .map_err(krylov_polishing_error)?;
                         let expanded =
                             expand_even_sector_vector(&polished.vector, params.n_modes, prec);
                         let diagnostics = polished.diagnostics;
@@ -8557,16 +8758,16 @@ fn weil_eigenpair_via_cache_with_retained_factors(
                     retained,
                 )
                 .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-                let output = xc_numerics::linalg::inverse_iteration_from_factors_detailed(
+                let output = xc_numerics::linalg::inverse_iteration_auto_detailed(
                     tau,
-                    &factors,
                     params.matrix_size(),
                     prec,
                     cfg.inverse_iter_steps,
                     parity_policy == CcmParityPolicy::AdaptiveEven,
                     None,
+                    Some(&factors),
                 )
-                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                .map_err(|error| CacheError::InvalidManifest(format!("{error:#}")))?;
                 (
                     output.eigenvalue,
                     normalize_eigenvector(&output.eigenvector, l, prec)
@@ -8629,7 +8830,15 @@ fn weil_eigenpair_via_cache_with_retained_factors(
                             &residual,
                         )
                         .map_err(|error| CacheError::InvalidManifest(error.to_string()))?
-                        .record,
+                        .admit(
+                            &ground_index
+                                .as_ref()
+                                .map(CcmGroundIndexAdmission::admitted_outcome)
+                                .transpose()
+                                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?
+                                .unwrap_or(ground_index::Outcome::Proven),
+                            cfg.ground_index_policy,
+                        ),
                     ),
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
@@ -8648,6 +8857,16 @@ fn weil_eigenpair_via_cache_with_retained_factors(
                 canonical_dependency_refs(factor_manifests),
             ))
         },
+        |artifact: &PortableWeilEigenpair| {
+            let reason = artifact
+                .ground_index
+                .as_ref()
+                .and_then(|r| r.reason.as_ref())
+                .map_or(0, |r| r.len() as u64);
+            runtime_float_bytes(artifact.eigenvector.len().saturating_add(16), prec)
+                .saturating_add(reason.saturating_mul(2))
+                .saturating_add(1024)
+        },
         |artifact| {
             decode_weil_eigenpair_admitted(
                 artifact,
@@ -8662,7 +8881,8 @@ fn weil_eigenpair_via_cache_with_retained_factors(
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("Weil eigenpair execution returned no manifest"))?;
-    let (eigenvalue, eigenvector, diagnostics, ground_index_admission) = resolved.value;
+    let (eigenvalue, eigenvector, diagnostics, ground_index_admission) =
+        resolved.value.into_owned();
     Ok((
         eigenvalue,
         eigenvector,
@@ -9712,6 +9932,130 @@ fn validate_adaptive_root_evidence(
     Ok(())
 }
 
+fn decode_root_outcome(
+    outcome: &PortableRootOutcome,
+    precision_bits: u32,
+) -> std::result::Result<EigenvalueResult, CacheError> {
+    match outcome {
+        PortableRootOutcome::Converged(result) => result
+            .to_runtime(precision_bits)
+            .map(EigenvalueResult::Converged),
+        PortableRootOutcome::Stagnated(result) => result
+            .to_runtime(precision_bits)
+            .map(EigenvalueResult::Stagnated),
+        PortableRootOutcome::Approximate(result) => result
+            .to_runtime(precision_bits)
+            .map(EigenvalueResult::Approximate),
+        PortableRootOutcome::Failed { iterations, reason } => Ok(EigenvalueResult::Failed {
+            iterations: *iterations,
+            reason: reason.clone(),
+        }),
+    }
+}
+
+fn validate_root_outcome(
+    portable: &PortableRootOutcome,
+    outcome: &EigenvalueResult,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    xi: &[Float],
+    poles: &[Float],
+    require_converged: bool,
+) -> std::result::Result<(), CacheError> {
+    let adaptive_precision = cfg.root_precision_policy == RootPrecisionPolicy::Adaptive;
+    let expected_target_bits = cfg.precision_bits.saturating_sub(GUARD_BITS).max(1);
+    let (portable_result, result, status) = match (portable, outcome) {
+        (PortableRootOutcome::Converged(portable), EigenvalueResult::Converged(result)) => {
+            (portable, result, "converged")
+        }
+        (PortableRootOutcome::Stagnated(portable), EigenvalueResult::Stagnated(result)) => {
+            (portable, result, "stagnated")
+        }
+        (PortableRootOutcome::Approximate(portable), EigenvalueResult::Approximate(result)) => {
+            (portable, result, "approximate")
+        }
+        (PortableRootOutcome::Failed { .. }, EigenvalueResult::Failed { .. }) => {
+            return Err(CacheError::InvalidManifest(
+                "computed CCM root-range payload contains a failed root".to_owned(),
+            ));
+        }
+        _ => unreachable!("portable and decoded root outcome variants match"),
+    };
+    if require_converged && status != "converged" {
+        return Err(CacheError::InvalidManifest(format!(
+            "requested assurance rejects {status} CCM root-range evidence"
+        )));
+    }
+    let value = &result.value;
+    let correction_meets_target =
+        result.diagnostics.final_correction < root_correction_tolerance(value, cfg.precision_bits);
+    let replayed_digits = achieved_decimal_digits(
+        value,
+        &result.diagnostics.final_correction,
+        cfg.precision_bits,
+    );
+    let replayed = secular_residual_and_scale_at(xi, poles, value, cfg.precision_bits);
+    let replayed_residual = replayed.as_ref().map(|(residual, _)| residual);
+    let replay_term_scale = replayed.as_ref().map(|(_, scale)| scale);
+    // Adaptive evidence replays the same directed witness below at its
+    // recorded verification precision. Requiring a second witness at the
+    // fixed guard precision would undo adaptive cancellation recovery.
+    if !adaptive_precision
+        && status == "converged"
+        && !root_accuracy_witness(
+            xi,
+            poles,
+            value,
+            expected_target_bits,
+            cfg.precision_bits.saturating_add(GUARD_BITS),
+        )
+    {
+        return Err(CacheError::InvalidManifest(
+            "converged CCM root has no directed local root witness".into(),
+        ));
+    }
+    let invalid_iterations = result.diagnostics.iterations > cfg.solver_steps;
+    let invalid_status = if adaptive_precision {
+        validate_adaptive_root_evidence(
+            portable_result.adaptive_precision.as_ref(),
+            result,
+            status,
+            cfg,
+            xi,
+            poles,
+        )
+        .is_err()
+    } else {
+        let confirmed_correction =
+            fixed_guard_retained_correction(xi, poles, value, cfg.precision_bits, cfg.root_solver);
+        portable_result.adaptive_precision.is_some()
+            || confirmed_correction.as_ref() != Some(&result.diagnostics.final_correction)
+            || (status == "converged" && !correction_meets_target)
+            || (status == "approximate" && result.diagnostics.iterations != cfg.solver_steps)
+    };
+    let digits_mismatch = replayed_digits != result.diagnostics.achieved_decimal_digits;
+    let residual_mismatch = !residual_replay_matches(
+        &result.diagnostics.residual,
+        replayed_residual,
+        replay_term_scale,
+        params.matrix_size(),
+        cfg.precision_bits,
+    );
+    if invalid_iterations || invalid_status || digits_mismatch || residual_mismatch {
+        return Err(CacheError::InvalidManifest(format!(
+            "validated CCM root-range payload has inconsistent convergence diagnostics: status={status}, iterations={}/{}, correction_meets_target={}, digits_mismatch={}, residual_mismatch={}, stored_residual={}, replayed_residual={}",
+            result.diagnostics.iterations,
+            cfg.solver_steps,
+            correction_meets_target,
+            digits_mismatch,
+            residual_mismatch,
+            result.diagnostics.residual,
+            replayed_residual.map_or_else(|| "none".to_owned(), Float::to_string)
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_root_range(
     artifact: &PortableRootRange,
@@ -9772,120 +10116,28 @@ fn decode_root_range(
     let decoded: Vec<EigenvalueResult> = artifact
         .outcomes
         .iter()
-        .map(|outcome| match outcome {
-            PortableRootOutcome::Converged(result) => result
-                .to_runtime(cfg.precision_bits)
-                .map(EigenvalueResult::Converged),
-            PortableRootOutcome::Stagnated(result) => result
-                .to_runtime(cfg.precision_bits)
-                .map(EigenvalueResult::Stagnated),
-            PortableRootOutcome::Approximate(result) => result
-                .to_runtime(cfg.precision_bits)
-                .map(EigenvalueResult::Approximate),
-            PortableRootOutcome::Failed { iterations, reason } => Ok(EigenvalueResult::Failed {
-                iterations: *iterations,
-                reason: reason.clone(),
-            }),
-        })
+        .map(|outcome| decode_root_outcome(outcome, cfg.precision_bits))
         .collect::<std::result::Result<_, _>>()?;
     let two_pi_over_l = secular_spacing(l, cfg.precision_bits)?;
     let poles = secular_poles(&two_pi_over_l, params.n_modes, cfg.precision_bits);
+    // Collect every numerical check by index, then interleave their errors with
+    // the original sequential ordering checks. Rayon completion order never
+    // changes which malformed root is reported first.
+    let checked = root_execution::ordered_map(decoded.len(), xi.len(), cfg, |index| {
+        validate_root_outcome(
+            &artifact.outcomes[index],
+            &decoded[index],
+            params,
+            cfg,
+            xi,
+            &poles,
+            require_converged,
+        )
+    })?;
     let mut previous: Option<&Float> = None;
-    for (portable, outcome) in artifact.outcomes.iter().zip(&decoded) {
-        let (portable_result, result, status) = match (portable, outcome) {
-            (PortableRootOutcome::Converged(portable), EigenvalueResult::Converged(result)) => {
-                (portable, result, "converged")
-            }
-            (PortableRootOutcome::Stagnated(portable), EigenvalueResult::Stagnated(result)) => {
-                (portable, result, "stagnated")
-            }
-            (PortableRootOutcome::Approximate(portable), EigenvalueResult::Approximate(result)) => {
-                (portable, result, "approximate")
-            }
-            (PortableRootOutcome::Failed { .. }, EigenvalueResult::Failed { .. }) => {
-                return Err(CacheError::InvalidManifest(
-                    "computed CCM root-range payload contains a failed root".to_owned(),
-                ));
-            }
-            _ => unreachable!("portable and decoded root outcome variants match"),
-        };
-        if require_converged && status != "converged" {
-            return Err(CacheError::InvalidManifest(format!(
-                "requested assurance rejects {status} CCM root-range evidence"
-            )));
-        }
-        let value = &result.value;
-        let correction_meets_target = result.diagnostics.final_correction
-            < root_correction_tolerance(value, cfg.precision_bits);
-        let replayed_digits = achieved_decimal_digits(
-            value,
-            &result.diagnostics.final_correction,
-            cfg.precision_bits,
-        );
-        let replayed = secular_residual_and_scale_at(xi, &poles, value, cfg.precision_bits);
-        let replayed_residual = replayed.as_ref().map(|(residual, _)| residual);
-        let replay_term_scale = replayed.as_ref().map(|(_, scale)| scale);
-        // Adaptive evidence replays the same directed witness below at its
-        // recorded verification precision. Requiring a second witness at the
-        // fixed guard precision would undo adaptive cancellation recovery.
-        if !adaptive_precision
-            && status == "converged"
-            && !root_accuracy_witness(
-                xi,
-                &poles,
-                value,
-                expected_target_bits,
-                cfg.precision_bits.saturating_add(GUARD_BITS),
-            )
-        {
-            return Err(CacheError::InvalidManifest(
-                "converged CCM root has no directed local root witness".into(),
-            ));
-        }
-        let invalid_iterations = result.diagnostics.iterations > cfg.solver_steps;
-        let invalid_status = if adaptive_precision {
-            validate_adaptive_root_evidence(
-                portable_result.adaptive_precision.as_ref(),
-                result,
-                status,
-                cfg,
-                xi,
-                &poles,
-            )
-            .is_err()
-        } else {
-            let confirmed_correction = fixed_guard_retained_correction(
-                xi,
-                &poles,
-                value,
-                cfg.precision_bits,
-                cfg.root_solver,
-            );
-            portable_result.adaptive_precision.is_some()
-                || confirmed_correction.as_ref() != Some(&result.diagnostics.final_correction)
-                || (status == "converged" && !correction_meets_target)
-                || (status == "approximate" && result.diagnostics.iterations != cfg.solver_steps)
-        };
-        let digits_mismatch = replayed_digits != result.diagnostics.achieved_decimal_digits;
-        let residual_mismatch = !residual_replay_matches(
-            &result.diagnostics.residual,
-            replayed_residual,
-            replay_term_scale,
-            params.matrix_size(),
-            cfg.precision_bits,
-        );
-        if invalid_iterations || invalid_status || digits_mismatch || residual_mismatch {
-            return Err(CacheError::InvalidManifest(format!(
-                "validated CCM root-range payload has inconsistent convergence diagnostics: status={status}, iterations={}/{}, correction_meets_target={}, digits_mismatch={}, residual_mismatch={}, stored_residual={}, replayed_residual={}",
-                result.diagnostics.iterations,
-                cfg.solver_steps,
-                correction_meets_target,
-                digits_mismatch,
-                residual_mismatch,
-                result.diagnostics.residual,
-                replayed_residual.map_or_else(|| "none".to_owned(), Float::to_string)
-            )));
-        }
+    for (outcome, checked) in decoded.iter().zip(checked) {
+        checked?;
+        let value = outcome.value().expect("validated root has a value");
         if (semantics.domain == IndependentRootDomain::Positive
             && value <= &Float::with_val(cfg.precision_bits, 0))
             || value.is_zero()
@@ -10346,7 +10598,24 @@ fn resolve_root_range_via_cache(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let computed = compute_root_range_detailed(xi, params, l, cfg, seeds);
+            let checkpoints = root_execution::checkpoints(
+                &semantic_key,
+                resolved_eigenstate_solver,
+                xi,
+                l,
+                seeds,
+                cache.mode,
+            );
+            let computed = root_execution::compute(
+                xi,
+                params,
+                l,
+                cfg,
+                seeds,
+                resolved_eigenstate_solver,
+                semantics.domain,
+                checkpoints.as_ref(),
+            )?;
             let runtime_outcomes = computed
                 .iter()
                 .map(|computed| computed.outcome.clone())
@@ -10363,33 +10632,8 @@ fn resolve_root_range_via_cache(
                     .map_err(|error| CacheError::InvalidTransition(error.to_string()))?;
             }
             let outcomes = computed
-                .into_iter()
-                .map(|computed| {
-                    let portable =
-                        |result: &RootRefinement| match computed.adaptive_precision.clone() {
-                            Some(evidence) => {
-                                PortableRootRefinement::from_runtime_adaptive(result, evidence)
-                            }
-                            None => PortableRootRefinement::from_runtime_for_eigenstate_solver(
-                                result,
-                                resolved_eigenstate_solver,
-                            ),
-                        };
-                    match computed.outcome {
-                        EigenvalueResult::Converged(result) => {
-                            PortableRootOutcome::Converged(portable(&result))
-                        }
-                        EigenvalueResult::Stagnated(result) => {
-                            PortableRootOutcome::Stagnated(portable(&result))
-                        }
-                        EigenvalueResult::Approximate(result) => {
-                            PortableRootOutcome::Approximate(portable(&result))
-                        }
-                        EigenvalueResult::Failed { iterations, reason } => {
-                            PortableRootOutcome::Failed { iterations, reason }
-                        }
-                    }
-                })
+                .iter()
+                .map(|computed| root_execution::portable(computed, resolved_eigenstate_solver))
                 .collect();
             let dependencies = canonical_dependency_refs(vec![secular_manifest.clone()]);
             Ok((
@@ -11026,7 +11270,7 @@ const RESPONSE_SPECTRAL_ISOLATION_STATUS: &str = "isolated_simple";
 
 #[derive(Clone, Debug)]
 struct ResponseSpectralPreparation {
-    even_sector_matrix: Vec<Float>,
+    even_sector_matrix: xc_cache::SharedValidated<Vec<Float>>,
     source_matrix_eigenvalue_allowance: Float,
     selected_enclosures: Vec<xc_numerics::eigen::HpTridiagonalEigenvalueEnclosure>,
 }
@@ -11090,7 +11334,7 @@ fn compute_response_spectral_preparation(
         SectorIsolationPolicy::ResponseLowestAndNeighbor,
     )?;
     Ok(ResponseSpectralPreparation {
-        even_sector_matrix,
+        even_sector_matrix: shared_float_vector(even_sector_matrix)?,
         selected_enclosures: eigenvalues.selected_enclosures,
         source_matrix_eigenvalue_allowance,
     })
@@ -11304,8 +11548,8 @@ fn response_spectral_isolation(
     }
     // Directed decimal conversion preserves literal real bounds as well as
     // p-bit round trips. Nearest decimal formatting is not an enclosure.
-    let down = |x: &Float| x.to_string_radix_round(10, None, Round::Down);
-    let up = |x: &Float| x.to_string_radix_round(10, None, Round::Up);
+    let down = |x: &Float| xc_numerics::fmt::decimal_string_round(x, None, Round::Down);
+    let up = |x: &Float| xc_numerics::fmt::decimal_string_round(x, None, Round::Up);
     Ok(PortableResponseSpectralIsolation {
         status: RESPONSE_SPECTRAL_ISOLATION_STATUS.to_owned(),
         parity: CcmParity::Even,
@@ -11331,6 +11575,182 @@ struct EvenSectorBorderedResponseSolver {
     precision_bits: u32,
 }
 
+// Optional execution-only reuse for one retained run. Artifact identities and
+// validation still follow each response's independent cache request.
+#[derive(Default)]
+struct BorderedResponseMemo {
+    slot: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<AdmittedBorderedResponseSolver>>>>,
+}
+
+struct BorderedResponseBinding {
+    matrix: xc_cache::SharedValidated<Vec<Float>>,
+    n_modes: usize,
+    precision_bits: u32,
+    eigenvalue: String,
+    unit_state: String,
+    exponent_range: (i32, i32),
+    arithmetic: Option<&'static str>,
+}
+impl BorderedResponseBinding {
+    fn new(
+        preparation: &ResponseSpectralPreparation,
+        params: &CcmParams,
+        cfg: &HighPrecConfig,
+        eigenvalue: &Float,
+        unit_state: &[Float],
+    ) -> Self {
+        Self {
+            matrix: preparation.even_sector_matrix.clone(),
+            n_modes: params.n_modes,
+            precision_bits: cfg.precision_bits,
+            eigenvalue: hp_values_memo_identity(std::slice::from_ref(eigenvalue)),
+            unit_state: hp_values_memo_identity(unit_state),
+            exponent_range: (rug::float::exp_min(), rug::float::exp_max()),
+            arithmetic: xc_numerics::linalg::dense_lu_arithmetic(params.n_modes + 2),
+        }
+    }
+    fn matches(&self, other: &Self) -> bool {
+        self.matrix.ptr_eq(&other.matrix)
+            && self.n_modes == other.n_modes
+            && self.precision_bits == other.precision_bits
+            && self.eigenvalue == other.eigenvalue
+            && self.unit_state == other.unit_state
+            && self.exponent_range == other.exponent_range
+            && self.arithmetic == other.arithmetic
+    }
+}
+
+struct AdmittedBorderedResponseSolver {
+    solver: EvenSectorBorderedResponseSolver,
+    binding: Option<BorderedResponseBinding>,
+    _reservation: Option<xc_core::MemoryReservation>,
+}
+impl std::ops::Deref for AdmittedBorderedResponseSolver {
+    type Target = EvenSectorBorderedResponseSolver;
+    fn deref(&self) -> &Self::Target {
+        &self.solver
+    }
+}
+impl BorderedResponseMemo {
+    fn clear(&self) {
+        let previous = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(previous);
+    }
+    fn eviction_callback(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        let weak = std::sync::Arc::downgrade(&self.slot);
+        std::sync::Arc::new(move || {
+            if let Some(slot) = weak.upgrade() {
+                let previous = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                drop(previous);
+            }
+        })
+    }
+}
+
+fn bordered_response_retained_bytes(
+    solver: &EvenSectorBorderedResponseSolver,
+    binding: &BorderedResponseBinding,
+) -> u64 {
+    // Even zeros allocate MPFR limbs. The shared source matrix already owns
+    // its reservation; only the additional LU and binding are charged.
+    let floats = (solver.factors.lu.capacity() as u64)
+        .saturating_mul(std::mem::size_of::<Float>() as u64)
+        .saturating_add(solver.factors.lu.iter().fold(0u64, |bytes, value| {
+            bytes.saturating_add(u64::from(value.prec()).div_ceil(64) * 8 + 64)
+        }));
+    floats
+        .saturating_add(
+            (solver.factors.perm.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<usize>() as u64),
+        )
+        .saturating_add(binding.eigenvalue.capacity() as u64)
+        .saturating_add(binding.unit_state.capacity() as u64)
+        .saturating_add(4096)
+}
+
+fn resolve_bordered_response_solver(
+    memo: Option<&BorderedResponseMemo>,
+    preparation: &ResponseSpectralPreparation,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    eigenvalue: &Float,
+    unit_state: &[Float],
+) -> Result<std::sync::Arc<AdmittedBorderedResponseSolver>> {
+    let binding = memo
+        .map(|_| BorderedResponseBinding::new(preparation, params, cfg, eigenvalue, unit_state));
+    if let (Some(memo), Some(binding)) = (memo, binding.as_ref()) {
+        let candidate = memo
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(candidate) = candidate {
+            if candidate
+                .binding
+                .as_ref()
+                .is_some_and(|old| old.matches(binding))
+            {
+                return Ok(candidate);
+            }
+        }
+        memo.clear();
+    }
+    // Never hold the memo lock while factoring or admitting memory: either
+    // operation can cause the run's validated-value memo to evict this slot.
+    let solver = {
+        let _stage = crate::ccm::capture_runtime::Stage::new("bordered response factorization");
+        build_even_sector_bordered_response_solver(
+            preparation,
+            params,
+            cfg,
+            eigenvalue,
+            unit_state,
+        )?
+    };
+    Ok(admit_bordered_response_solver(memo, solver, binding))
+}
+
+fn admit_bordered_response_solver(
+    memo: Option<&BorderedResponseMemo>,
+    solver: EvenSectorBorderedResponseSolver,
+    binding: Option<BorderedResponseBinding>,
+) -> std::sync::Arc<AdmittedBorderedResponseSolver> {
+    let reservation = binding.as_ref().and_then(|binding| {
+        xc_core::RunResources::current().and_then(|resources| {
+            resources
+                .try_reserve_retained(bordered_response_retained_bytes(&solver, binding))
+                .ok()
+        })
+    });
+    let retain = reservation.is_some();
+    let solver = std::sync::Arc::new(AdmittedBorderedResponseSolver {
+        solver,
+        binding: retain.then_some(binding).flatten(),
+        _reservation: reservation,
+    });
+    if retain {
+        if let Some(memo) = memo {
+            *memo
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(solver.clone());
+        }
+    }
+    solver
+}
+
+#[cfg(test)]
+thread_local! {
+    static BORDERED_RESPONSE_FACTORIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn build_even_sector_bordered_response_solver(
     preparation: &ResponseSpectralPreparation,
     params: &CcmParams,
@@ -11338,6 +11758,8 @@ fn build_even_sector_bordered_response_solver(
     state_eigenvalue: &Float,
     unit_state: &[Float],
 ) -> Result<EvenSectorBorderedResponseSolver> {
+    #[cfg(test)]
+    BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.set(count.get() + 1));
     let sector_dimension = params.n_modes + 1;
     let sector_state = restrict_even_sector_vector(unit_state, params.n_modes, cfg.precision_bits)?;
     let bordered_dimension = sector_dimension + 1;
@@ -11354,7 +11776,7 @@ fn build_even_sector_bordered_response_solver(
         bordered[sector_dimension * bordered_dimension + row] = sector_state[row].clone();
     }
     Ok(EvenSectorBorderedResponseSolver {
-        factors: xc_numerics::linalg::lu_factor(&bordered, bordered_dimension)?,
+        factors: xc_numerics::linalg::lu_factor_auto(&bordered, bordered_dimension)?,
         sector_dimension,
         n_modes: params.n_modes,
         precision_bits: cfg.precision_bits,
@@ -11496,6 +11918,8 @@ struct UFlowVelocityActions {
     tau_archimedean: Vec<Float>,
     tau_prime: Vec<Float>,
     tau_total: Vec<Float>,
+    // A decoded private checkpoint owns its admitted storage until consumed.
+    _checkpoint_reservation: Option<xc_core::MemoryReservation>,
 }
 
 #[cfg(test)]
@@ -11626,6 +12050,20 @@ fn compute_u_flow_velocity_actions(
     u_flow_math::evaluate(params, cfg, l, unit_state)
 }
 
+fn compute_u_flow_velocity_actions_checkpointed(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    unit_state: &[Float],
+    semantic: &SemanticKeyEnvelope,
+    mode: xc_cache::ArtifactExecutionCacheMode,
+    assurance: xc_core::AssuranceLevel,
+) -> Result<UFlowVelocityActions> {
+    #[cfg(test)]
+    U_FLOW_ACTION_CALLS.with(|count| count.set(count.get() + 1));
+    u_flow_math::evaluate_checkpointed(params, cfg, l, unit_state, semantic, mode, assurance)
+}
+
 /// Apply one active prime power's additive contribution to `dQ/du` to a
 /// vector, where `u = log(lambda_squared)`. The retained Tau convention is
 /// `pole - archimedean - prime`, so the coefficient below carries the minus
@@ -11739,6 +12177,26 @@ fn bordered_response_relative_residual(
     .map_err(|error| CacheError::InvalidManifest(error.to_string()))
 }
 
+// Every event's matrix rows already use the Rayon pool. Keep event workspaces
+// sequential so several events cannot each reserve scratch for the entire pool.
+// Both production and verifying replay retain canonical event/error ordering.
+fn map_prime_response_chunks<T, R>(
+    events: &[T],
+    mut evaluate: impl FnMut(usize, &[T]) -> R,
+) -> Vec<R> {
+    let resources = xc_core::RunResources::current();
+    let chunk_size = response_performance::event_chunk_size(events.len());
+    events
+        .chunks(chunk_size)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+            evaluate(index * chunk_size, chunk)
+        })
+        .collect()
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn compute_prime_power_response_analysis(
     params: &CcmParams,
@@ -11755,6 +12213,43 @@ fn compute_prime_power_response_analysis(
     secular_manifest: &ArtifactManifest,
     selection_digest: &ContentDigest,
     spectral_preparation: &ResponseSpectralPreparation,
+) -> Result<PortablePrimePowerResponseAnalysis> {
+    compute_prime_power_response_analysis_with_memo(
+        params,
+        cfg,
+        l,
+        tau,
+        state_eigenvalue,
+        xi,
+        roots,
+        first_positive_root_index,
+        tau_manifest,
+        eigenpair_manifest,
+        root_manifest,
+        secular_manifest,
+        selection_digest,
+        spectral_preparation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_prime_power_response_analysis_with_memo(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    tau: &[Float],
+    state_eigenvalue: &Float,
+    xi: &[Float],
+    roots: &[EigenvalueResult],
+    first_positive_root_index: usize,
+    tau_manifest: &ArtifactManifest,
+    eigenpair_manifest: &ArtifactManifest,
+    root_manifest: &ArtifactManifest,
+    secular_manifest: &ArtifactManifest,
+    selection_digest: &ContentDigest,
+    spectral_preparation: &ResponseSpectralPreparation,
+    bordered_memo: Option<&BorderedResponseMemo>,
 ) -> Result<PortablePrimePowerResponseAnalysis> {
     let precision_bits = cfg.precision_bits;
     let dimension = params.matrix_size();
@@ -11775,16 +12270,14 @@ fn compute_prime_power_response_analysis(
         state_eigenvalue,
         &unit_state,
     )?;
-    let bordered_solver = {
-        let _stage = crate::ccm::capture_runtime::Stage::new("bordered response factorization");
-        build_even_sector_bordered_response_solver(
-            spectral_preparation,
-            params,
-            cfg,
-            state_eigenvalue,
-            &unit_state,
-        )?
-    };
+    let bordered_solver = resolve_bordered_response_solver(
+        bordered_memo,
+        spectral_preparation,
+        params,
+        cfg,
+        state_eigenvalue,
+        &unit_state,
+    )?;
     let shifted_frobenius_norm =
         shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits)?;
     let (poles, _) = ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits)?;
@@ -11794,10 +12287,9 @@ fn compute_prime_power_response_analysis(
     let prepared_roots = PreparedRootResponses::new(&unit_state, &poles, roots, precision_bits)?;
     let progress = ResponseProgress::new("compute", prime_content.len(), roots.len());
 
-    let chunk_size = response_performance::event_chunk_size(prime_content.len());
-    let chunks = prime_content
-        .par_chunks(chunk_size)
-        .map(|chunk| -> Result<Vec<PortablePrimePowerResponseEvent>> {
+    let chunks = map_prime_response_chunks(
+        &prime_content,
+        |_, chunk| -> Result<Vec<PortablePrimePowerResponseEvent>> {
             let mut events = Vec::with_capacity(chunk.len());
             for &(power, prime, exponent) in chunk {
                 let velocity = apply_prime_power_velocity(
@@ -11810,12 +12302,26 @@ fn compute_prime_power_response_analysis(
                 )?;
                 let eigenvalue_response =
                     deterministic_dot_hp(&unit_state, &velocity.action, precision_bits)?;
-                let projected_forcing = projected_response_forcing(&velocity.action, &unit_state, &eigenvalue_response, precision_bits)?;
-                let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
+                let projected_forcing = projected_response_forcing(
+                    &velocity.action,
+                    &unit_state,
+                    &eigenvalue_response,
+                    precision_bits,
+                )?;
+                let projected_forcing_norm =
+                    deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
                 let (eigenvector_response, lagrange_multiplier) =
                     solve_even_sector_bordered_response(&bordered_solver, &projected_forcing)?;
-                let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits)?;
-                let ccm_scale_response = response_normalization_tangent(&unit_state, &eigenvector_response, &Float::with_val(precision_bits, 0), &ccm_scale, &unit_state_sum, precision_bits)?;
+                let response_norm =
+                    deterministic_l2_norm_hp(&eigenvector_response, precision_bits)?;
+                let ccm_scale_response = response_normalization_tangent(
+                    &unit_state,
+                    &eigenvector_response,
+                    &Float::with_val(precision_bits, 0),
+                    &ccm_scale,
+                    &unit_state_sum,
+                    precision_bits,
+                )?;
                 let root_velocity_responses = prepared_roots.values(&eigenvector_response)?;
                 let relative_residual = bordered_response_relative_residual(
                     tau,
@@ -11827,36 +12333,41 @@ fn compute_prime_power_response_analysis(
                     &shifted_frobenius_norm,
                     precision_bits,
                 )?;
-                if !weil_eigvec_cache::residual_within_precision_floor(&relative_residual, precision_bits) {
+                if !weil_eigvec_cache::residual_within_precision_floor(
+                    &relative_residual,
+                    precision_bits,
+                ) {
                     bail!(
                         "prime-power response bordered solve for {power} failed its precision-scaled residual gate"
                     );
-            }
+                }
 
-            events.push(PortablePrimePowerResponseEvent {
-                power,
-                prime,
-                exponent,
-                log_power: lossless_hp_decimal(&velocity.log_power),
-                von_mangoldt_weight: lossless_hp_decimal(&velocity.von_mangoldt_weight),
-                reduced_position: lossless_hp_decimal(&velocity.reduced_position),
-                velocity_coefficient: lossless_hp_decimal(&velocity.velocity_coefficient),
-                edge_jump_coefficient: lossless_hp_decimal(&velocity.edge_jump_coefficient),
-                observation_is_event_edge: cutoff_equals_event_power(&lambda_identity, power)?,
-                eigenvalue_velocity_response: lossless_hp_decimal(&eigenvalue_response),
-                projected_forcing_norm: lossless_hp_decimal(&projected_forcing_norm),
-                l2_eigenvector_velocity_response_norm: lossless_hp_decimal(&response_norm),
-                l2_eigenvector_velocity_response: encode_hp_vector(&eigenvector_response),
-                ccm_normalization_scale_velocity_response: lossless_hp_decimal(&ccm_scale_response),
-                bordered_lagrange_multiplier: lossless_hp_decimal(&lagrange_multiplier),
-                bordered_solve_relative_residual: lossless_hp_decimal(&relative_residual),
-                root_velocity_responses,
-            });
+                events.push(PortablePrimePowerResponseEvent {
+                    power,
+                    prime,
+                    exponent,
+                    log_power: lossless_hp_decimal(&velocity.log_power),
+                    von_mangoldt_weight: lossless_hp_decimal(&velocity.von_mangoldt_weight),
+                    reduced_position: lossless_hp_decimal(&velocity.reduced_position),
+                    velocity_coefficient: lossless_hp_decimal(&velocity.velocity_coefficient),
+                    edge_jump_coefficient: lossless_hp_decimal(&velocity.edge_jump_coefficient),
+                    observation_is_event_edge: cutoff_equals_event_power(&lambda_identity, power)?,
+                    eigenvalue_velocity_response: lossless_hp_decimal(&eigenvalue_response),
+                    projected_forcing_norm: lossless_hp_decimal(&projected_forcing_norm),
+                    l2_eigenvector_velocity_response_norm: lossless_hp_decimal(&response_norm),
+                    l2_eigenvector_velocity_response: encode_hp_vector(&eigenvector_response),
+                    ccm_normalization_scale_velocity_response: lossless_hp_decimal(
+                        &ccm_scale_response,
+                    ),
+                    bordered_lagrange_multiplier: lossless_hp_decimal(&lagrange_multiplier),
+                    bordered_solve_relative_residual: lossless_hp_decimal(&relative_residual),
+                    root_velocity_responses,
+                });
                 progress.completed();
             }
             Ok(events)
-        })
-        .collect::<Vec<_>>();
+        },
+    );
     let events = chunks
         .into_iter()
         .collect::<Result<Vec<_>>>()?
@@ -11970,120 +12481,114 @@ fn validate_prime_power_response_analysis(
     let prepared_roots = PreparedRootResponses::new(&unit_state, &poles, roots, precision_bits)
         .map_err(|error| invalid(error.to_string()))?;
     let progress = ResponseProgress::new("validate", expected_content.len(), roots.len());
-    let chunk_size = response_performance::event_chunk_size(artifact.events.len());
-    let chunks = artifact
-        .events
-        .par_chunks(chunk_size)
-        .enumerate()
-        .map(
-            |(chunk_index, events)| -> std::result::Result<(), CacheError> {
-                for (event, (power, prime, exponent)) in events
-                    .iter()
-                    .zip(expected_content[chunk_index * chunk_size..].iter().copied())
+    let chunks = map_prime_response_chunks(
+        &artifact.events,
+        |offset, events| -> std::result::Result<(), CacheError> {
+            for (event, (power, prime, exponent)) in events
+                .iter()
+                .zip(expected_content[offset..].iter().copied())
+            {
+                if event.power != power
+                    || event.prime != prime
+                    || event.exponent != exponent
+                    || event.observation_is_event_edge
+                        != cutoff_equals_event_power(&lambda_identity, power)
+                            .map_err(|e| invalid(e.to_string()))?
+                    || event.l2_eigenvector_velocity_response.len() != dimension
+                    || event.root_velocity_responses.len() != roots.len()
                 {
-                    if event.power != power
-                        || event.prime != prime
-                        || event.exponent != exponent
-                        || event.observation_is_event_edge
-                            != cutoff_equals_event_power(&lambda_identity, power)
-                                .map_err(|e| invalid(e.to_string()))?
-                        || event.l2_eigenvector_velocity_response.len() != dimension
-                        || event.root_velocity_responses.len() != roots.len()
-                    {
-                        return Err(invalid(format!(
-                "CCM prime-power response event {power} has incompatible shape or identity"
-            )));
-                    }
-                    let velocity = apply_prime_power_velocity(
-                        params.n_modes,
-                        power,
-                        prime,
-                        l,
-                        &unit_state,
+                    return Err(invalid(format!(
+                        "CCM prime-power response event {power} has incompatible shape or identity"
+                    )));
+                }
+                let velocity = apply_prime_power_velocity(
+                    params.n_modes,
+                    power,
+                    prime,
+                    l,
+                    &unit_state,
+                    precision_bits,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+                let eigenvalue_response =
+                    deterministic_dot_hp(&unit_state, &velocity.action, precision_bits)?;
+                let projected_forcing = projected_response_forcing(
+                    &velocity.action,
+                    &unit_state,
+                    &eigenvalue_response,
+                    precision_bits,
+                )?;
+                let projected_forcing_norm =
+                    deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
+                let response =
+                    parse_hp_vector(&event.l2_eigenvector_velocity_response, precision_bits)?;
+                if response.iter().any(|value| !value.is_finite()) {
+                    return Err(invalid(format!(
+                        "CCM prime-power response event {power} contains a nonfinite vector value"
+                    )));
+                }
+                let response_norm = deterministic_l2_norm_hp(&response, precision_bits)?;
+                let ccm_scale_response = response_normalization_tangent(
+                    &unit_state,
+                    &response,
+                    &Float::with_val(precision_bits, 0),
+                    &ccm_scale,
+                    &unit_state_sum,
+                    precision_bits,
+                )?;
+                let lagrange_multiplier =
+                    parse_hp_scalar(&event.bordered_lagrange_multiplier, precision_bits)?;
+                let relative_residual = bordered_response_relative_residual(
+                    tau,
+                    state_eigenvalue,
+                    &unit_state,
+                    &projected_forcing,
+                    &response,
+                    &lagrange_multiplier,
+                    &shifted_frobenius_norm,
+                    precision_bits,
+                )?;
+
+                if event.log_power != lossless_hp_decimal(&velocity.log_power)
+                    || event.von_mangoldt_weight
+                        != lossless_hp_decimal(&velocity.von_mangoldt_weight)
+                    || event.reduced_position != lossless_hp_decimal(&velocity.reduced_position)
+                    || event.velocity_coefficient
+                        != lossless_hp_decimal(&velocity.velocity_coefficient)
+                    || event.edge_jump_coefficient
+                        != lossless_hp_decimal(&velocity.edge_jump_coefficient)
+                    || event.eigenvalue_velocity_response
+                        != lossless_hp_decimal(&eigenvalue_response)
+                    || event.projected_forcing_norm != lossless_hp_decimal(&projected_forcing_norm)
+                    || event.l2_eigenvector_velocity_response_norm
+                        != lossless_hp_decimal(&response_norm)
+                    || event.ccm_normalization_scale_velocity_response
+                        != lossless_hp_decimal(&ccm_scale_response)
+                    || event.bordered_solve_relative_residual
+                        != lossless_hp_decimal(&relative_residual)
+                    || !weil_eigvec_cache::residual_within_precision_floor(
+                        &relative_residual,
                         precision_bits,
                     )
-                    .map_err(|error| invalid(error.to_string()))?;
-                    let eigenvalue_response =
-                        deterministic_dot_hp(&unit_state, &velocity.action, precision_bits)?;
-                    let projected_forcing = projected_response_forcing(
-                        &velocity.action,
-                        &unit_state,
-                        &eigenvalue_response,
-                        precision_bits,
-                    )?;
-                    let projected_forcing_norm =
-                        deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
-                    let response =
-                        parse_hp_vector(&event.l2_eigenvector_velocity_response, precision_bits)?;
-                    if response.iter().any(|value| !value.is_finite()) {
-                        return Err(invalid(format!(
-                "CCM prime-power response event {power} contains a nonfinite vector value"
-            )));
-                    }
-                    let response_norm = deterministic_l2_norm_hp(&response, precision_bits)?;
-                    let ccm_scale_response = response_normalization_tangent(
-                        &unit_state,
-                        &response,
-                        &Float::with_val(precision_bits, 0),
-                        &ccm_scale,
-                        &unit_state_sum,
-                        precision_bits,
-                    )?;
-                    let lagrange_multiplier =
-                        parse_hp_scalar(&event.bordered_lagrange_multiplier, precision_bits)?;
-                    let relative_residual = bordered_response_relative_residual(
-                        tau,
-                        state_eigenvalue,
-                        &unit_state,
-                        &projected_forcing,
-                        &response,
-                        &lagrange_multiplier,
-                        &shifted_frobenius_norm,
-                        precision_bits,
-                    )?;
-
-                    if event.log_power != lossless_hp_decimal(&velocity.log_power)
-                        || event.von_mangoldt_weight
-                            != lossless_hp_decimal(&velocity.von_mangoldt_weight)
-                        || event.reduced_position != lossless_hp_decimal(&velocity.reduced_position)
-                        || event.velocity_coefficient
-                            != lossless_hp_decimal(&velocity.velocity_coefficient)
-                        || event.edge_jump_coefficient
-                            != lossless_hp_decimal(&velocity.edge_jump_coefficient)
-                        || event.eigenvalue_velocity_response
-                            != lossless_hp_decimal(&eigenvalue_response)
-                        || event.projected_forcing_norm
-                            != lossless_hp_decimal(&projected_forcing_norm)
-                        || event.l2_eigenvector_velocity_response_norm
-                            != lossless_hp_decimal(&response_norm)
-                        || event.ccm_normalization_scale_velocity_response
-                            != lossless_hp_decimal(&ccm_scale_response)
-                        || event.bordered_solve_relative_residual
-                            != lossless_hp_decimal(&relative_residual)
-                        || !weil_eigvec_cache::residual_within_precision_floor(
-                            &relative_residual,
-                            precision_bits,
-                        )
-                    {
-                        return Err(invalid(format!(
-                            "CCM prime-power response event {power} failed its numerical replay"
-                        )));
-                    }
-
-                    let expected = prepared_roots
-                        .values(&response)
-                        .map_err(|error| invalid(error.to_string()))?;
-                    if event.root_velocity_responses != expected {
-                        return Err(invalid(format!(
-                            "CCM prime-power response event {power} has an invalid root response"
-                        )));
-                    }
-                    progress.completed();
+                {
+                    return Err(invalid(format!(
+                        "CCM prime-power response event {power} failed its numerical replay"
+                    )));
                 }
-                Ok(())
-            },
-        )
-        .collect::<Vec<_>>();
+
+                let expected = prepared_roots
+                    .values(&response)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if event.root_velocity_responses != expected {
+                    return Err(invalid(format!(
+                        "CCM prime-power response event {power} has an invalid root response"
+                    )));
+                }
+                progress.completed();
+            }
+            Ok(())
+        },
+    );
     for chunk in chunks {
         chunk?;
     }
@@ -12105,6 +12610,41 @@ fn resolve_prime_power_response_analysis_via_cache(
     root_manifest: &ArtifactManifest,
     secular_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
+) -> Result<PortablePrimePowerResponseAnalysis> {
+    resolve_prime_power_response_analysis_via_cache_with_memo(
+        params,
+        cfg,
+        l,
+        tau,
+        state_eigenvalue,
+        xi,
+        roots,
+        first_positive_root_index,
+        tau_manifest,
+        eigenpair_manifest,
+        root_manifest,
+        secular_manifest,
+        cache,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_prime_power_response_analysis_via_cache_with_memo(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    tau: &[Float],
+    state_eigenvalue: &Float,
+    xi: &[Float],
+    roots: &[EigenvalueResult],
+    first_positive_root_index: usize,
+    tau_manifest: &ArtifactManifest,
+    eigenpair_manifest: &ArtifactManifest,
+    root_manifest: &ArtifactManifest,
+    secular_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+    bordered_memo: Option<&BorderedResponseMemo>,
 ) -> Result<PortablePrimePowerResponseAnalysis> {
     if roots.is_empty() {
         bail!("CCM prime-power response capture requires at least one root outcome");
@@ -12135,6 +12675,10 @@ fn resolve_prime_power_response_analysis_via_cache(
         "velocity_parameter": PRIME_POWER_RESPONSE_VELOCITY_PARAMETER,
         "response_definition": PRIME_POWER_RESPONSE_DEFINITION,
     });
+    // The bordered solve has dimension N+2 and can change even when the
+    // retained primary state is numerically identical under two LU policies.
+    // Bind its own arithmetic before lookup rather than relying on ancestry.
+    add_dense_lu_arithmetic(&mut resolved_parameters, params.n_modes + 2);
     add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
@@ -12201,7 +12745,7 @@ fn resolve_prime_power_response_analysis_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
+        minimum_reader_version: ToolkitVersion::parse("0.17.0")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -12218,7 +12762,7 @@ fn resolve_prime_power_response_analysis_via_cache(
         &request,
         || {
             let _stage = crate::ccm::capture_runtime::Stage::new("prime-power response solves");
-            let artifact = compute_prime_power_response_analysis(
+            let artifact = compute_prime_power_response_analysis_with_memo(
                 params,
                 cfg,
                 l,
@@ -12233,8 +12777,9 @@ fn resolve_prime_power_response_analysis_via_cache(
                 secular_manifest,
                 &selection_digest,
                 &spectral_preparation.numerical,
+                bordered_memo,
             )
-            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            .map_err(|error| CacheError::InvalidManifest(format!("{error:#}")))?;
             // Explicit verification modes retain independent numerical replay.
             if !cache.mode.compares_against_reference() {
                 fresh.record(&artifact)?;
@@ -12334,7 +12879,8 @@ fn compute_u_flow_response_channel(
     if action.len() != dimension {
         bail!("CCM u-flow channel {channel} has an incompatible action dimension");
     }
-    let eigenvalue_response = deterministic_dot_hp(unit_state, action, precision_bits)?;
+    let eigenvalue_response = deterministic_dot_hp(unit_state, action, precision_bits)
+        .context("eigenvalue-response dot product")?;
     let projected_forcing =
         projected_response_forcing(action, unit_state, &eigenvalue_response, precision_bits)?;
     let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
@@ -12401,6 +12947,7 @@ fn compute_u_flow_response_channel(
     ))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn compute_u_flow_response_analysis(
     params: &CcmParams,
@@ -12418,6 +12965,45 @@ fn compute_u_flow_response_analysis(
     selection_digest: &ContentDigest,
     velocity_actions: &UFlowVelocityActions,
     spectral_preparation: &ResponseSpectralPreparation,
+) -> Result<PortableUFlowResponseAnalysis> {
+    compute_u_flow_response_analysis_with_memo(
+        params,
+        cfg,
+        l,
+        tau,
+        state_eigenvalue,
+        xi,
+        roots,
+        first_positive_root_index,
+        tau_manifest,
+        eigenpair_manifest,
+        root_manifest,
+        secular_manifest,
+        selection_digest,
+        velocity_actions,
+        spectral_preparation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_u_flow_response_analysis_with_memo(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    tau: &[Float],
+    state_eigenvalue: &Float,
+    xi: &[Float],
+    roots: &[EigenvalueResult],
+    first_positive_root_index: usize,
+    tau_manifest: &ArtifactManifest,
+    eigenpair_manifest: &ArtifactManifest,
+    root_manifest: &ArtifactManifest,
+    secular_manifest: &ArtifactManifest,
+    selection_digest: &ContentDigest,
+    velocity_actions: &UFlowVelocityActions,
+    spectral_preparation: &ResponseSpectralPreparation,
+    bordered_memo: Option<&BorderedResponseMemo>,
 ) -> Result<PortableUFlowResponseAnalysis> {
     let precision_bits = cfg.precision_bits;
     let dimension = params.matrix_size();
@@ -12438,16 +13024,14 @@ fn compute_u_flow_response_analysis(
         state_eigenvalue,
         &unit_state,
     )?;
-    let bordered_solver = {
-        let _stage = crate::ccm::capture_runtime::Stage::new("bordered response factorization");
-        build_even_sector_bordered_response_solver(
-            spectral_preparation,
-            params,
-            cfg,
-            state_eigenvalue,
-            &unit_state,
-        )?
-    };
+    let bordered_solver = resolve_bordered_response_solver(
+        bordered_memo,
+        spectral_preparation,
+        params,
+        cfg,
+        state_eigenvalue,
+        &unit_state,
+    )?;
     let shifted_frobenius_norm =
         shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits)?;
     let (poles, pole_velocities) =
@@ -12481,7 +13065,8 @@ fn compute_u_flow_response_analysis(
             &bordered_solver,
             &shifted_frobenius_norm,
             precision_bits,
-        )?;
+        )
+        .with_context(|| format!("u-flow response channel {channel}"))?;
         if index + 1 == U_FLOW_CHANNELS.len() {
             total_l2_vector_response = Some(l2_vector_response);
         }
@@ -12847,6 +13432,41 @@ fn resolve_u_flow_response_analysis_via_cache(
     secular_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<PortableUFlowResponseAnalysis> {
+    resolve_u_flow_response_analysis_via_cache_with_memo(
+        params,
+        cfg,
+        l,
+        tau,
+        state_eigenvalue,
+        xi,
+        roots,
+        first_positive_root_index,
+        tau_manifest,
+        eigenpair_manifest,
+        root_manifest,
+        secular_manifest,
+        cache,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_u_flow_response_analysis_via_cache_with_memo(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    tau: &[Float],
+    state_eigenvalue: &Float,
+    xi: &[Float],
+    roots: &[EigenvalueResult],
+    first_positive_root_index: usize,
+    tau_manifest: &ArtifactManifest,
+    eigenpair_manifest: &ArtifactManifest,
+    root_manifest: &ArtifactManifest,
+    secular_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+    bordered_memo: Option<&BorderedResponseMemo>,
+) -> Result<PortableUFlowResponseAnalysis> {
     if roots.is_empty() {
         bail!("CCM u-flow response capture requires at least one root outcome");
     }
@@ -12877,6 +13497,7 @@ fn resolve_u_flow_response_analysis_via_cache(
         "velocity_parameter": U_FLOW_RESPONSE_VELOCITY_PARAMETER,
         "derivative_convention": U_FLOW_RESPONSE_DERIVATIVE_CONVENTION,
     });
+    add_dense_lu_arithmetic(&mut resolved_parameters, params.n_modes + 2);
     add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
@@ -12949,7 +13570,7 @@ fn resolve_u_flow_response_analysis_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
+        minimum_reader_version: ToolkitVersion::parse("0.17.0")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -12965,11 +13586,19 @@ fn resolve_u_flow_response_analysis_via_cache(
             let unit_state = response_unit_state(xi, precision_bits)?;
             let velocity_actions = {
                 let _stage = crate::ccm::capture_runtime::Stage::new("u-flow velocity actions");
-                compute_u_flow_velocity_actions(params, cfg, l, &unit_state)
-                    .map_err(|e| CacheError::InvalidManifest(e.to_string()))?
+                compute_u_flow_velocity_actions_checkpointed(
+                    params,
+                    cfg,
+                    l,
+                    &unit_state,
+                    &semantic_key,
+                    cache.mode,
+                    cache.requested_assurance,
+                )
+                .map_err(|e| CacheError::InvalidManifest(format!("{e:#}")))?
             };
             let _stage = crate::ccm::capture_runtime::Stage::new("u-flow response solves");
-            let artifact = compute_u_flow_response_analysis(
+            let artifact = compute_u_flow_response_analysis_with_memo(
                 params,
                 cfg,
                 l,
@@ -12985,8 +13614,9 @@ fn resolve_u_flow_response_analysis_via_cache(
                 &selection_digest,
                 &velocity_actions,
                 &spectral_preparation.numerical,
+                bordered_memo,
             )
-            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            .map_err(|error| CacheError::InvalidManifest(format!("{error:#}")))?;
             // Explicit verification modes retain independent numerical replay.
             if !cache.mode.compares_against_reference() {
                 fresh.record(&artifact)?;
@@ -14391,6 +15021,24 @@ fn run_inner(
         .map(|(result, _)| result)
 }
 
+// Every primary/evenness entry shares one run owner across source construction
+// and all solves. An existing owner is authoritative, including its live
+// reservations and numerical-pool limit.
+fn ccm_run_resources() -> Result<xc_core::RunResources> {
+    let resources = xc_core::RunResources::current()
+        .map(Ok)
+        .unwrap_or_else(|| {
+            xc_core::RunResources::with_worker_limit(
+                crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()
+                    .map_err(|e| xc_core::ConfigError::new(e.to_string()))?
+                    .maximum_working_bytes,
+                rayon::current_num_threads(),
+            )
+        })?;
+    resources.check_workers(rayon::current_num_threads())?;
+    Ok(resources)
+}
+
 fn run_inner_retaining_source(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -14398,6 +15046,12 @@ fn run_inner_retaining_source(
     cache_route: CcmCacheRoute<'_>,
     continuation: Option<(&[Float], &ArtifactManifest)>,
 ) -> Result<(HighPrecResult, RetainedCcmSource)> {
+    let resources = ccm_run_resources()?;
+    let _resource_scope = resources.enter();
+    let memo = xc_cache::ValidatedValueMemo::current().unwrap_or_else(|| {
+        xc_cache::ValidatedValueMemo::new(resources.clone(), resources.maximum_bytes() / 4)
+    });
+    let _memo_scope = memo.enter();
     cfg.validate_source_admission(params)?;
     if !matches!(acquisition, RootAcquisition::SourceOnly) {
         cfg.validate_root_precision_policy()?;
@@ -14408,6 +15062,13 @@ fn run_inner_retaining_source(
     let _performance_primary = xc_core::performance_top_level_stage_with("ccm.hp.primary", || {
         ccm_performance_metadata("ccm.hp.primary", dim, prec)
     });
+    if !cfg.archimedean_gl_generator.is_legacy()
+        && matches!(&cache_route, CcmCacheRoute::Standalone)
+    {
+        bail!(
+            "alternate Archimedean quadrature generators require a managed source dependency graph"
+        );
+    }
     if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov
         && matches!(&cache_route, CcmCacheRoute::Standalone)
     {
@@ -14422,7 +15083,7 @@ fn run_inner_retaining_source(
         ccm_performance_metadata("ccm.hp.tau", dim, prec)
     });
     let (mut tau, tau_manifest) = match &cache_route {
-        CcmCacheRoute::Standalone => (build_tau_hp(params, &l, cfg)?, None),
+        CcmCacheRoute::Standalone => (shared_float_vector(build_tau_hp(params, &l, cfg)?)?, None),
         CcmCacheRoute::Fabric(cache) => {
             let (tau, manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
             (tau, Some(manifest))
@@ -14435,7 +15096,7 @@ fn run_inner_retaining_source(
     drop(performance_tau);
 
     // Force exact symmetry of the τ-matrix (parallel compute, sequential write).
-    force_symmetric(&mut tau, dim)?;
+    force_shared_symmetric(&mut tau, dim)?;
 
     // Smallest eigenpair (ξ, ε_N).
     //
@@ -14559,12 +15220,14 @@ fn run_inner_retaining_source(
                             sector_dimension,
                             sector_dimension
                         );
-                        let output = xc_numerics::linalg::inverse_iteration_detailed(
+                        let output = xc_numerics::linalg::inverse_iteration_auto_detailed(
                             &sector,
                             sector_dimension,
                             prec,
                             cfg.inverse_iter_steps,
                             false,
+                            None,
+                            None,
                         )?;
                         (
                             output.eigenvalue,
@@ -14578,27 +15241,20 @@ fn run_inner_retaining_source(
                             dim
                         );
                         let project_adaptively = parity_policy == CcmParityPolicy::AdaptiveEven;
-                        let output = if let Some(warm) = warm_xi {
+                        if warm_xi.is_some() {
                             crate::hp_debug!(
                                 "[HP] starting inverse iteration from warm-start vector"
                             );
-                            xc_numerics::linalg::inverse_iteration_from_detailed(
-                                &tau,
-                                dim,
-                                prec,
-                                cfg.inverse_iter_steps,
-                                project_adaptively,
-                                Some(warm),
-                            )?
-                        } else {
-                            xc_numerics::linalg::inverse_iteration_detailed(
-                                &tau,
-                                dim,
-                                prec,
-                                cfg.inverse_iter_steps,
-                                project_adaptively,
-                            )?
-                        };
+                        }
+                        let output = xc_numerics::linalg::inverse_iteration_auto_detailed(
+                            &tau,
+                            dim,
+                            prec,
+                            cfg.inverse_iter_steps,
+                            project_adaptively,
+                            warm_xi,
+                            None,
+                        )?;
                         (output.eigenvalue, output.eigenvector, output.diagnostics)
                     };
                     crate::hp_debug!("[HP] LU factorization done.");
@@ -14643,8 +15299,6 @@ fn run_inner_retaining_source(
     );
     drop(performance_eigenstate);
 
-    let stored_state_resolution =
-        stored_resolution::bounds(&tau, &xi, &eps_n, prec, parity_policy)?.record;
     let ground_index_admission = match cfg.ground_index_policy {
         CcmGroundIndexPolicy::Require => None,
         CcmGroundIndexPolicy::RecordOutcome => Some(match &cache_route {
@@ -14661,6 +15315,15 @@ fn run_inner_retaining_source(
             )?),
         }),
     };
+    let stored_state_resolution =
+        stored_resolution::bounds(&tau, &xi, &eps_n, prec, parity_policy)?.admit(
+            &ground_index_admission
+                .as_ref()
+                .map(CcmGroundIndexAdmission::admitted_outcome)
+                .transpose()?
+                .unwrap_or(ground_index::Outcome::Proven),
+            cfg.ground_index_policy,
+        );
     if let Some(CcmGroundIndexAdmission {
         established: false,
         reason,
@@ -14961,12 +15624,15 @@ pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<Even
         cfg.precision_bits,
         CcmParityPolicy::Natural,
     )?;
+    let resources = ccm_run_resources()?;
+    let _resource_scope = resources.enter();
     let managed =
         xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
     if let Some(managed) = &managed {
         let cache = managed.context();
-        let result =
-            xc_numerics::hp_runtime::run_hp(|| measure_evenness_via_cache(params, cfg, &cache))?;
+        let result = xc_numerics::hp_runtime::run_hp(|| {
+            measure_evenness_via_cache_inner(params, cfg, &cache)
+        })?;
         managed
             .finalize_publication_inventory()
             .map_err(anyhow::Error::from)?;
@@ -14974,7 +15640,7 @@ pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<Even
     } else {
         let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
         let tau = build_tau_hp(params, &l, cfg)?;
-        measure_evenness_from_tau(params, cfg, tau)
+        measure_evenness_from_tau(params, cfg, shared_float_vector(tau)?)
     }
 }
 
@@ -15015,12 +15681,33 @@ fn evenness_from_natural_state(
     }
 }
 
-fn measure_evenness_via_cache(
+/// Explicit-cache variant of [`measure_evenness`].
+///
+/// The caller controls reuse, staging, and publication finalization through
+/// `cache`. This function retains the same natural and even-sector measurements
+/// but never finalizes publication. Configured cache overlays may still perform
+/// authenticated reads while resolving their inputs.
+pub fn measure_evenness_via_cache(
     params: &CcmParams,
     cfg: &HighPrecConfig,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<EvennessResult> {
     validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
+    ground_index::preflight(
+        params.matrix_size(),
+        cfg.precision_bits,
+        CcmParityPolicy::Natural,
+    )?;
+    let resources = ccm_run_resources()?;
+    let _resource_scope = resources.enter();
+    xc_numerics::hp_runtime::run_hp(|| measure_evenness_via_cache_inner(params, cfg, cache))
+}
+
+fn measure_evenness_via_cache_inner(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<EvennessResult> {
     let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
     let (tau, tau_manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
     measure_evenness_from_retained_source_via_cache(params, cfg, tau, tau_manifest, cache)
@@ -15029,13 +15716,13 @@ fn measure_evenness_via_cache(
 fn measure_evenness_from_retained_source_via_cache(
     params: &CcmParams,
     cfg: &HighPrecConfig,
-    mut tau: Vec<Float>,
+    mut tau: xc_cache::SharedValidated<Vec<Float>>,
     tau_manifest: ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<EvennessResult> {
     validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
     let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
-    force_symmetric(&mut tau, params.matrix_size())?;
+    force_shared_symmetric(&mut tau, params.matrix_size())?;
 
     let mut natural_cfg = cfg.clone();
     natural_cfg.set_parity_policy(CcmParityPolicy::Natural);
@@ -15184,17 +15871,25 @@ fn admit_unpersisted_ground_index(
 fn measure_evenness_from_tau(
     params: &CcmParams,
     cfg: &HighPrecConfig,
-    mut tau: Vec<Float>,
+    mut tau: xc_cache::SharedValidated<Vec<Float>>,
 ) -> Result<EvennessResult> {
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
 
     // Force exact symmetry of the τ-matrix (parallel compute, sequential write).
-    force_symmetric(&mut tau, dim)?;
+    force_shared_symmetric(&mut tau, dim)?;
 
     // Natural (unforced) smallest eigenpair.
-    let (natural_eval, xi_natural) =
-        xc_numerics::linalg::inverse_iteration(&tau, dim, prec, cfg.inverse_iter_steps, false)?;
+    let natural = xc_numerics::linalg::inverse_iteration_auto_detailed(
+        &tau,
+        dim,
+        prec,
+        cfg.inverse_iter_steps,
+        false,
+        None,
+        None,
+    )?;
+    let (natural_eval, xi_natural) = (natural.eigenvalue, natural.eigenvector);
     let xi_natural = response_point_math::unit_state(&xi_natural, prec)?;
     if !weil_eigvec_cache::residual_ok(&tau, dim, &xi_natural, &natural_eval, prec) {
         bail!("natural evenness state failed its directed source residual gate");
@@ -15208,8 +15903,16 @@ fn measure_evenness_from_tau(
     )?;
 
     // Forced-even smallest eigenpair.
-    let (forced_eval, xi_forced) =
-        xc_numerics::linalg::inverse_iteration(&tau, dim, prec, cfg.inverse_iter_steps, true)?;
+    let forced = xc_numerics::linalg::inverse_iteration_auto_detailed(
+        &tau,
+        dim,
+        prec,
+        cfg.inverse_iter_steps,
+        true,
+        None,
+        None,
+    )?;
+    let (forced_eval, xi_forced) = (forced.eigenvalue, forced.eigenvector);
     let xi_forced = response_point_math::unit_state(&xi_forced, prec)?;
     if !weil_eigvec_cache::residual_ok(&tau, dim, &xi_forced, &forced_eval, prec) {
         bail!("forced-even evenness state failed its directed source residual gate");
@@ -15291,7 +15994,9 @@ pub struct EvennessResult {
 /// Legacy files remain readable only along explicitly internal standalone routes.
 fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<Vec<Float>> {
     validate_managed_source_length(params, cfg, l)?;
-    if cfg.research_quadrature_policy != super::research::QuadraturePolicy::AdaptiveFloor {
+    if cfg.research_quadrature_policy != super::research::QuadraturePolicy::AdaptiveFloor
+        || !cfg.archimedean_gl_generator.is_legacy()
+    {
         // Legacy filenames have no policy field. Never read or overwrite them
         // with fixed-order experiments; managed artifacts bind the full policy.
         return build_tau_hp_compute(params, l, cfg, true);
@@ -15392,7 +16097,9 @@ fn direct_matrix_tau(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Res
     managed.output_validation = None;
     managed.cache_mode = xc_cache::ArtifactExecutionCacheMode::PreferReuse;
     let session = xc_cache::ManagedArtifactCacheSession::new(managed)?;
-    Ok(build_tau_hp_via_cache(params, l, cfg, &session.context())?.0)
+    Ok(build_tau_hp_via_cache(params, l, cfg, &session.context())?
+        .0
+        .into_owned())
 }
 
 fn weil_matrix_hp_inner(
@@ -15878,6 +16585,84 @@ fn report_quadrature_precompute_summary(
     detail
 }
 
+// Operational scheduling only: no quadrature order, guard, scalar operation,
+// output precision, or artifact identity is selected by this helper.
+fn integral_batch_width() -> Result<usize> {
+    let workers = rayon::current_num_threads();
+    if let Some(resources) = xc_core::RunResources::current() {
+        // Nested node preparation still uses the entire existing Rayon pool.
+        // Capping outer jobs is not permission to exceed its admitted limit.
+        resources.check_workers(workers)?;
+    }
+    Ok(workers.clamp(1, 16))
+}
+
+fn map_integral_batches<T, U>(
+    orders: &[usize],
+    width: usize,
+    prepare: impl Fn(usize) -> Result<T> + Sync,
+    evaluate: impl Fn(usize, &T) -> Result<U> + Sync,
+) -> Result<Vec<U>>
+where
+    T: Send + Sync,
+    U: Send,
+{
+    if orders.is_empty() || width == 0 || width > 16 {
+        bail!("invalid integral batch shape or width");
+    }
+    let mut groups = BTreeMap::<usize, Vec<usize>>::new();
+    for (mode, &order) in orders.iter().enumerate() {
+        groups.entry(order).or_default().push(mode);
+    }
+    let groups: Vec<_> = groups.into_iter().collect();
+    let resources = xc_core::RunResources::current();
+    let mut values: Vec<Option<Result<U>>> = (0..orders.len()).map(|_| None).collect();
+    for batch in groups.chunks(width) {
+        // At most width preparation closures can exist, including suspended
+        // parents of nested node-parallel jobs. Do not collect Result directly:
+        // select initial-table failures in sorted rule order after this batch.
+        let tables: Vec<Result<T>> = batch
+            .par_iter()
+            .map(|(q, _)| {
+                let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+                prepare(*q)
+            })
+            .collect();
+        let tables: Vec<T> = tables.into_iter().collect::<Result<_>>()?;
+        let mut jobs = Vec::new();
+        for (slot, (_, modes)) in batch.iter().enumerate() {
+            jobs.extend(modes.iter().map(|&mode| (mode, slot)));
+        }
+        jobs.sort_unstable_by_key(|&(mode, _)| mode);
+        for round in jobs.chunks(width) {
+            // Each callback owns at most one escalation table. Finite rounds
+            // bound those owners even when nested Rayon suspends a callback.
+            let results: Vec<_> = round
+                .par_iter()
+                .map(|&(mode, slot)| {
+                    let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+                    (mode, evaluate(mode, &tables[slot]))
+                })
+                .collect();
+            for (mode, value) in results {
+                values[mode] = Some(value);
+            }
+        }
+        // All mode callbacks and their escalation tables have returned. Release
+        // this batch before another first-guard table can be allocated.
+        drop(tables);
+    }
+    // Even after a mode error, subsequent table batches are prepared: a later
+    // initial-table failure has precedence over every mode failure, as in the
+    // old prepare-all-then-evaluate structure. If all tables succeed, choose
+    // mode failures in original mode order. No integral artifact is published
+    // until this function succeeds.
+    values
+        .into_iter()
+        .map(|value| value.expect("every mode belongs to one prepared rule"))
+        .collect()
+}
+
 fn compute_archimedean_integrals_tracked(
     n_modes: usize,
     l: &Float,
@@ -15895,6 +16680,7 @@ fn compute_archimedean_integrals_tracked_with_orders(
     fabric_cache: Option<&ArtifactCacheContext<'_>>,
     pts_for_n: Vec<usize>,
 ) -> Result<(ComputedArchimedeanIntegrals, Vec<ArtifactManifest>)> {
+    cfg.archimedean_gl_generator.ensure_available()?;
     let prec = cfg.precision_bits;
     validate_source_shape(n_modes, prec, cfg.quad_points)?;
     if !l.is_finite() || l <= &0 || l.prec() < prec {
@@ -15926,6 +16712,7 @@ fn compute_archimedean_integrals_tracked_with_orders(
         unique_pts.last().copied().unwrap_or(0),
         prec
     );
+    let integral_width = integral_batch_width()?;
     quadrature_workspace(n_modes, prec, &pts_for_n)?;
     type GlTable = (Vec<Float>, Vec<Float>);
     let gl_plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique_pts, prec);
@@ -15953,11 +16740,12 @@ fn compute_archimedean_integrals_tracked_with_orders(
                     certification_failure_policy: cache.certification_failure_policy,
                     production_sink: cache.production_sink,
                 };
-                xc_numerics::quadrature::gauss_legendre_nodes_via_cache_scheduled(
+                xc_numerics::quadrature::gauss_legendre_nodes_via_cache_scheduled_with_generator(
                     npts,
                     prec,
                     request,
                     root_schedule,
+                    cfg.archimedean_gl_generator,
                 )
                 .map(|rule| {
                     (
@@ -15987,11 +16775,12 @@ fn compute_archimedean_integrals_tracked_with_orders(
             &unique_pts,
             gl_plan,
             |npts, root_schedule| {
-                xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
+                xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled_with_generator(
                     npts,
                     prec,
                     cfg.cache_mode,
                     root_schedule,
+                    cfg.archimedean_gl_generator,
                 )
                 .map(|table| (npts, table))
             },
@@ -16013,35 +16802,22 @@ fn compute_archimedean_integrals_tracked_with_orders(
         xc_core::performance_stage_with("ccm.tau.archimedean_integrals", || {
             ccm_performance_metadata("ccm.tau.archimedean_integrals", n_modes + 1, prec)
         });
-    // Node-only terms (density, decay, weight products) are prepared once per
-    // quadrature order and shared by every mode using that order; results are
-    // bit-identical to independent per-mode evaluation.
-    let mut orders: Vec<usize> = pts_for_n[..=n_modes].to_vec();
-    orders.sort_unstable();
-    orders.dedup();
-    let node_tables: HashMap<usize, matrix_point_math::IntegralNodeTable> = orders
-        .par_iter()
-        .map(|&npts| {
-            let (nodes, weights) = gl_cache.get(&npts).unwrap();
+    // Bound shared-table ownership and the number of mode callbacks, even
+    // when a callback enters nested Rayon while building an escalation table.
+    // Every scalar operation and the original guard ladder remain unchanged.
+    matrix_point_math::integral_batch_workspace(l, prec, &pts_for_n, &gl_cache, integral_width)?;
+    let fused = map_integral_batches(
+        &pts_for_n,
+        integral_width,
+        |npts| {
+            let (nodes, weights) = &gl_cache[&npts];
             matrix_point_math::integral_node_table(l, prec, nodes, weights, 64)
-                .map(|table| (npts, table))
-        })
-        .collect::<Result<_>>()?;
-    let indices: Vec<usize> = (0..=n_modes).collect();
-    let fused: Vec<(Float, Float, Float)> = indices
-        .par_iter()
-        .map(|&n| {
-            let (nodes, weights) = gl_cache.get(&pts_for_n[n]).unwrap();
-            matrix_point_math::integrals_with_table(
-                n as i64,
-                l,
-                prec,
-                nodes,
-                weights,
-                &node_tables[&pts_for_n[n]],
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+        },
+        |n, table| {
+            let (nodes, weights) = &gl_cache[&pts_for_n[n]];
+            matrix_point_math::integrals_with_table(n as i64, l, prec, nodes, weights, table)
+        },
+    )?;
     let mut alpha = Vec::with_capacity(fused.len());
     let mut beta = Vec::with_capacity(fused.len());
     let mut gamma = Vec::with_capacity(fused.len());
@@ -16465,6 +17241,9 @@ fn normalize_eigenvector(xi: &[Float], l: &Float, prec: u32) -> Result<Vec<Float
 
 // Resource admission is operational policy; it never changes arithmetic or identity.
 fn source_working_budget() -> Result<u128> {
+    if let Some(resources) = xc_core::RunResources::current() {
+        return Ok(u128::from(resources.maximum_bytes()));
+    }
     Ok(u128::from(
         super::capture_runtime::CaptureResourcePolicy::from_environment()?.maximum_working_bytes,
     ))
@@ -18098,10 +18877,10 @@ mod weil_eigvec_cache {
     //!
     //! Cache layout under `weil_eigvec_cache/` in the standalone cache root
     //! (`$XC_CACHE_ROOT`, else the per-user cache root):
-    //!   - `weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json` (uncompressed,
-    //!     fast path)
-    //!   - `weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json.zip`
-    //!     (single-zip companion for distribution)
+    //! `weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}{variant}.json.zip` is
+    //! the only stored format. The variant binds parity and, for every
+    //! factorization dimension greater than one, the dense-LU arithmetic.
+    //! The same binding is required inside the JSON before scalar decoding.
     //!
     //! Unlike `tau_cache`, ξ is small (2N+1 entries, ≲ 2 MB even at
     //! HP-1000/N=800), so there is no byte-split `.partXX` tier — single
@@ -18225,7 +19004,7 @@ mod weil_eigvec_cache {
     ) -> Option<Vec<Float>> {
         super::standalone_cache::shape(n_modes, target_prec, false)?;
         let dir = cache_dir()?;
-        let variant = cache_variant(parity_policy);
+        let variant = cache_variant(n_modes, parity_policy);
         let prefix = format!(
             "weil_eigvec_lambda_sq{}_nmodes{}_prec",
             lambda_sq.filename_str(),
@@ -18290,7 +19069,7 @@ mod weil_eigvec_cache {
         prec: u32,
         parity_policy: CcmParityPolicy,
     ) -> String {
-        let variant = cache_variant(parity_policy);
+        let variant = cache_variant(n_modes, parity_policy);
         format!(
             "weil_eigvec_lambda_sq{}_nmodes{}_prec{}{}.json",
             lambda_sq.filename_str(),
@@ -18300,8 +19079,13 @@ mod weil_eigvec_cache {
         )
     }
 
-    fn cache_variant(parity_policy: CcmParityPolicy) -> &'static str {
-        match parity_policy {
+    fn arithmetic(n_modes: usize, parity_policy: CcmParityPolicy) -> Option<&'static str> {
+        super::primary_lu_dimension(n_modes, parity_policy)
+            .and_then(xc_numerics::linalg::dense_lu_arithmetic)
+    }
+
+    fn cache_variant(n_modes: usize, parity_policy: CcmParityPolicy) -> String {
+        let parity = match parity_policy {
             // The historical unsuffixed standalone cache used full-space
             // inverse iteration with conditional even projection.
             CcmParityPolicy::AdaptiveEven => "",
@@ -18310,6 +19094,12 @@ mod weil_eigvec_cache {
             // managed artifact fabric, so it must not consume a historical
             // adaptive standalone result.
             CcmParityPolicy::EvenSector => "_even_sector",
+        };
+        // Bind before both exact lookup and nearby-precision discovery. Never
+        // read or overwrite a large legacy file under the new LU arithmetic.
+        match arithmetic(n_modes, parity_policy) {
+            Some(arithmetic) => format!("{parity}_{arithmetic}"),
+            None => parity.to_owned(),
         }
     }
 
@@ -18340,6 +19130,26 @@ mod weil_eigvec_cache {
         }
         let v: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = v.as_object()?;
+
+        let parity = match obj.get("parity_policy").and_then(serde_json::Value::as_str) {
+            Some("even") => CcmParityPolicy::EvenSector,
+            Some("natural") => CcmParityPolicy::Natural,
+            Some("adaptive-even") => CcmParityPolicy::AdaptiveEven,
+            // Only the scalar dimension retains the unstamped arithmetic.
+            _ if xc_numerics::linalg::dense_lu_arithmetic(dimension).is_none() => {
+                CcmParityPolicy::AdaptiveEven
+            }
+            _ => return None,
+        };
+        match arithmetic(n_modes, parity) {
+            Some(expected)
+                if obj
+                    .get("dense_lu_arithmetic")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected) => {}
+            None if !obj.contains_key("dense_lu_arithmetic") => {}
+            _ => return None,
+        }
 
         if !super::standalone_cache::identity_matches(
             obj,
@@ -18594,7 +19404,7 @@ mod weil_eigvec_cache {
         diagnostics: &xc_numerics::linalg::InverseIterationDiagnostics,
     ) -> Vec<u8> {
         let xi_strings: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "parity_policy":parity_policy.cache_label(),
             "tau_residual_arithmetic":super::standalone_cache::RESIDUAL_ARITHMETIC,
             "schema_version": SCHEMA_VERSION,
@@ -18613,7 +19423,82 @@ mod weil_eigvec_cache {
             "xi": xi_strings,
             "inverse_iteration": PortableInverseIterationDiagnostics::from_runtime(diagnostics),
         });
+        if let Some(arithmetic) = arithmetic(n_modes, parity_policy) {
+            payload["dense_lu_arithmetic"] = serde_json::json!(arithmetic);
+        }
         serde_json::to_vec(&payload).unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn dense_lu_standalone_cache_binds_payload_filename_and_warm_suffix() {
+        let lambda = LambdaSq::integer(13);
+        let prec = 128;
+        let source = xc_cache::ContentDigest::sha256(b"standalone-lu-identity-test");
+        let diagnostics = xc_numerics::linalg::InverseIterationDiagnostics {
+            configured_step_limit: 1,
+            unshifted_steps: 1,
+            unshifted_converged: true,
+            final_relative_rayleigh_change: Some(Float::with_val(prec, 0)),
+            shifted_refinement: xc_numerics::linalg::ShiftedRefinementOutcome::Accepted,
+            final_relative_residual_norm: Float::with_val(prec, 0),
+        };
+        for (modes, parity, dimension, historical_variant) in [
+            (0, CcmParityPolicy::EvenSector, 1, "_even_sector"),
+            (1, CcmParityPolicy::EvenSector, 2, "_even_sector"),
+            (120, CcmParityPolicy::AdaptiveEven, 241, ""),
+            (128, CcmParityPolicy::EvenSector, 129, "_even_sector"),
+            (128, CcmParityPolicy::Natural, 257, "_natural"),
+            (255, CcmParityPolicy::EvenSector, 256, "_even_sector"),
+        ] {
+            let xi = vec![Float::with_val(prec, 1); 2 * modes + 1];
+            let payload = serialize_to_json(
+                lambda,
+                modes,
+                prec,
+                &source,
+                &Float::with_val(prec, 1),
+                &xi,
+                parity,
+                &diagnostics,
+            );
+            let mut json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            let expected = xc_numerics::linalg::dense_lu_arithmetic(dimension);
+            assert_eq!(
+                json.get("dense_lu_arithmetic")
+                    .and_then(serde_json::Value::as_str),
+                expected
+            );
+            let current_name = cache_filename(lambda, modes, prec, parity);
+            let historical_name = format!(
+                "weil_eigvec_lambda_sq13_nmodes{modes}_prec{prec}{historical_variant}.json"
+            );
+            let archive = compress_to_zip(&payload, &current_name);
+            let (decoded, exact_payload) =
+                read_single_zip(&archive, lambda, modes, prec, parity).unwrap();
+            assert_eq!(exact_payload.as_bytes(), payload);
+            assert_eq!(decoded.xi, xi);
+            assert_eq!(decoded.diagnostics, diagnostics);
+            if let Some(token) = expected {
+                assert_ne!(current_name, historical_name);
+                assert_eq!(
+                    cache_variant(modes, parity),
+                    format!("{historical_variant}_{token}")
+                );
+                let legacy_archive = compress_to_zip(&payload, &historical_name);
+                assert!(read_single_zip(&legacy_archive, lambda, modes, prec, parity).is_none());
+                json.as_object_mut().unwrap().remove("dense_lu_arithmetic");
+                assert!(parse_json(&json.to_string(), lambda, modes, prec).is_none());
+                json["dense_lu_arithmetic"] = serde_json::json!("wrong-arithmetic");
+                assert!(parse_json(&json.to_string(), lambda, modes, prec).is_none());
+            } else {
+                assert_eq!(current_name, historical_name);
+                assert_eq!(cache_variant(modes, parity), historical_variant);
+                assert_eq!(serde_json::to_vec(&json).unwrap(), payload);
+                json["dense_lu_arithmetic"] = serde_json::json!("wrong-arithmetic");
+                assert!(parse_json(&json.to_string(), lambda, modes, prec).is_none());
+            }
+        }
     }
 
     /// See `tau_cache::compress_to_zip` for why `large_file(true)` is
@@ -18896,6 +19781,7 @@ pub fn assemble_research_matrix_hp(
             prime_route: options.prime_route,
             quadrature_orders: orders,
             quadrature_policy: options.quadrature_policy,
+            quadrature_generator: cfg.archimedean_gl_generator,
             assurance: "computed_point_matrix_not_certified".to_owned(),
         },
         entries,
@@ -18905,6 +19791,133 @@ pub fn assemble_research_matrix_hp(
 #[cfg(test)]
 #[allow(clippy::erasing_op)]
 mod tests {
+    #[cfg(feature = "arb")]
+    #[test]
+    fn certified_quadrature_binds_parents_before_lookup_and_reuses_its_own_graph() {
+        use xc_numerics::quadrature::GaussLegendreGenerator;
+        let params = CcmParams::from_lambda_sq_integer(5, 1);
+        let mut cfg = HighPrecConfig::for_decimal_digits(30);
+        cfg.precision_bits = 128;
+        cfg.quad_points = 128;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let length = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
+        let root = xc_core::test_support::TestDir::new("certified-quadrature-parent");
+        let resolver = xc_cache::CacheResolver::new(vec![xc_cache::CacheLayer {
+            precedence: 0,
+            store: Box::new(xc_cache::ZipJsonFilesystemCacheStore::new(
+                "local",
+                root.to_path_buf(),
+                true,
+                xc_cache::CacheVisibility::Local,
+            )),
+        }]);
+        let policy = xc_cache::CachePolicy {
+            current_toolkit_version: xc_cache::ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))
+                .unwrap(),
+            minimum_quality: xc_cache::CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![xc_cache::CacheVisibility::Local],
+        };
+        let mut cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: xc_cache::ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: xc_cache::CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let legacy = build_tau_hp_via_cache(&params, &length, &cfg, &cache).unwrap();
+        let integral_dep = |m: &ArtifactManifest| {
+            m.dependencies
+                .iter()
+                .find(|d| d.key.kind == "ccm_archimedean_integrals")
+                .unwrap()
+                .clone()
+        };
+        let prime_dep = |m: &ArtifactManifest| {
+            m.dependencies
+                .iter()
+                .find(|d| d.key.kind == "ccm_prime_component")
+                .unwrap()
+                .clone()
+        };
+        let legacy_arch = integral_dep(&legacy.1);
+        let old_payload = resolver
+            .read_exact_payload(&legacy_arch.key, &legacy_arch.content_digest, &policy)
+            .unwrap();
+        let old_json: serde_json::Value = serde_json::from_slice(&old_payload).unwrap();
+        assert!(old_json.get("quadrature_generator").is_none());
+        cfg.archimedean_gl_generator = GaussLegendreGenerator::ArbCertified;
+        cache.mode = xc_cache::ArtifactExecutionCacheMode::RequireReuse;
+        cache.write_on_miss = false;
+        assert!(
+            build_tau_hp_via_cache(&params, &length, &cfg, &cache).is_err(),
+            "a legacy parent must not bypass the requested generator"
+        );
+        assert!(resolve_archimedean_integrals_via_cache(&params, &length, &cfg, &cache).is_err());
+        cache.mode = xc_cache::ArtifactExecutionCacheMode::PreferReuse;
+        cache.write_on_miss = true;
+        let certified = build_tau_hp_via_cache(&params, &length, &cfg, &cache).unwrap();
+        assert_ne!(legacy.1.key, certified.1.key);
+        assert_ne!(legacy_arch.key, integral_dep(&certified.1).key);
+        assert_eq!(prime_dep(&legacy.1), prime_dep(&certified.1));
+        let certified_arch = integral_dep(&certified.1);
+        let new_payload = resolver
+            .read_exact_payload(&certified_arch.key, &certified_arch.content_digest, &policy)
+            .unwrap();
+        let new_json: serde_json::Value = serde_json::from_slice(&new_payload).unwrap();
+        assert_eq!(
+            new_json["quadrature_generator"],
+            serde_json::json!(GaussLegendreGenerator::ArbCertified)
+        );
+        for solver in [
+            CcmEigenstateSolver::LegacyInverseIteration,
+            CcmEigenstateSolver::ShiftInvertKrylov,
+        ] {
+            let mut selected = cfg.clone();
+            selected.eigenstate_solver = solver;
+            let legacy_state_key = weil_eigenpair_cache_identity(&params, &selected, &legacy.1)
+                .unwrap()
+                .0;
+            let certified_state_key =
+                weil_eigenpair_cache_identity(&params, &selected, &certified.1)
+                    .unwrap()
+                    .0;
+            assert_ne!(
+                serde_json::to_vec(&legacy_state_key).unwrap(),
+                serde_json::to_vec(&certified_state_key).unwrap()
+            );
+        }
+        cache.mode = xc_cache::ArtifactExecutionCacheMode::RequireReuse;
+        cache.write_on_miss = false;
+        let warm = build_tau_hp_via_cache(&params, &length, &cfg, &cache).unwrap();
+        assert_eq!(certified.0, warm.0);
+        assert_eq!(certified.1.key, warm.1.key);
+        assert_eq!(certified.1.content_digest, warm.1.content_digest);
+        cfg.archimedean_gl_generator = GaussLegendreGenerator::LegacyNewton;
+        let old_warm = build_tau_hp_via_cache(&params, &length, &cfg, &cache).unwrap();
+        assert_eq!(legacy.0, old_warm.0);
+        assert_eq!(legacy.1.key, old_warm.1.key);
+        assert_eq!(legacy.1.content_digest, old_warm.1.content_digest);
+    }
+
+    #[cfg(not(feature = "arb"))]
+    #[test]
+    fn unavailable_certified_quadrature_fails_at_source_admission() {
+        let mut cfg = HighPrecConfig::for_decimal_digits(30);
+        cfg.archimedean_gl_generator =
+            xc_numerics::quadrature::GaussLegendreGenerator::ArbCertified;
+        let params = CcmParams::from_lambda_sq_integer(5, 1);
+        assert!(cfg.validate_source_admission(&params).is_err());
+    }
+
     #[test]
     fn fixed_quadrature_is_exact_and_has_distinct_managed_source_identity() {
         use crate::ccm::research::{ExactCutoff, QuadraturePolicy, ResearchAssemblyOptions};
@@ -18987,7 +20000,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(research.entries, fixed.0);
+        assert_eq!(research.entries, *fixed.0);
         cfg.research_quadrature_policy = QuadraturePolicy::Fixed { order: 0 };
         assert!(cfg.resolved_archimedean_orders(1, &l).is_err());
     }
@@ -19603,6 +20616,7 @@ mod tests {
                 "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
                 "inverse_iteration_step_limit": 2_000,
                 "inverse_iteration_semantics": xc_numerics::linalg::INVERSE_ITERATION_SEMANTICS,
+                "dense_lu_arithmetic": "dense_lu_partial_pivot_dimension_panel512_exact_schur_v1",
                 "tau_residual_arithmetic": standalone_cache::RESIDUAL_ARITHMETIC,
                 "ground_index_validation": ground_index::ARITHMETIC,
                 "parity_basis_arithmetic": super::parity_math::ARITHMETIC,
@@ -22868,7 +23882,55 @@ mod tests {
     }
 
     #[test]
+    fn prime_response_event_schedule_preserves_owner_budget_and_order() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::with_worker_limit(1024, 4).unwrap();
+            let _scope = resources.enter();
+            let parent = resources.try_reserve_retained(128).unwrap();
+            let events = (0..16).collect::<Vec<_>>();
+            let mut visited = Vec::new();
+            let chunks = map_prime_response_chunks(&events, |offset, chunk| {
+                let owner = xc_core::RunResources::current().expect("event lost its run owner");
+                assert_eq!(owner.maximum_bytes(), 1024);
+                assert_eq!(owner.usage().retained_bytes, 128);
+                // Two simultaneous event workspaces would exceed this budget.
+                let _workspace = owner.try_reserve_working(768).unwrap();
+                visited.extend_from_slice(chunk);
+                assert_eq!(chunk, &events[offset..offset + chunk.len()]);
+                chunk.iter().map(|n| n * n).collect::<Vec<_>>()
+            });
+            assert_eq!(visited, events);
+            assert_eq!(
+                chunks.into_iter().flatten().collect::<Vec<_>>(),
+                events.iter().map(|n| n * n).collect::<Vec<_>>()
+            );
+            assert_eq!(resources.usage().working_bytes, 0);
+            assert_eq!(resources.usage().peak_bytes, 896);
+            // Ordered result collection retains the first canonical failure.
+            let failures = map_prime_response_chunks(&events, |offset, _| Err::<(), _>(offset));
+            assert_eq!(failures.into_iter().collect::<Result<Vec<_>, _>>(), Err(0));
+            let occupied = resources.try_reserve_retained(129).unwrap();
+            let denied = map_prime_response_chunks(&events, |_, _| {
+                xc_core::RunResources::current()
+                    .unwrap()
+                    .try_reserve_working(768)
+                    .is_err()
+            });
+            assert!(denied.into_iter().all(|denied| denied));
+            drop(occupied);
+            drop(parent);
+            assert_eq!(resources.usage().retained_bytes, 0);
+        });
+    }
+
+    #[test]
     fn prime_power_response_records_and_replays_full_state_and_root_transport() {
+        let resources = xc_core::RunResources::new(32 << 20).unwrap();
+        let _scope = resources.enter();
         let precision_bits = 192;
         let params = CcmParams::from_lambda_sq_integer(13, 1);
         let mut cfg = HighPrecConfig::for_decimal_digits(40);
@@ -22929,6 +23991,8 @@ mod tests {
             &spectral_preparation,
         )
         .unwrap();
+        assert!(resources.usage().peak_bytes > 0);
+        assert_eq!(resources.usage().working_bytes, 0);
         assert_eq!(artifact.events.len(), 9);
         assert_eq!(artifact.roots.len(), 1);
         assert!(artifact.events.last().unwrap().observation_is_event_edge);
@@ -22960,6 +24024,7 @@ mod tests {
             &spectral_preparation,
         )
         .unwrap();
+        assert_eq!(resources.usage().working_bytes, 0);
 
         let mut tampered = artifact;
         tampered.events[0].root_velocity_responses[0] =
@@ -22982,6 +24047,7 @@ mod tests {
             &spectral_preparation,
         )
         .is_err());
+        assert_eq!(resources.usage().working_bytes, 0);
     }
 
     #[test]
@@ -23002,12 +24068,13 @@ mod tests {
         };
         let preparation = ResponseSpectralPreparation {
             source_matrix_eigenvalue_allowance: Float::with_val(precision_bits, 0),
-            even_sector_matrix: vec![
+            even_sector_matrix: shared_float_vector(vec![
                 Float::with_val(precision_bits, 1),
                 Float::with_val(precision_bits, 0),
                 Float::with_val(precision_bits, 0),
                 Float::with_val(precision_bits, 1),
-            ],
+            ])
+            .unwrap(),
             selected_enclosures: vec![enclosure(0, 0, 2), enclosure(1, 1, 3)],
         };
         let unit_state = vec![
@@ -23528,6 +24595,75 @@ mod tests {
             &spectral_preparation,
         )
         .unwrap();
+        // The two response families have identical bordered matrices, while
+        // every artifact field and independent numerical gate stays unchanged.
+        let resources =
+            xc_core::RunResources::with_worker_limit(1 << 30, rayon::current_num_threads())
+                .unwrap();
+        let _resource_scope = resources.enter();
+        let prime = |memo: Option<&BorderedResponseMemo>| {
+            compute_prime_power_response_analysis_with_memo(
+                &params,
+                &cfg,
+                &l,
+                &tau,
+                &state_eigenvalue,
+                &xi,
+                &roots,
+                1,
+                &tau_manifest,
+                &eigenpair_manifest,
+                &root_manifest,
+                &secular_manifest,
+                &selection_digest,
+                &spectral_preparation,
+                memo,
+            )
+            .unwrap()
+        };
+        let flow = |memo: Option<&BorderedResponseMemo>| {
+            compute_u_flow_response_analysis_with_memo(
+                &params,
+                &cfg,
+                &l,
+                &tau,
+                &state_eigenvalue,
+                &xi,
+                &roots,
+                1,
+                &tau_manifest,
+                &eigenpair_manifest,
+                &root_manifest,
+                &secular_manifest,
+                &selection_digest,
+                &velocity_actions,
+                &spectral_preparation,
+                memo,
+            )
+            .unwrap()
+        };
+        let prime_bytes = serde_json::to_vec(&prime(None)).unwrap();
+        let flow_bytes = serde_json::to_vec(&artifact).unwrap();
+        for prime_first in [true, false] {
+            let memo = BorderedResponseMemo::default();
+            BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.set(0));
+            let (actual_prime, actual_flow) = if prime_first {
+                let p = prime(Some(&memo));
+                (p, flow(Some(&memo)))
+            } else {
+                let f = flow(Some(&memo));
+                (prime(Some(&memo)), f)
+            };
+            assert_eq!(
+                BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.get()),
+                1
+            );
+            assert_eq!(serde_json::to_vec(&actual_prime).unwrap(), prime_bytes);
+            assert_eq!(serde_json::to_vec(&actual_flow).unwrap(), flow_bytes);
+            assert!(resources.usage().retained_bytes > 0);
+            memo.clear();
+            assert_eq!(resources.usage().retained_bytes, 0);
+        }
         assert_eq!(
             artifact
                 .channels
@@ -23610,6 +24746,167 @@ mod tests {
             &spectral_preparation,
         )
         .is_err());
+    }
+
+    #[test]
+    fn bordered_response_memo_binds_exact_inputs_and_retains_only_admitted_factors() {
+        let p = 192;
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.precision_bits = p;
+        let preparation = ResponseSpectralPreparation {
+            even_sector_matrix: shared_float_vector(
+                [1, 0, 0, 2].map(|v| Float::with_val(p, v)).to_vec(),
+            )
+            .unwrap(),
+            source_matrix_eigenvalue_allowance: Float::with_val(p, 0),
+            selected_enclosures: Vec::new(),
+        };
+        // The even-sector ordering is [central coefficient, symmetric pair].
+        let unit = [0, 1, 0].map(|v| Float::with_val(p, v)).to_vec();
+        let eigenvalue = Float::with_val(p, 1);
+        let binding =
+            || BorderedResponseBinding::new(&preparation, &params, &cfg, &eigenvalue, &unit);
+        let expected = binding();
+        assert!(expected.matches(&binding()));
+        let mut changed = binding();
+        changed.precision_bits += 1;
+        assert!(!expected.matches(&changed));
+        let mut changed = binding();
+        changed.n_modes += 1;
+        assert!(!expected.matches(&changed));
+        let mut changed = binding();
+        changed.exponent_range.0 += 1;
+        assert!(!expected.matches(&changed));
+        let mut changed = binding();
+        changed.arithmetic = Some("different arithmetic");
+        assert!(!expected.matches(&changed));
+        let mut changed = binding();
+        changed.matrix = shared_float_vector(preparation.even_sector_matrix.to_vec()).unwrap();
+        assert!(
+            !expected.matches(&changed),
+            "a different allocation must be authenticated anew"
+        );
+        let mut changed = binding();
+        changed.eigenvalue = hp_values_memo_identity(&[Float::with_val(p + 1, 1)]);
+        assert!(!expected.matches(&changed));
+        let mut negative_zero = unit.clone();
+        negative_zero[0] = -negative_zero[0].clone();
+        let changed =
+            BorderedResponseBinding::new(&preparation, &params, &cfg, &eigenvalue, &negative_zero);
+        assert!(
+            !expected.matches(&changed),
+            "signed zero is part of the binding"
+        );
+
+        let resources =
+            xc_core::RunResources::with_worker_limit(1 << 30, rayon::current_num_threads())
+                .unwrap();
+        let _scope = resources.enter();
+        let memo = BorderedResponseMemo::default();
+        let validated = xc_cache::ValidatedValueMemo::new(resources.clone(), 1 << 29);
+        let _validated_scope = validated.enter();
+        let eviction = memo.eviction_callback();
+        validated.register_eviction(&eviction);
+        BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.set(0));
+        let first = resolve_bordered_response_solver(
+            Some(&memo),
+            &preparation,
+            &params,
+            &cfg,
+            &eigenvalue,
+            &unit,
+        )
+        .unwrap();
+        let retained = resources.usage().retained_bytes;
+        assert!(retained > 0);
+        let second = resolve_bordered_response_solver(
+            Some(&memo),
+            &preparation,
+            &params,
+            &cfg,
+            &eigenvalue,
+            &unit,
+        )
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.get()),
+            1
+        );
+        validated.clear();
+        assert!(memo.slot.lock().unwrap().is_none());
+        assert_eq!(resources.usage().retained_bytes, retained);
+        drop(first);
+        assert_eq!(resources.usage().retained_bytes, retained);
+        drop(second);
+        assert_eq!(resources.usage().retained_bytes, 0);
+
+        drop(
+            resolve_bordered_response_solver(
+                Some(&memo),
+                &preparation,
+                &params,
+                &cfg,
+                &eigenvalue,
+                &unit,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.get()),
+            2
+        );
+        // Required capture work can evict optional retained factors.
+        let work =
+            crate::ccm::capture_runtime::reserve_working(u128::from(resources.maximum_bytes()))
+                .unwrap();
+        assert!(memo.slot.lock().unwrap().is_none());
+        assert_eq!(resources.usage().retained_bytes, 0);
+        drop(work);
+
+        // A singular request is never retained and does not poison a later one.
+        let other_eigenvalue = Float::with_val(p, 2);
+        assert!(resolve_bordered_response_solver(
+            Some(&memo),
+            &preparation,
+            &params,
+            &cfg,
+            &other_eigenvalue,
+            &unit,
+        )
+        .is_err());
+        assert!(memo.slot.lock().unwrap().is_none());
+        drop(
+            resolve_bordered_response_solver(
+                Some(&memo),
+                &preparation,
+                &params,
+                &cfg,
+                &eigenvalue,
+                &unit,
+            )
+            .unwrap(),
+        );
+        assert!(memo.slot.lock().unwrap().is_some());
+        memo.clear();
+
+        let solver = build_even_sector_bordered_response_solver(
+            &preparation,
+            &params,
+            &cfg,
+            &eigenvalue,
+            &unit,
+        )
+        .unwrap();
+        let bytes = bordered_response_retained_bytes(&solver, &expected);
+        let tight = xc_core::RunResources::new(bytes - 1).unwrap();
+        let _tight_scope = tight.enter();
+        let temporary = admit_bordered_response_solver(Some(&memo), solver, Some(expected));
+        assert!(memo.slot.lock().unwrap().is_none());
+        assert_eq!(tight.usage().retained_bytes, 0);
+        let forcing = [0, 0, 0].map(|v| Float::with_val(p, v));
+        assert!(solve_even_sector_bordered_response(&temporary, &forcing).is_ok());
     }
 
     #[test]
@@ -23707,7 +25004,9 @@ mod tests {
             &context(ArtifactExecutionCacheMode::PreferReuse, true),
         )
         .unwrap();
-        let prime_reused = resolve_prime_power_response_analysis_via_cache(
+        let warm_memo = BorderedResponseMemo::default();
+        BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.set(0));
+        let prime_reused = resolve_prime_power_response_analysis_via_cache_with_memo(
             &params,
             &cfg,
             &l,
@@ -23721,8 +25020,14 @@ mod tests {
             &root_manifest,
             &secular_manifest,
             &context(ArtifactExecutionCacheMode::RequireReuse, false),
+            Some(&warm_memo),
         )
         .unwrap();
+        assert_eq!(
+            BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.get()),
+            0
+        );
+        assert!(warm_memo.slot.lock().unwrap().is_none());
         let prime_refreshed = resolve_prime_power_response_analysis_via_cache(
             &params,
             &cfg,
@@ -23774,7 +25079,7 @@ mod tests {
         );
         assert_eq!(
             manifests[0].minimum_reader_version,
-            ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
+            ToolkitVersion::parse("0.17.0").unwrap()
         );
         let mut legacy = semantic.clone();
         legacy.mathematical_semantics_version = "ccm-u-flow-response-v0.15.0-v3".into();
@@ -23785,7 +25090,9 @@ mod tests {
         assert_eq!(keys[0].parameters_digest, semantic.digest().unwrap());
 
         assert_eq!(U_FLOW_ACTION_CALLS.with(|count| count.get()), 1);
-        let u_flow_reused = resolve_u_flow_response_analysis_via_cache(
+        let warm_memo = BorderedResponseMemo::default();
+        BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.set(0));
+        let u_flow_reused = resolve_u_flow_response_analysis_via_cache_with_memo(
             &params,
             &cfg,
             &l,
@@ -23799,8 +25106,14 @@ mod tests {
             &root_manifest,
             &secular_manifest,
             &context(ArtifactExecutionCacheMode::RequireReuse, false),
+            Some(&warm_memo),
         )
         .unwrap();
+        assert_eq!(
+            BORDERED_RESPONSE_FACTORIZATIONS.with(|count| count.get()),
+            0
+        );
+        assert!(warm_memo.slot.lock().unwrap().is_none());
         assert_eq!(
             U_FLOW_ACTION_CALLS.with(|count| count.get()),
             1,
@@ -23846,6 +25159,21 @@ mod tests {
                 let key: SemanticKeyEnvelope =
                     serde_json::from_str(&row.tags[xc_cache::SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
                 assert_eq!(key.mathematical_semantics_version, version);
+                assert_eq!(
+                    key.resolved_mathematical_parameters["dense_lu_arithmetic"],
+                    xc_numerics::linalg::dense_lu_arithmetic(params.n_modes + 2).unwrap()
+                );
+                assert_eq!(
+                    row.minimum_reader_version,
+                    ToolkitVersion::parse("0.17.0").unwrap()
+                );
+                let mut unblocked = key.clone();
+                unblocked
+                    .resolved_mathematical_parameters
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("dense_lu_arithmetic");
+                assert_ne!(key.digest().unwrap(), unblocked.digest().unwrap());
                 let digest = &key.source_data_identities["ccm_even_sector_transform"];
                 assert_eq!(
                     key.resolved_mathematical_parameters["even_sector_transform_content_digest"],
@@ -24911,37 +26239,37 @@ mod tests {
         );
     }
 
-    /// Weil-eigenvector cache filenames preserve the two historical
-    /// standalone routes and isolate the newer reduced even-sector route.
+    /// Every nontrivial standalone route binds the default blocked arithmetic
+    /// while retaining its distinct parity suffix.
     #[test]
     fn weil_eigvec_cache_filename_keys_on_force_even() {
         use super::super::LambdaSq;
         use super::weil_eigvec_cache::cache_filename;
         let forced = cache_filename(
             LambdaSq::integer(1000),
-            800,
+            120,
             6660,
             CcmParityPolicy::EvenSector,
         );
-        let natural = cache_filename(LambdaSq::integer(1000), 800, 6660, CcmParityPolicy::Natural);
+        let natural = cache_filename(LambdaSq::integer(1000), 120, 6660, CcmParityPolicy::Natural);
         let adaptive = cache_filename(
             LambdaSq::integer(1000),
-            800,
+            120,
             6660,
             CcmParityPolicy::AdaptiveEven,
         );
         assert_eq!(
             forced,
-            "weil_eigvec_lambda_sq1000_nmodes800_prec6660_even_sector.json"
+            "weil_eigvec_lambda_sq1000_nmodes120_prec6660_even_sector_dense_lu_partial_pivot_dimension_panel512_exact_schur_v1.json"
         );
         // Natural is distinct.
         assert_eq!(
             natural,
-            "weil_eigvec_lambda_sq1000_nmodes800_prec6660_natural.json"
+            "weil_eigvec_lambda_sq1000_nmodes120_prec6660_natural_dense_lu_partial_pivot_dimension_panel512_exact_schur_v1.json"
         );
         assert_eq!(
             adaptive,
-            "weil_eigvec_lambda_sq1000_nmodes800_prec6660.json"
+            "weil_eigvec_lambda_sq1000_nmodes120_prec6660_dense_lu_partial_pivot_dimension_panel512_exact_schur_v1.json"
         );
         assert_ne!(forced, natural);
         assert_ne!(forced, adaptive);
@@ -26031,7 +27359,8 @@ mod tests {
     fn exhaustive_standalone_xi_fixture() -> serde_json::Value {
         serde_json::json!({"schema_version":3,"tau_source_point_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","toolkit_version":env!("CARGO_PKG_VERSION"),
             "lambda_sq":13,"lambda_sq_mode":"integer","lambda_sq_key":"13","prime_cutoff":13,
-            "parity_policy":"even_sector","n_modes":1,"precision_bits":128,
+            "parity_policy":"even","n_modes":1,"precision_bits":128,
+            "dense_lu_arithmetic":"dense_lu_partial_pivot_dimension_panel512_exact_schur_v1",
             "parity_basis_arithmetic": super::parity_math::ARITHMETIC,
             "state_normalization_arithmetic": super::state_normalization_math::ARITHMETIC,
             "l2_normalization_arithmetic":xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2,
@@ -26280,6 +27609,8 @@ mod tests {
         let xi_strs: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
         let good = serde_json::json!({
             "schema_version":3,"tau_source_point_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "parity_policy":"even",
+            "dense_lu_arithmetic":"dense_lu_partial_pivot_dimension_panel512_exact_schur_v1",
             "parity_basis_arithmetic": super::parity_math::ARITHMETIC,
             "state_normalization_arithmetic": super::state_normalization_math::ARITHMETIC,
             "l2_normalization_arithmetic": xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2,
@@ -26353,6 +27684,8 @@ mod tests {
         short_strs.pop();
         let short = serde_json::json!({
             "schema_version":3,"tau_source_point_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "parity_policy":"even",
+            "dense_lu_arithmetic":"dense_lu_partial_pivot_dimension_panel512_exact_schur_v1",
             "parity_basis_arithmetic": super::parity_math::ARITHMETIC,
             "state_normalization_arithmetic": super::state_normalization_math::ARITHMETIC,
             "l2_normalization_arithmetic": xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2, "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
@@ -26689,10 +28022,13 @@ mod tests {
         // so JsonZip must fall through to the (garbage) zip, fail to
         // open it, and return None — without panicking.
         let zip_path = dir.join(format!(
-            "weil_eigvec_lambda_sq{}_nmodes{}_prec{}.json.zip",
-            lambda_sq.filename_str(),
-            n_modes,
-            prec
+            "{}.zip",
+            super::weil_eigvec_cache::cache_filename(
+                lambda_sq,
+                n_modes,
+                prec,
+                CcmParityPolicy::EvenSector
+            )
         ));
         std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
 
@@ -27175,7 +28511,7 @@ mod source_isolation_tests {
                 compute_sector_eigenvalues(&t, 2, 2, CcmSectorEigenvalueRoute::Selected, p)
                     .unwrap();
             let prep = ResponseSpectralPreparation {
-                even_sector_matrix: a,
+                even_sector_matrix: shared_float_vector(a).unwrap(),
                 source_matrix_eigenvalue_allowance: allowance,
                 selected_enclosures: values.selected_enclosures,
             };
@@ -27442,17 +28778,52 @@ mod exhaustive_resumed_hp_admission {
             ground_index: None,
         };
         a.stored_state_resolution = Some(
-            stored_resolution::bounds(
+            stored_resolution::resolved(
                 &tau,
                 &parse_hp_vector(&a.eigenvector, 128).unwrap(),
                 &Float::with_val(128, 1),
                 128,
                 CcmParityPolicy::EvenSector,
             )
-            .unwrap()
-            .record,
+            .unwrap(),
         );
         assert!(decode_weil_eigenpair(&a, &params, &cfg, &tau).is_ok());
+        assert_eq!(
+            a.stored_state_resolution.as_ref().unwrap().arithmetic,
+            "stored_state_residual_and_one_norm_scale_gap_v1"
+        );
+        let released_bytes = serde_json::to_vec(&a).unwrap();
+        let released: PortableWeilEigenpair = serde_json::from_slice(&released_bytes).unwrap();
+        for prove in [false, true] {
+            decode_weil_eigenpair_admitted(&released, &params, &cfg, &tau, prove).unwrap();
+        }
+        assert_eq!(serde_json::to_vec(&released).unwrap(), released_bytes);
+
+        let mut recorded = released.clone();
+        let mut recorded_cfg = cfg.clone();
+        recorded_cfg.ground_index_policy = CcmGroundIndexPolicy::RecordOutcome;
+        recorded.ground_index = Some(CcmGroundIndexAdmission::from_outcome(
+            ground_index::Outcome::Proven,
+        ));
+        for prove in [false, true] {
+            let error =
+                decode_weil_eigenpair_admitted(&recorded, &params, &recorded_cfg, &tau, prove)
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("stored-state resolution failed source replay"),
+                "{error}"
+            );
+        }
+        recorded
+            .stored_state_resolution
+            .as_mut()
+            .unwrap()
+            .arithmetic = "stored_state_residual_and_admitted_gap_v2".into();
+        for prove in [false, true] {
+            decode_weil_eigenpair_admitted(&recorded, &params, &recorded_cfg, &tau, prove).unwrap();
+        }
         a.eigenvector[0] = "1e-400000000".into();
         a.eigenvector[2] = "1e-400000000".into();
         assert!(
@@ -27502,9 +28873,8 @@ mod exhaustive_resumed_hp_admission {
         let xi = parse_hp_vector(&a.eigenvector, 128).unwrap();
         let value = Float::with_val(128, 2);
         a.stored_state_resolution = Some(
-            stored_resolution::bounds(&tau, &xi, &value, 128, CcmParityPolicy::EvenSector)
-                .unwrap()
-                .record,
+            stored_resolution::resolved(&tau, &xi, &value, 128, CcmParityPolicy::EvenSector)
+                .unwrap(),
         );
         let error = decode_weil_eigenpair(&a, &params, &cfg, &tau).unwrap_err();
         assert!(
@@ -28562,9 +29932,7 @@ mod exhaustive_ground_index {
         };
         let artifact = PortableWeilEigenpair {
             stored_state_resolution: Some(
-                stored_resolution::bounds(&tau, &xi, &eps, 128, parity)
-                    .unwrap()
-                    .record,
+                stored_resolution::resolved(&tau, &xi, &eps, 128, parity).unwrap(),
             ),
             schema_version: 4,
             lambda_squared: "13".into(),
@@ -30316,7 +31684,13 @@ mod exhaustive_discovery_count {
     fn exhaustive_discovery_count_repeated_root_is_not_silently_missing() {
         let p = 256;
         let a = Rational::from((65, 128));
-        assert!(roots(&residues(a.clone(), a, p), p).is_err());
+        let error = roots(&residues(a.clone(), a, p), p).unwrap_err();
+        let expected = if cfg!(feature = "arb") {
+            "FLINT/Arb exact root isolation failed with status 5"
+        } else {
+            "exact discovery has unresolved repeated roots"
+        };
+        assert_eq!(error.to_string(), expected);
     }
     #[test]
     fn exhaustive_discovery_count_rejects_mismatched_weight_shape() {
@@ -30872,6 +32246,668 @@ mod archimedean_length_order_tests {
                     assert!(error <= allowance, "cutoff={cutoff} p={p} entry={i}");
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod evenness_resource_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use xc_cache::{
+        ArtifactDraft, ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver,
+        CacheStore, CacheVisibility, EphemeralCacheStore,
+    };
+    use xc_core::RunResources;
+
+    #[derive(Default)]
+    struct Observed {
+        owner: Option<RunResources>,
+        writes: Vec<(String, xc_cache::ArtifactKey)>,
+        lookups: usize,
+        ledger_probed: bool,
+    }
+
+    struct ObservingStore {
+        inner: EphemeralCacheStore,
+        observed: Arc<Mutex<Observed>>,
+        panic_on_lookup: bool,
+    }
+
+    impl ObservingStore {
+        fn observe(&self) {
+            let current =
+                RunResources::current().expect("public evenness must enter its run owner");
+            let mut observed = self.observed.lock().unwrap();
+            let owner = observed
+                .owner
+                .get_or_insert_with(|| current.clone())
+                .clone();
+            assert_eq!(current.maximum_bytes(), owner.maximum_bytes());
+            assert_eq!(current.worker_limit(), owner.worker_limit());
+            // Equal limits alone cannot prove that nested work shares the
+            // caller's ledger. This temporary reservation must be visible
+            // through the independently retained owner.
+            // Probe the first source lookup before parallel table construction;
+            // later callbacks may overlap other legitimate ledger changes.
+            if !observed.ledger_probed {
+                let before = owner.usage();
+                let reservation = current.try_reserve_working(1).unwrap();
+                assert_eq!(owner.usage().working_bytes, before.working_bytes + 1);
+                drop(reservation);
+                assert_eq!(owner.usage().working_bytes, before.working_bytes);
+                observed.ledger_probed = true;
+            }
+        }
+    }
+
+    impl CacheStore for ObservingStore {
+        fn name(&self) -> &str {
+            "ephemeral"
+        }
+        fn writable(&self) -> bool {
+            true
+        }
+        fn visibility(&self) -> CacheVisibility {
+            CacheVisibility::Local
+        }
+        fn put(
+            &self,
+            draft: &ArtifactDraft,
+            payload: &[u8],
+        ) -> std::result::Result<ArtifactManifest, CacheError> {
+            self.observe();
+            self.observed
+                .lock()
+                .unwrap()
+                .writes
+                .push((draft.key.kind.clone(), draft.key.clone()));
+            self.inner.put(draft, payload)
+        }
+        fn candidates(
+            &self,
+            key: &xc_cache::ArtifactKey,
+        ) -> std::result::Result<Vec<ArtifactManifest>, CacheError> {
+            self.observe();
+            self.observed.lock().unwrap().lookups += 1;
+            assert!(!self.panic_on_lookup, "evenness scope unwind probe");
+            self.inner.candidates(key)
+        }
+        fn read_payload_to(
+            &self,
+            manifest: &ArtifactManifest,
+            writer: &mut dyn std::io::Write,
+        ) -> std::result::Result<(), CacheError> {
+            self.observe();
+            self.inner.read_payload_to(manifest, writer)
+        }
+    }
+
+    fn resolver(observed: &Arc<Mutex<Observed>>, panic_on_lookup: bool) -> CacheResolver {
+        CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(ObservingStore {
+                inner: EphemeralCacheStore::new(16 << 20).unwrap(),
+                observed: observed.clone(),
+                panic_on_lookup,
+            }),
+        }])
+    }
+
+    fn policy() -> CachePolicy {
+        CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        }
+    }
+
+    fn context<'a>(
+        resolver: &'a CacheResolver,
+        policy: &'a CachePolicy,
+        mode: ArtifactExecutionCacheMode,
+    ) -> ArtifactCacheContext<'a> {
+        ArtifactCacheContext {
+            resolver: Some(resolver),
+            reference_resolver: None,
+            acceptance: Some(policy),
+            ordered_overlays: vec!["ephemeral".to_owned()],
+            mode,
+            write_on_miss: mode != ArtifactExecutionCacheMode::RequireReuse,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        }
+    }
+
+    fn fixture() -> (CcmParams, HighPrecConfig) {
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        (CcmParams::from_lambda_sq_integer(5, 2), cfg)
+    }
+
+    #[test]
+    fn evenness_public_entrypoints_admit_the_actual_pool_before_cache_access() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let owner = RunResources::with_worker_limit(1 << 30, 1).unwrap();
+            let _scope = owner.enter();
+            let retained = owner.try_reserve_retained(17).unwrap();
+            let observed = Arc::new(Mutex::new(Observed::default()));
+            let resolver = resolver(&observed, false);
+            let policy = policy();
+            let cache = context(&resolver, &policy, ArtifactExecutionCacheMode::RequireReuse);
+            let (params, cfg) = fixture();
+            for result in [
+                measure_evenness(&params, &cfg),
+                measure_evenness_via_cache(&params, &cfg, &cache),
+            ] {
+                let error = result
+                    .err()
+                    .expect("oversized pool must refuse")
+                    .to_string();
+                assert!(error.contains("run worker budget exceeded"), "{error}");
+                assert_eq!(owner.usage().retained_bytes, retained.bytes());
+                assert_eq!(owner.usage().working_bytes, 0);
+                assert_eq!(RunResources::current().unwrap().worker_limit(), 1);
+            }
+            assert_eq!(observed.lock().unwrap().lookups, 0);
+        });
+        pool.broadcast(|_| assert!(RunResources::current().is_none()));
+    }
+
+    #[test]
+    fn evenness_cached_entry_establishes_configured_scope_and_restores_on_error_or_unwind() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            assert!(RunResources::current().is_none());
+            let maximum = crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()
+                .unwrap()
+                .maximum_working_bytes;
+            for panic_on_lookup in [false, true] {
+                let observed = Arc::new(Mutex::new(Observed::default()));
+                let resolver = resolver(&observed, panic_on_lookup);
+                let policy = policy();
+                let cache = context(&resolver, &policy, ArtifactExecutionCacheMode::RequireReuse);
+                let (params, cfg) = fixture();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    measure_evenness_via_cache(&params, &cfg, &cache)
+                }));
+                if panic_on_lookup {
+                    assert!(result.is_err());
+                } else {
+                    assert!(
+                        result.unwrap().is_err(),
+                        "empty require-reuse cache must refuse"
+                    );
+                }
+                assert!(RunResources::current().is_none());
+                let observed = observed.lock().unwrap();
+                assert!(observed.lookups > 0);
+                let owner = observed.owner.as_ref().unwrap();
+                assert_eq!(owner.maximum_bytes(), maximum);
+                assert_eq!(owner.worker_limit(), 2);
+                assert_eq!(
+                    owner.usage().retained_bytes + owner.usage().working_bytes,
+                    0
+                );
+            }
+        });
+        pool.broadcast(|_| assert!(RunResources::current().is_none()));
+    }
+
+    #[test]
+    fn evenness_cached_entry_preserves_parent_scope_during_unwind_and_budget_refusal() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let parent = RunResources::with_worker_limit(96 << 20, 2).unwrap();
+            let _scope = parent.enter();
+            let observed = Arc::new(Mutex::new(Observed {
+                owner: Some(parent.clone()),
+                ..Observed::default()
+            }));
+            let resolver = resolver(&observed, true);
+            let policy = policy();
+            let cache = context(&resolver, &policy, ArtifactExecutionCacheMode::RequireReuse);
+            let (params, cfg) = fixture();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                measure_evenness_via_cache(&params, &cfg, &cache)
+            }));
+            assert!(result.is_err());
+            let probe = RunResources::current()
+                .unwrap()
+                .try_reserve_working(7)
+                .unwrap();
+            assert_eq!(parent.usage().working_bytes, 7);
+            drop(probe);
+
+            // Keep enough total budget to pass shape/preflight checks, but
+            // occupy it with a real retained caller allocation. Nested cold
+            // source construction must fail instead of creating a fresh ledger.
+            let retained = parent
+                .try_reserve_retained(parent.maximum_bytes() - 1)
+                .unwrap();
+            let resolver = CacheResolver::new(vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(EphemeralCacheStore::new(16 << 20).unwrap()),
+            }]);
+            let cache = context(&resolver, &policy, ArtifactExecutionCacheMode::PreferReuse);
+            let error = measure_evenness_via_cache(&params, &cfg, &cache)
+                .err()
+                .expect("occupied parent budget must refuse cold source construction");
+            assert!(
+                format!("{error:#}").contains("run memory budget exceeded"),
+                "{error:#}"
+            );
+            assert_eq!(parent.usage().retained_bytes, retained.bytes());
+            assert_eq!(parent.usage().working_bytes, 0);
+            assert!(parent.usage().peak_bytes <= parent.maximum_bytes());
+            assert_eq!(RunResources::current().unwrap().maximum_bytes(), 96 << 20);
+        });
+        pool.broadcast(|_| assert!(RunResources::current().is_none()));
+    }
+
+    #[test]
+    fn evenness_cold_cached_entry_keeps_one_owner_through_source_and_both_solves() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            // Test both creation and an inherited sub-GiB owner, including a
+            // live parent reservation that the nested call must not replace.
+            for inherited in [false, true] {
+                assert!(RunResources::current().is_none());
+                let parent =
+                    inherited.then(|| RunResources::with_worker_limit(96 << 20, 2).unwrap());
+                let scope = parent.as_ref().map(RunResources::enter);
+                let retained = parent
+                    .as_ref()
+                    .map(|r| r.try_reserve_retained(1 << 20).unwrap());
+                let observed = Arc::new(Mutex::new(Observed {
+                    owner: parent.clone(),
+                    ..Observed::default()
+                }));
+                let resolver = resolver(&observed, false);
+                let policy = policy();
+                let cache = context(&resolver, &policy, ArtifactExecutionCacheMode::PreferReuse);
+                let (params, cfg) = fixture();
+                let result = measure_evenness_via_cache(&params, &cfg, &cache).unwrap();
+                assert_eq!(result.claim_scope, CcmEvennessClaimScope::ExactStoredTau);
+                let observed = observed.lock().unwrap();
+                let owner = observed.owner.as_ref().unwrap();
+                let eigenpairs = observed
+                    .writes
+                    .iter()
+                    .filter(|(kind, _)| kind == "ccm_weil_eigenpair")
+                    .map(|(_, key)| key)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    eigenpairs.len(),
+                    2,
+                    "both natural and even states must be computed"
+                );
+                assert_ne!(eigenpairs[0], eigenpairs[1]);
+                assert!(observed
+                    .writes
+                    .iter()
+                    .any(|(kind, _)| kind == "ccm_tau_matrix"));
+                assert!(
+                    owner.usage().peak_bytes > 1 << 20,
+                    "actual nested reservations must be charged"
+                );
+                assert_eq!(owner.usage().working_bytes, 0);
+                assert_eq!(
+                    owner.usage().retained_bytes,
+                    retained.as_ref().map_or(0, |r| r.bytes())
+                );
+                if inherited {
+                    assert_eq!(owner.maximum_bytes(), 96 << 20);
+                    assert!(owner.usage().peak_bytes <= 96 << 20);
+                    let probe = RunResources::current()
+                        .unwrap()
+                        .try_reserve_working(3)
+                        .unwrap();
+                    assert_eq!(owner.usage().working_bytes, 3);
+                    drop(probe);
+                } else {
+                    assert!(RunResources::current().is_none());
+                }
+                drop(observed);
+                drop(retained);
+                drop(scope);
+                assert!(RunResources::current().is_none());
+            }
+        });
+        pool.broadcast(|_| assert!(RunResources::current().is_none()));
+    }
+}
+
+#[cfg(test)]
+mod integral_batch_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn integral_batches_propagate_and_restore_the_owner_budget() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let owner = xc_core::RunResources::with_worker_limit(128, 2).unwrap();
+            let _scope = owner.enter();
+            let values = map_integral_batches(
+                &[8, 3, 3],
+                2,
+                |q| {
+                    let current = xc_core::RunResources::current().unwrap();
+                    assert_eq!(current.maximum_bytes(), 128);
+                    assert_eq!(source_working_budget().unwrap(), 128);
+                    assert!(current.try_reserve_working(129).is_err());
+                    Ok(q)
+                },
+                |mode, _| {
+                    let current = xc_core::RunResources::current().unwrap();
+                    assert_eq!(current.maximum_bytes(), 128);
+                    assert!(current.try_reserve_working(129).is_err());
+                    Ok(mode)
+                },
+            )
+            .unwrap();
+            assert_eq!(values, [0, 1, 2]);
+        });
+        pool.broadcast(|_| assert!(xc_core::RunResources::current().is_none()));
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        live: AtomicUsize,
+        peak: AtomicUsize,
+    }
+    struct Owner(Arc<Counts>);
+    impl Owner {
+        fn new(counts: &Arc<Counts>) -> Self {
+            let now = counts.live.fetch_add(1, Ordering::SeqCst) + 1;
+            counts.peak.fetch_max(now, Ordering::SeqCst);
+            Self(Arc::clone(counts))
+        }
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn integral_batches_bound_owners_across_nested_rayon_and_keep_mode_order() {
+        for threads in [1, 4] {
+            for width in [1, 2, 3] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                // A large repeated-order group, later unique groups, and mode
+                // indices whose rule order differs from their output order.
+                let orders = [8, 3, 3, 3, 8, 3, 5, 3, 11, 5, 3, 13, 8, 3, 17, 3];
+                let tables = Arc::new(Counts::default());
+                let modes = Arc::new(Counts::default());
+                let escalations = Arc::new(Counts::default());
+                let got = pool
+                    .install(|| {
+                        map_integral_batches(
+                            &orders,
+                            width,
+                            |_| Ok(Owner::new(&tables)),
+                            |mode, _table| {
+                                let _mode = Owner::new(&modes);
+                                // Model a live escalation table while nested node work
+                                // yields. No claim that an ordinary fixture escalates.
+                                let _escalation = Owner::new(&escalations);
+                                let nested: usize = (0..31).into_par_iter().map(|n| n + mode).sum();
+                                assert_eq!(nested, (0..31).map(|n| n + mode).sum::<usize>());
+                                Ok(mode)
+                            },
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(got, (0..orders.len()).collect::<Vec<_>>());
+                for counts in [&tables, &modes, &escalations] {
+                    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+                    assert!(counts.peak.load(Ordering::SeqCst) <= width);
+                    assert!(counts.peak.load(Ordering::SeqCst) > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integral_batches_preserve_initial_table_precedence_and_order_mode_errors() {
+        let orders = [30, 10, 20, 40];
+        let error = map_integral_batches(
+            &orders,
+            2,
+            |q| {
+                if q == 40 {
+                    bail!("initial table 40")
+                } else {
+                    Ok(q)
+                }
+            },
+            |mode, _| -> Result<usize> { bail!("mode {mode}") },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "initial table 40");
+        let error = map_integral_batches(
+            &orders,
+            2,
+            |q| -> Result<usize> { bail!("initial table {q}") },
+            |_, _| -> Result<usize> { panic!("no mode runs after an initial-table error") },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "initial table 10");
+        let error = map_integral_batches(&orders, 2, Ok, |mode, _| -> Result<usize> {
+            bail!("mode {mode}")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "mode 0");
+    }
+
+    #[test]
+    fn integral_batches_drop_owners_on_errors_and_reject_invalid_width() {
+        let tables = Arc::new(Counts::default());
+        let result: Result<Vec<usize>> = map_integral_batches(
+            &[3, 7, 11, 13],
+            2,
+            |q| {
+                if q == 13 {
+                    bail!("table")
+                } else {
+                    Ok(Owner::new(&tables))
+                }
+            },
+            |_, _| bail!("mode"),
+        );
+        assert!(result.is_err());
+        assert_eq!(tables.live.load(Ordering::SeqCst), 0);
+        for width in [0, 17] {
+            let result: Result<Vec<usize>> = map_integral_batches(
+                &[3],
+                width,
+                |_| panic!("invalid width prepares nothing"),
+                |_, _: &()| unreachable!(),
+            );
+            assert!(result.is_err());
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::with_worker_limit(1 << 20, 1).unwrap();
+            let _scope = resources.enter();
+            assert!(integral_batch_width().is_err());
+        });
+    }
+
+    fn split(values: &[(Float, Float, Float)]) -> ComputedArchimedeanIntegrals {
+        ComputedArchimedeanIntegrals {
+            alpha: values.iter().map(|v| v.0.clone()).collect(),
+            beta: values.iter().map(|v| v.1.clone()).collect(),
+            gamma: values.iter().map(|v| v.2.clone()).collect(),
+        }
+    }
+
+    #[test]
+    fn integral_batches_match_all_table_path_and_full_integral_tau_payloads() {
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for (p, orders) in [
+                    (128u32, vec![7usize; 12]),
+                    (192u32, vec![11usize, 7, 9, 7, 13, 9, 7, 11, 15]),
+                ] {
+                    let l = Float::with_val(p, 13).ln();
+                    let mut gl = std::collections::HashMap::new();
+                    for &q in &orders {
+                        gl.entry(q).or_insert_with(|| {
+                            xc_numerics::quadrature::try_gauss_legendre_nodes(
+                                q,
+                                p,
+                                xc_numerics::quadrature::CacheMode::Off,
+                            )
+                            .unwrap()
+                        });
+                    }
+                    // The old successful prepare-all/evaluate-all path, with
+                    // its original kernels and point-operation sequences.
+                    let old_tables: std::collections::HashMap<_, _> = gl
+                        .par_iter()
+                        .map(|(&q, (nodes, weights))| {
+                            (
+                                q,
+                                matrix_point_math::integral_node_table(&l, p, nodes, weights, 64)
+                                    .unwrap(),
+                            )
+                        })
+                        .collect();
+                    let old: Vec<_> = (0..orders.len())
+                        .into_par_iter()
+                        .map(|mode| {
+                            let (nodes, weights) = &gl[&orders[mode]];
+                            matrix_point_math::integrals_with_table(
+                                mode as i64,
+                                &l,
+                                p,
+                                nodes,
+                                weights,
+                                &old_tables[&orders[mode]],
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    drop(old_tables);
+                    for width in [1, 2, 3] {
+                        matrix_point_math::integral_batch_workspace(&l, p, &orders, &gl, width)
+                            .unwrap();
+                        let new = map_integral_batches(
+                            &orders,
+                            width,
+                            |q| {
+                                let (nodes, weights) = &gl[&q];
+                                matrix_point_math::integral_node_table(&l, p, nodes, weights, 64)
+                            },
+                            |mode, table| {
+                                let (nodes, weights) = &gl[&orders[mode]];
+                                matrix_point_math::integrals_with_table(
+                                    mode as i64,
+                                    &l,
+                                    p,
+                                    nodes,
+                                    weights,
+                                    table,
+                                )
+                            },
+                        )
+                        .unwrap();
+                        for (a, b) in old.iter().zip(&new) {
+                            for (a, b) in [(&a.0, &b.0), (&a.1, &b.1), (&a.2, &b.2)] {
+                                assert_eq!(a.prec(), b.prec());
+                                assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+                                assert_eq!(
+                                    a.to_string_radix(16, None),
+                                    b.to_string_radix(16, None)
+                                );
+                            }
+                        }
+                        let payload =
+                            |rows: &[(Float, Float, Float)]| PortableArchimedeanIntegrals {
+                                schema_version: 1,
+                                lambda_squared: "13".to_owned(),
+                                n_modes: orders.len() - 1,
+                                precision_bits: p,
+                                quadrature_policy:
+                                    super::super::research::QuadraturePolicy::AdaptiveFloor,
+                                quadrature_generator: Default::default(),
+                                quadrature_orders: orders.clone(),
+                                alpha: rows.iter().map(|v| v.0.to_string()).collect(),
+                                beta: rows.iter().map(|v| v.1.to_string()).collect(),
+                                gamma: rows.iter().map(|v| v.2.to_string()).collect(),
+                            };
+                        assert_eq!(
+                            serde_json::to_vec(&payload(&old)).unwrap(),
+                            serde_json::to_vec(&payload(&new)).unwrap()
+                        );
+                        let n = orders.len() - 1;
+                        let prime = compute_prime_component_matrix(n, 13, &l, p).unwrap();
+                        let tau = |rows: &[(Float, Float, Float)]| {
+                            let (pole, archimedean) =
+                                assemble_pole_and_archimedean_components(n, &l, p, &split(rows))
+                                    .unwrap();
+                            let values = assemble_tau_components(
+                                &ComputedCcmMatrixComponents {
+                                    pole,
+                                    archimedean,
+                                    prime: prime.clone(),
+                                },
+                                p,
+                            )
+                            .unwrap();
+                            PortableTauMatrix {
+                                schema_version: 1,
+                                lambda_squared: "13".to_owned(),
+                                n_modes: n,
+                                precision_bits: p,
+                                entries: values.iter().map(Float::to_string).collect(),
+                            }
+                        };
+                        assert_eq!(
+                            serde_json::to_vec(&tau(&old)).unwrap(),
+                            serde_json::to_vec(&tau(&new)).unwrap()
+                        );
+                    }
+                }
+            });
         }
     }
 }

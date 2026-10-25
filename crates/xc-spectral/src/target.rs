@@ -16,6 +16,7 @@ use std::path::Path;
 
 #[path = "target_external.rs"]
 mod external;
+#[cfg(feature = "hp")]
 pub(crate) use external::provider_declared_pure;
 pub use external::ExternalProfileSpec;
 

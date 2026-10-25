@@ -5,6 +5,7 @@ use rug::{float::Round, Float};
 use serde::{Deserialize, Serialize};
 
 pub(super) const ARITHMETIC: &str = "stored_state_residual_and_one_norm_scale_gap_v1";
+pub(super) const RECORDED_OUTCOME_ARITHMETIC: &str = "stored_state_residual_and_admitted_gap_v2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -14,8 +15,9 @@ pub enum StoredEigenvalueResolution {
     StoredSignUnresolved,
 }
 
-/// Directed bounds for the indexed eigenpair of the stored matrix. The matrix
-/// rounding scale is a resolution policy, not a finite-form assembly bound.
+/// Directed residual inclusion for a retained stored-state candidate. The
+/// selected gap and angle additionally require its admitted ground index.
+/// Matrix rounding scale is a resolution policy, not an assembly-error bound.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CcmStoredStateResolution {
@@ -29,9 +31,12 @@ pub struct CcmStoredStateResolution {
     /// Sum of coefficient magnitudes divided by the magnitude of their sum.
     /// None means the stored sum is exactly zero or its sign is unresolved.
     pub coefficient_sum_condition_upper: Option<String>,
-    /// Absent only when the selected subspace has dimension one.
+    /// Absent in dimension one or when the index/separation proof is unavailable.
     pub selected_gap_lower: Option<String>,
-    pub residual_angle_upper: String,
+    pub residual_angle_upper: Option<String>,
+    /// Missing proof premise, distinct from numerical eigenvalue resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separation_unresolved_reason: Option<String>,
     /// Ordinary assembly does not supply this bound.
     pub assembly_error_bound: Option<String>,
 }
@@ -63,7 +68,64 @@ pub(super) struct AdmissionBounds {
     pub lower: Float,
     pub upper: Float,
     pub neighbor_probe: Float,
-    pub record: CcmStoredStateResolution,
+    record: CcmStoredStateResolution,
+    candidate_gap: Option<String>,
+    candidate_angle: String,
+}
+
+impl AdmissionBounds {
+    pub(super) fn residual_upper(&self) -> &str {
+        &self.record.residual_upper
+    }
+
+    /// Publish separation-dependent fields only after source-bound admission.
+    /// On ordinary reuse the outcome comes from the admitted immutable artifact;
+    /// fresh/verified paths obtain it from directed inertia for these inputs.
+    pub(super) fn admit(
+        mut self,
+        outcome: &super::ground_index::Outcome,
+        policy: super::CcmGroundIndexPolicy,
+    ) -> CcmStoredStateResolution {
+        // The required proof retains its released record bytes. The outcome
+        // route is versioned by request policy, even when its proof succeeds.
+        self.record.arithmetic = match (policy, outcome) {
+            (super::CcmGroundIndexPolicy::Require, super::ground_index::Outcome::Proven) => {
+                ARITHMETIC
+            }
+            _ => RECORDED_OUTCOME_ARITHMETIC,
+        }
+        .into();
+        match outcome {
+            super::ground_index::Outcome::Proven => {
+                self.record.selected_gap_lower = self.candidate_gap;
+                self.record.residual_angle_upper = Some(self.candidate_angle);
+            }
+            super::ground_index::Outcome::NotEstablished(reason) => {
+                self.record.separation_unresolved_reason = Some(reason.clone());
+            }
+        }
+        self.record
+    }
+}
+
+#[cfg(test)]
+pub(super) fn resolved(
+    a: &[Float],
+    v: &[Float],
+    lambda: &Float,
+    p: u32,
+    parity: CcmParityPolicy,
+) -> Result<CcmStoredStateResolution> {
+    let residual = state_residual_bounds::evaluate(a, v, lambda, p)?;
+    let outcome =
+        super::ground_index::outcome_with_residual(a, v, lambda, p, parity, Some(&residual))?;
+    let policy = match outcome {
+        super::ground_index::Outcome::Proven => super::CcmGroundIndexPolicy::Require,
+        super::ground_index::Outcome::NotEstablished(_) => {
+            super::CcmGroundIndexPolicy::RecordOutcome
+        }
+    };
+    Ok(bounds_with_residual(a, v, lambda, p, parity, &residual)?.admit(&outcome, policy))
 }
 
 /// Build the same directed endpoints used by ground-index inertia. This helper
@@ -168,22 +230,25 @@ pub(super) fn bounds_with_residual(
         let denominator = crate::ccm::retained_evidence::finite_math::abs(&sum)?;
         Some(magnitude_sum.div(&denominator)?.upper().clone())
     };
-    let down = |x: &Float| x.to_string_radix_round(10, None, Round::Down);
-    let up = |x: &Float| x.to_string_radix_round(10, None, Round::Up);
+    let down = |x: &Float| xc_numerics::fmt::decimal_string_round(x, None, Round::Down);
+    let up = |x: &Float| xc_numerics::fmt::decimal_string_round(x, None, Round::Up);
     Ok(AdmissionBounds {
         lower,
         upper,
         neighbor_probe,
+        candidate_gap: gap.as_ref().map(down),
+        candidate_angle: up(&angle),
         record: CcmStoredStateResolution {
-            arithmetic: ARITHMETIC.into(),
+            arithmetic: RECORDED_OUTCOME_ARITHMETIC.into(),
             eigenvalue_resolution: status,
             eigenvalue_lower: down(&value_lower),
             eigenvalue_upper: up(&value_upper),
             residual_upper: up(&residual),
             matrix_rounding_scale_upper: up(&floor),
             coefficient_sum_condition_upper: condition.as_ref().map(up),
-            selected_gap_lower: gap.as_ref().map(down),
-            residual_angle_upper: up(&angle),
+            selected_gap_lower: None,
+            residual_angle_upper: None,
+            separation_unresolved_reason: None,
             assembly_error_bound: None,
         },
     })

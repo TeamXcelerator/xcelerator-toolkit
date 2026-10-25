@@ -1030,7 +1030,7 @@ fn hp_string(value: &rug::Float, precision_bits: u32) -> String {
     // away from the computed root and replay validation of the residual
     // failed on every reuse.
     let digits = xc_numerics::reduction::roundtrip_decimal_digits(precision_bits).max(32);
-    value.to_string_radix(10, Some(digits))
+    xc_numerics::fmt::decimal_string_round(value, Some(digits), rug::float::Round::Nearest)
 }
 
 #[cfg(feature = "hp")]
@@ -1723,12 +1723,16 @@ fn interval_root_certificate(
         schema_version: 2,
         endpoint_encoding: IntervalRootEndpointEncoding::OutwardDecimalV2,
         uniqueness_witness: witness.cloned(),
-        lower: interval
-            .lower()
-            .to_string_radix_round(10, Some(digits), rug::float::Round::Down),
-        upper: interval
-            .upper()
-            .to_string_radix_round(10, Some(digits), rug::float::Round::Up),
+        lower: xc_numerics::fmt::decimal_string_round(
+            interval.lower(),
+            Some(digits),
+            rug::float::Round::Down,
+        ),
+        upper: xc_numerics::fmt::decimal_string_round(
+            interval.upper(),
+            Some(digits),
+            rug::float::Round::Up,
+        ),
         precision_bits: interval.precision(),
         iterations,
         status,
