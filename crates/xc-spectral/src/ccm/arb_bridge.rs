@@ -49,6 +49,76 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+// Numerator construction has a separate ABI from transform evaluation. GMP
+// rationals cross this boundary exactly, using the same system GMP already
+// required by the MPFR/FLINT bridge; no decimal conversion or rounding occurs.
+unsafe extern "C" {
+    fn xc_flint_exact_secular_numerator(
+        out_coefficients: *mut *mut c_void,
+        output_capacity: FlintSLong,
+        poles: *const *const c_void,
+        weights: *const *const c_void,
+        count: FlintSLong,
+        weight_denominator_bits: FlintSLong,
+        total_denominator_bits: FlintSLong,
+    ) -> c_int;
+}
+
+/// The caller admits the exact-discovery workspace before entering this
+/// function. Only nonzero residues contribute poles to the numerator.
+pub(in crate::ccm) fn exact_secular_numerator(
+    poles: &[Float],
+    weights: &[Float],
+    weight_denominator_bits: u128,
+    total_denominator_bits: u128,
+) -> Result<Vec<rug::Rational>> {
+    if poles.len() != weights.len()
+        || poles.is_empty()
+        || poles.len() > 8193
+        || poles.iter().chain(weights).any(|point| !point.is_finite())
+        || weight_denominator_bits > total_denominator_bits
+    {
+        bail!("invalid exact secular numerator source");
+    }
+    let weight_bits = FlintSLong::try_from(weight_denominator_bits)?;
+    let total_bits = FlintSLong::try_from(total_denominator_bits)?;
+    let pole_pointers = poles
+        .iter()
+        .zip(weights)
+        .filter(|(_, weight)| !weight.is_zero())
+        .map(|(pole, _)| pole.as_raw().cast())
+        .collect::<Vec<*const c_void>>();
+    let weight_pointers = weights
+        .iter()
+        .filter(|weight| !weight.is_zero())
+        .map(|weight| weight.as_raw().cast())
+        .collect::<Vec<*const c_void>>();
+    if pole_pointers.is_empty() {
+        bail!("the secular point source is identically zero");
+    }
+    let mut coefficients = vec![rug::Rational::from(0); pole_pointers.len()];
+    let mut outputs = coefficients
+        .iter_mut()
+        .map(|value| value.as_raw_mut().cast())
+        .collect::<Vec<*mut c_void>>();
+    let count = FlintSLong::try_from(pole_pointers.len())?;
+    let status = unsafe {
+        xc_flint_exact_secular_numerator(
+            outputs.as_mut_ptr(),
+            count,
+            pole_pointers.as_ptr(),
+            weight_pointers.as_ptr(),
+            count,
+            weight_bits,
+            total_bits,
+        )
+    };
+    if status != 0 {
+        bail!("FLINT exact secular numerator failed with status {status}");
+    }
+    Ok(coefficients)
+}
+
 pub fn rational_polynomial_root_count(
     coefficients_ascending: &[rug::Rational],
     lower: &rug::Rational,
@@ -292,6 +362,28 @@ mod tests {
 }
 
 unsafe extern "C" {
+    fn xc_arb_finite_transform_context_new(
+        cutoff: *const c_char,
+        coefficients: *const *const c_void,
+        count: FlintSLong,
+        precision: FlintSLong,
+    ) -> *mut c_void;
+    fn xc_arb_finite_transform_context_free(context: *mut c_void);
+    fn xc_arb_finite_transform_prepared(
+        re_lo: *mut c_void,
+        re_hi: *mut c_void,
+        im_lo: *mut c_void,
+        im_hi: *mut c_void,
+        dr_lo: *mut c_void,
+        dr_hi: *mut c_void,
+        di_lo: *mut c_void,
+        di_hi: *mut c_void,
+        zrl: *const c_void,
+        zrh: *const c_void,
+        zil: *const c_void,
+        zih: *const c_void,
+        context: *const c_void,
+    ) -> c_int;
     fn xc_arb_finite_transform(
         re_lo: *mut c_void,
         re_hi: *mut c_void,
@@ -320,6 +412,129 @@ unsafe extern "C" {
         precision: FlintSLong,
     );
 }
+
+/// Immutable source- and precision-bound native balls. No source pointers survive
+/// construction, and each evaluation allocates its own mutable Arb workspace.
+pub(crate) struct PreparedFiniteTransform {
+    context: std::ptr::NonNull<c_void>,
+    precision: u32,
+    resources: Option<xc_core::RunResources>,
+    // Released after the native context by the explicit Drop implementation.
+    _reservation: Option<xc_core::MemoryReservation>,
+}
+
+// SAFETY: C exposes the owned context only through const reads during evaluation;
+// its mutable temporaries and output slots belong exclusively to each call.
+unsafe impl Send for PreparedFiniteTransform {}
+unsafe impl Sync for PreparedFiniteTransform {}
+
+impl Drop for PreparedFiniteTransform {
+    fn drop(&mut self) {
+        unsafe { xc_arb_finite_transform_context_free(self.context.as_ptr()) };
+    }
+}
+
+impl PreparedFiniteTransform {
+    pub(crate) fn new(cutoff: &str, coefficients: &[Float], precision: u32) -> Result<Self> {
+        if coefficients.iter().any(|value| !value.is_finite()) {
+            bail!("finite transform coefficients must be finite");
+        }
+        if precision < 2 || coefficients.is_empty() || coefficients.len().is_multiple_of(2) {
+            bail!("invalid finite transform dimensions");
+        }
+        let count = FlintSLong::try_from(coefficients.len())?;
+        let ffi_precision = checked_ffi_precision(precision)?;
+        let resources = xc_core::RunResources::current();
+        // Three mode arrays, 48 powers and scalar balls, plus native setup
+        // temporaries. The factor four covers Arb objects, limbs and allocator
+        // overhead; reservations precede both Rust and native allocations.
+        let ball_bytes = 128u128 + u128::from(precision).div_ceil(64) * 8;
+        let retained_bytes = u64::try_from(
+            (coefficients.len() as u128 * 3 + 64) * ball_bytes * 4
+                + coefficients.len() as u128 * std::mem::size_of::<*const c_void>() as u128
+                + cutoff.len() as u128
+                + 4096,
+        )?;
+        let reservation = resources
+            .as_ref()
+            .map(|resources| resources.try_reserve_retained(retained_bytes))
+            .transpose()?;
+        let c = CString::new(cutoff)?;
+        let pointers = coefficients
+            .iter()
+            .map(|value| value.as_raw().cast())
+            .collect::<Vec<*const c_void>>();
+        let context = unsafe {
+            xc_arb_finite_transform_context_new(c.as_ptr(), pointers.as_ptr(), count, ffi_precision)
+        };
+        let Some(context) = std::ptr::NonNull::new(context) else {
+            bail!("finite Arb transform input or enclosure unresolved");
+        };
+        Ok(Self {
+            context,
+            precision,
+            resources,
+            _reservation: reservation,
+        })
+    }
+
+    pub(crate) fn evaluate(
+        &self,
+        re: &MpfrInterval,
+        im: &MpfrInterval,
+    ) -> Result<(MpfrInterval, MpfrInterval, MpfrInterval, MpfrInterval)> {
+        re.validate()?;
+        im.validate()?;
+        if re.precision() != im.precision() || re.precision() != self.precision {
+            bail!("invalid finite transform dimensions");
+        }
+        // The creating run remains authoritative on Rayon workers even when
+        // their thread-local RunResources scope has not been entered.
+        let resources = self
+            .resources
+            .clone()
+            .or_else(xc_core::RunResources::current);
+        let workspace_bytes = u64::try_from(
+            (128u128 + u128::from(self.precision).div_ceil(64) * 8) * 1024 * 4 + 4096,
+        )?;
+        let _workspace = resources
+            .as_ref()
+            .map(|resources| resources.reserve_working(workspace_bytes))
+            .transpose()?;
+        let mut values: [Float; 8] = std::array::from_fn(|_| Float::with_val(self.precision, 0));
+        let out = values.each_mut().map(|value| value.as_raw_mut().cast());
+        let status = unsafe {
+            xc_arb_finite_transform_prepared(
+                out[0],
+                out[1],
+                out[2],
+                out[3],
+                out[4],
+                out[5],
+                out[6],
+                out[7],
+                re.lower().as_raw().cast(),
+                re.upper().as_raw().cast(),
+                im.lower().as_raw().cast(),
+                im.upper().as_raw().cast(),
+                self.context.as_ptr(),
+            )
+        };
+        if status != 1 {
+            bail!("finite Arb transform input or enclosure unresolved");
+        }
+        let [rl, rh, il, ih, drl, drh, dil, dih] = values;
+        Ok((
+            MpfrInterval::new(rl, rh)?,
+            MpfrInterval::new(il, ih)?,
+            MpfrInterval::new(drl, drh)?,
+            MpfrInterval::new(dil, dih)?,
+        ))
+    }
+}
+
+// Retain the original setup and arithmetic route as an independent test oracle.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn finite_transform(
     cutoff: &str,
     coefficients: &[Float],
@@ -407,6 +622,246 @@ pub(crate) fn argument(re: &MpfrInterval, im: &MpfrInterval) -> Result<MpfrInter
 #[cfg(test)]
 mod finite_transform_failure_tests {
     use super::*;
+
+    type TransformValue = (MpfrInterval, MpfrInterval, MpfrInterval, MpfrInterval);
+
+    fn assert_same_endpoints(actual: &TransformValue, expected: &TransformValue) {
+        for (actual, expected) in [
+            (&actual.0, &expected.0),
+            (&actual.1, &expected.1),
+            (&actual.2, &expected.2),
+            (&actual.3, &expected.3),
+        ] {
+            assert_eq!(actual.precision(), expected.precision());
+            assert_eq!(actual.lower().as_ord(), expected.lower().as_ord());
+            assert_eq!(actual.upper().as_ord(), expected.upper().as_ord());
+        }
+    }
+
+    #[test]
+    fn prepared_transform_matches_one_shot_endpoints_at_every_carrier_branch() {
+        for p in [32, 64, 128, 256, 512] {
+            for count in [1, 3, 9] {
+                let coefficients = (0..count)
+                    .map(|j| Float::with_val(p + 19, (j * 7 % 17) - 8) / 17)
+                    .collect::<Vec<_>>();
+                let prepared = PreparedFiniteTransform::new("13", &coefficients, p).unwrap();
+                let half = Float::with_val(p, 13).ln() / 2;
+                let radius = Float::with_val(p, 1) >> (p / 2);
+                let mut boxes = vec![
+                    (MpfrInterval::from_i64(0, p), MpfrInterval::from_i64(0, p)),
+                    (MpfrInterval::from_i64(70, p), MpfrInterval::from_i64(-1, p)),
+                    (
+                        MpfrInterval::point(Float::with_val(p, 1) >> 1000),
+                        MpfrInterval::from_i64(0, p),
+                    ),
+                    (
+                        MpfrInterval::new(Float::with_val(p, -1), Float::with_val(p, 1)).unwrap(),
+                        MpfrInterval::new(Float::with_val(p, -0.2), Float::with_val(p, 0.2))
+                            .unwrap(),
+                    ),
+                ];
+                for mode in [-(count / 2), 0, count / 2] {
+                    for offset in [0., 0.99, 1.01] {
+                        let center: Float = (-Float::with_val(p, rug::float::Constant::Pi) * mode
+                            + Float::with_val(p, offset))
+                            / &half;
+                        boxes.push((
+                            MpfrInterval::point(center.clone()),
+                            MpfrInterval::from_i64(0, p),
+                        ));
+                        boxes.push((
+                            MpfrInterval::new(
+                                Float::with_val(p, &center) - &radius,
+                                Float::with_val(p, &center) + &radius,
+                            )
+                            .unwrap(),
+                            MpfrInterval::new(-radius.clone(), radius.clone()).unwrap(),
+                        ));
+                    }
+                }
+                for (re, im) in boxes {
+                    let expected = finite_transform("13", &coefficients, &re, &im).unwrap();
+                    assert_same_endpoints(&prepared.evaluate(&re, &im).unwrap(), &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_transform_owns_source_and_isolates_precision_and_concurrent_workspaces() {
+        let p = 192;
+        let mut source = [-2, 3, 5, 7, -11].map(|value| Float::with_val(p, value));
+        let original = source.clone();
+        let first = PreparedFiniteTransform::new("13", &source, p).unwrap();
+        source[0] *= 17;
+        let second = PreparedFiniteTransform::new("17", &source, p).unwrap();
+        let third = PreparedFiniteTransform::new("13", &original, 2 * p).unwrap();
+        // Exercise constant caches warmed at a much higher precision between
+        // preparation and one-shot reuse on this thread.
+        let zero = MpfrInterval::from_i64(0, p);
+        let before_warming = first.evaluate(&zero, &zero).unwrap();
+        let high_zero = MpfrInterval::from_i64(0, 4096);
+        finite_transform("13", &[Float::with_val(4096, 1)], &high_zero, &high_zero).unwrap();
+        assert_same_endpoints(&first.evaluate(&zero, &zero).unwrap(), &before_warming);
+        assert_same_endpoints(
+            &first.evaluate(&zero, &zero).unwrap(),
+            &finite_transform("13", &original, &zero, &zero).unwrap(),
+        );
+        for threads in [1, 2, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    use rayon::prelude::*;
+                    (0..24).into_par_iter().for_each(|j| {
+                        let re = MpfrInterval::new(
+                            Float::with_val(p, j) / 17,
+                            Float::with_val(p, j + j % 2) / 17,
+                        )
+                        .unwrap();
+                        let im = MpfrInterval::from_i64(-1, p);
+                        assert_same_endpoints(
+                            &first.evaluate(&re, &im).unwrap(),
+                            &finite_transform("13", &original, &re, &im).unwrap(),
+                        );
+                        assert_same_endpoints(
+                            &second.evaluate(&re, &im).unwrap(),
+                            &finite_transform("17", &source, &re, &im).unwrap(),
+                        );
+                        let high_re = MpfrInterval::new(
+                            Float::with_val(2 * p, re.lower()),
+                            Float::with_val(2 * p, re.upper()),
+                        )
+                        .unwrap();
+                        let high_im = MpfrInterval::from_i64(-1, 2 * p);
+                        assert_same_endpoints(
+                            &third.evaluate(&high_re, &high_im).unwrap(),
+                            &finite_transform("13", &original, &high_re, &high_im).unwrap(),
+                        );
+                    });
+                });
+        }
+        assert!(first
+            .evaluate(
+                &MpfrInterval::from_i64(0, 2 * p),
+                &MpfrInterval::from_i64(0, 2 * p)
+            )
+            .is_err());
+        assert!(first
+            .evaluate(
+                &MpfrInterval::from_i64(0, p),
+                &MpfrInterval::from_i64(0, 2 * p)
+            )
+            .is_err());
+        drop(source);
+        drop(original);
+        first
+            .evaluate(&MpfrInterval::from_i64(0, p), &MpfrInterval::from_i64(0, p))
+            .unwrap();
+    }
+
+    #[test]
+    fn prepared_transform_failures_preserve_source_validation_order_and_release_reservations() {
+        let p = 128;
+        let resources = xc_core::RunResources::new(8 << 20).unwrap();
+        let zero = MpfrInterval::from_i64(0, p);
+        let coefficients = [Float::with_val(p, 1)];
+        let prepared = {
+            let _scope = resources.enter();
+            for (cutoff, source) in [
+                ("not-a-number", vec![Float::with_val(p, 1)]),
+                ("1", vec![Float::with_val(p, 1)]),
+                ("9", vec![Float::with_val(p, 0)]),
+                ("bad\0cutoff", vec![Float::with_val(p, 1)]),
+                ("bad", vec![]),
+                ("bad", vec![Float::with_val(p, 1); 2]),
+                ("bad", vec![Float::with_val(p, rug::float::Special::Nan); 2]),
+            ] {
+                let expected = finite_transform(cutoff, &source, &zero, &zero).unwrap_err();
+                let actual = PreparedFiniteTransform::new(cutoff, &source, p)
+                    .err()
+                    .unwrap();
+                assert_eq!(actual.to_string(), expected.to_string());
+                assert_eq!(resources.usage().retained_bytes, 0);
+                assert_eq!(resources.usage().working_bytes, 0);
+            }
+            std::sync::Arc::new(PreparedFiniteTransform::new("13", &coefficients, p).unwrap())
+        };
+        assert!(resources.usage().retained_bytes > 0);
+        let worker = prepared.clone();
+        std::thread::spawn(move || {
+            assert!(xc_core::RunResources::current().is_none());
+            worker
+                .evaluate(&MpfrInterval::from_i64(0, p), &MpfrInterval::from_i64(0, p))
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(resources.usage().working_bytes, 0);
+        drop(prepared);
+        assert_eq!(resources.usage().retained_bytes, 0);
+        let bounded = xc_core::RunResources::new(128 << 10).unwrap();
+        {
+            let _scope = bounded.enter();
+            let prepared = PreparedFiniteTransform::new("13", &coefficients, p).unwrap();
+            let retained = bounded.usage().retained_bytes;
+            assert!(prepared
+                .evaluate(&zero, &zero)
+                .unwrap_err()
+                .to_string()
+                .contains("run memory budget exceeded"));
+            assert_eq!(bounded.usage().retained_bytes, retained);
+            assert_eq!(bounded.usage().working_bytes, 0);
+        }
+        assert_eq!(bounded.usage().retained_bytes, 0);
+        let tiny = xc_core::RunResources::new(1).unwrap();
+        let _scope = tiny.enter();
+        assert!(PreparedFiniteTransform::new("13", &coefficients, p).is_err());
+        assert_eq!(tiny.usage().retained_bytes, 0);
+        assert_eq!(tiny.usage().peak_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "local bounded timing comparison; run explicitly with --nocapture"]
+    fn benchmark_prepared_finite_transform() {
+        for (p, calls, repeats) in [(256, 128, 5), (3386, 8, 3)] {
+            let coefficients = (0..65)
+                .map(|j| Float::with_val(p, (j * 7 % 31) - 15) / 17)
+                .collect::<Vec<_>>();
+            let start = std::time::Instant::now();
+            let prepared = PreparedFiniteTransform::new("13", &coefficients, p).unwrap();
+            eprintln!(
+                "precision={p} prepared construction_ns={}",
+                start.elapsed().as_nanos()
+            );
+            for rectangle in [false, true] {
+                let re = MpfrInterval::new(
+                    Float::with_val(p, 3),
+                    Float::with_val(p, if rectangle { 3.125 } else { 3. }),
+                )
+                .unwrap();
+                let im = MpfrInterval::from_i64(-1, p);
+                let expected = finite_transform("13", &coefficients, &re, &im).unwrap();
+                assert_same_endpoints(&prepared.evaluate(&re, &im).unwrap(), &expected);
+                for repeat in 0..repeats {
+                    for use_prepared in [repeat % 2 == 0, repeat % 2 != 0] {
+                        let start = std::time::Instant::now();
+                        for _ in 0..calls {
+                            let value = if use_prepared {
+                                prepared.evaluate(&re, &im).unwrap()
+                            } else {
+                                finite_transform("13", &coefficients, &re, &im).unwrap()
+                            };
+                            std::hint::black_box(value);
+                        }
+                        eprintln!("precision={p} prepared={use_prepared} rectangle={rectangle} repeat={repeat} calls={calls} elapsed_ns={}", start.elapsed().as_nanos());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn near_carrier_rectangles_stay_narrow_and_contain_point_evaluations() {

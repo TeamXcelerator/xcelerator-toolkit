@@ -597,7 +597,7 @@ fn tail_operator_uncached(
         let error = super::retained_evidence::finite_math::decimal_upper(err, p)?;
         out.values.insert(
             "declared_tail_form_error".into(),
-            error.to_string_radix_round(10, None, rug::float::Round::Up),
+            xc_numerics::fmt::decimal_string_round(&error, None, rug::float::Round::Up),
         );
         match tail_error_math::bound(
             &gram,
@@ -609,7 +609,7 @@ fn tail_operator_uncached(
             Ok(bound) => {
                 out.values.insert(
                     "conditional_energy_error_budget".into(),
-                    bound.to_string_radix_round(10, None, rug::float::Round::Up),
+                    xc_numerics::fmt::decimal_string_round(&bound, None, rug::float::Round::Up),
                 );
             }
             Err(error) => {
@@ -726,7 +726,8 @@ mod exhaustive_model_action {
 #[doc(hidden)]
 pub mod finite_capture {
     use super::super::{
-        extended_research::ExternalResearchInputs, retained_evidence::*,
+        extended_research::{ExtensionOptions, ExternalResearchInputs},
+        retained_evidence::*,
         state_geometry::RetainedState,
     };
     use anyhow::{bail, Result};
@@ -1181,6 +1182,19 @@ pub mod finite_capture {
         );
         // Guards beyond the 8192-bit analysis limit are not tried.
         assert_eq!(run(7900, None, pivot), ("unresolved".into(), vec![64, 256]));
+        // A budget stop after a mathematical attempt must not turn that
+        // earlier unresolved attempt into a reusable cached result.
+        let mut tried = Vec::new();
+        let stopped = guard_ladder(3386, |guard| {
+            tried.push(guard);
+            if guard > 64 {
+                return Err(ResourceLimited("guard workspace unavailable".into()).into());
+            }
+            Ok(record("unresolved", pivot))
+        })
+        .unwrap_err();
+        assert_eq!(tried, vec![64, 256]);
+        assert!(stopped.downcast_ref::<ResourceLimited>().is_some());
     }
     #[test]
     fn finite_scalar_admission_checks_exponent_before_allocation() {
@@ -2773,7 +2787,35 @@ pub mod finite_capture {
             )
         }
 
+        const DEFAULT_CONTINUOUS_MAX_OPERATIONS: u64 = 32_000_000;
+
+        fn parse_continuous_max_operations(text: &str) -> Result<u64> {
+            text.parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0 && value.to_string() == text)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "XC_CONTINUOUS_MAX_OPERATIONS must be a positive canonical decimal u64"
+                    )
+                })
+        }
+
+        fn continuous_max_operations() -> Result<u64> {
+            match std::env::var("XC_CONTINUOUS_MAX_OPERATIONS") {
+                Ok(text) => parse_continuous_max_operations(&text),
+                Err(std::env::VarError::NotPresent) => Ok(DEFAULT_CONTINUOUS_MAX_OPERATIONS),
+                Err(_) => bail!("XC_CONTINUOUS_MAX_OPERATIONS is not valid Unicode"),
+            }
+        }
+
+        /// Evaluate the complete supplied profiles. The optional
+        /// `XC_CONTINUOUS_MAX_OPERATIONS` work ceiling is operational only;
+        /// it never truncates a sum or enters a mathematical artifact identity.
         pub fn analyze_continuous(r: &ContinuousRequest) -> Result<Value> {
+            analyze_continuous_with_limit(r, continuous_max_operations()?)
+        }
+
+        fn analyze_continuous_with_limit(r: &ContinuousRequest, maximum: u64) -> Result<Value> {
             admission(r)?;
             precision(r.precision_bits)?;
             if !r.definition_digest.validate()
@@ -2795,8 +2837,10 @@ pub mod finite_capture {
                 .iter()
                 .map(|f| f.x.len())
                 .sum::<usize>();
-            if knots.saturating_mul(r.integration_cells + r.maximum_prime_power) > 32_000_000 {
-                bail!("continuous evaluator operation limit");
+            let operations =
+                (knots as u128) * (r.integration_cells as u128 + r.maximum_prime_power as u128);
+            if operations > u128::from(maximum) {
+                bail!("continuous evaluator operation limit: requested={operations}, maximum={maximum}; configure XC_CONTINUOUS_MAX_OPERATIONS to admit the complete calculation");
             }
             // The five independent forms run concurrently; failures keep their order.
             let [energy_a, energy_b, energy_sum, energy_sum_plus_a, energy_sum_plus_b] =
@@ -3005,6 +3049,87 @@ pub mod finite_capture {
         #[cfg(test)]
         mod parallel_form_tests {
             use super::*;
+
+            #[test]
+            fn continuous_work_limit_configuration_is_strict() {
+                for text in ["1", "32000000", "64000000", "18446744073709551615"] {
+                    assert_eq!(
+                        parse_continuous_max_operations(text).unwrap().to_string(),
+                        text
+                    );
+                }
+                for text in [
+                    "",
+                    "0",
+                    "-1",
+                    "+1",
+                    "01",
+                    " 1",
+                    "1 ",
+                    "1e8",
+                    "18446744073709551616",
+                ] {
+                    assert!(parse_continuous_max_operations(text).is_err(), "{text:?}");
+                }
+            }
+
+            #[test]
+            fn continuous_work_limit_admits_complete_profiles_without_changing_bytes() {
+                // The retained large-cutoff shape crosses the old work ceiling.
+                // Compact support keeps this regression inexpensive; the declared
+                // prime ceiling is deliberately conservative, as callers may be.
+                let profile = LogProfile {
+                    label: "compact zero profile".into(),
+                    knots: (0..75)
+                        .map(|i| Knot {
+                            coordinate: Rational::from((i - 37, 148)).to_string(),
+                            value: "0".into(),
+                        })
+                        .collect(),
+                };
+                let mut request = ContinuousRequest {
+                    definition_digest: ContentDigest::sha256(b"continuous work admission fixture"),
+                    profile_a: profile.clone(),
+                    profile_b: profile.clone(),
+                    profile_sum: profile,
+                    scope: ProfileScope::ExactInterpolant,
+                    summands: vec![],
+                    integration_windows: vec![],
+                    unrepresented_sum_l2: None,
+                    overlap: None,
+                    translation_shifts: vec![],
+                    integration_cells: 512,
+                    maximum_prime_power: 108_732,
+                    precision_bits: 128,
+                };
+                let error =
+                    analyze_continuous_with_limit(&request, DEFAULT_CONTINUOUS_MAX_OPERATIONS)
+                        .unwrap_err()
+                        .to_string();
+                assert!(error.contains("requested=40966500, maximum=32000000"));
+                assert!(analyze_continuous_with_limit(&request, 40_966_499).is_err());
+                let admitted = analyze_continuous_with_limit(&request, 40_966_500).unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&admitted).unwrap(),
+                    serde_json::to_vec(
+                        &analyze_continuous_with_limit(&request, 64_000_000).unwrap()
+                    )
+                    .unwrap()
+                );
+                // The same complete integral with a tighter sufficient prime
+                // ceiling was already admitted by the legacy policy.
+                request.maximum_prime_power = 8;
+                assert_eq!(
+                    serde_json::to_vec(&admitted).unwrap(),
+                    serde_json::to_vec(
+                        &analyze_continuous_with_limit(&request, DEFAULT_CONTINUOUS_MAX_OPERATIONS)
+                            .unwrap()
+                    )
+                    .unwrap()
+                );
+                request.profile_a.knots[0].value = "1".into();
+                assert!(analyze_continuous_with_limit(&request, 64_000_000).is_err());
+            }
 
             #[test]
             fn retained_stream_fingerprint_matches_fresh_and_binds_exact_entries() {
@@ -3644,6 +3769,62 @@ pub mod finite_capture {
     pub(super) const AUTOMATIC_MATRIX_GUARD_BITS: [u32; 3] = [64, 256, 1024];
     pub(super) const AUTOMATIC_MATRIX_PRECISION: &str = "source_plus_guard_ladder_64_256_1024_v1";
 
+    fn automatic_matrix_options(d: usize, p: u32) -> Result<cv::Options> {
+        let large = d > 512;
+        let operations = if large {
+            let n = d as u128;
+            // Two shifted inertias plus matrix/vector work. This is a work
+            // allowance, not a claim that the finite premises will resolve.
+            n.checked_mul(n)
+                .and_then(|square| {
+                    square.checked_mul(n).and_then(|cube| {
+                        cube.checked_mul(4)?
+                            .checked_add(square.checked_mul(64)?)?
+                            .checked_add(65536)
+                    })
+                })
+                .and_then(|work| u64::try_from(work).ok())
+                .ok_or_else(|| ResourceLimited("automatic matrix work estimate overflow".into()))?
+        } else {
+            1_000_000_000
+        };
+        Ok(cv::Options {
+            maximum_dimension: d.max(512),
+            // The large route has already reserved its dense workspace. The
+            // solver counts serialized bytes without a second JSON allocation.
+            // Keep all released small-route options (and report hashes) exact.
+            maximum_input_bytes: if large {
+                usize::MAX
+            } else {
+                cv::MAXIMUM_INPUT_BYTES
+            },
+            maximum_interval_operations: operations,
+            maximum_rational_bits: 65536,
+            working_precision_bits: p,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn automatic_matrix_limits_follow_shape_without_changing_small_requests() {
+        let old = cv::Options {
+            maximum_dimension: 512,
+            maximum_input_bytes: cv::MAXIMUM_INPUT_BYTES,
+            maximum_interval_operations: 1_000_000_000,
+            maximum_rational_bits: 65536,
+            working_precision_bits: 3450,
+            ..Default::default()
+        };
+        assert_eq!(automatic_matrix_options(501, 3450).unwrap(), old);
+        for dimension in [1001usize, 2501] {
+            let options = automatic_matrix_options(dimension, 3450).unwrap();
+            assert_eq!(options.maximum_dimension, dimension);
+            let n = dimension as u64;
+            assert!(options.maximum_interval_operations > n * (n - 1) * (n + 2));
+        }
+        assert!(automatic_matrix_options(usize::MAX, 3450).is_err());
+    }
+
     fn precision_unresolved(a: &Analysis) -> bool {
         a.rows.len() == 1
             && a.rows[0].outcome == "unresolved"
@@ -3658,8 +3839,27 @@ pub mod finite_capture {
         s: &RetainedState,
         m: &RetainedMatrix<'_>,
         roots: Option<&RetainedRoots>,
+        maximum_working_bytes: u128,
     ) -> Result<Analysis> {
         guard_ladder(s.precision, |guard| {
+            let precision = s.precision.saturating_add(guard).max(384);
+            // Charge only the attempt that will actually execute. A later
+            // resource refusal is operational and must escape the ladder,
+            // rather than caching an earlier unresolved mathematical result.
+            let bytes = if precision <= 8192 {
+                automatic_matrix_workspace(id, s, m, roots, precision)?
+            } else {
+                0
+            };
+            if bytes > maximum_working_bytes {
+                return Err(ResourceLimited(format!(
+                    "automatic finite matrix guard {guard} requires {bytes} working bytes; declared remaining stage budget is {maximum_working_bytes}"
+                )).into());
+            }
+            let _workspace =
+                super::super::capture_runtime::reserve_working(bytes).map_err(|error| {
+                    ResourceLimited(format!("automatic finite matrix guard {guard}: {error}"))
+                })?;
             automatic_matrix_at(id, s, m, roots, guard)
         })
     }
@@ -3685,6 +3885,513 @@ pub mod finite_capture {
         Ok(last.expect("the guard ladder is not empty"))
     }
 
+    #[derive(Clone, Copy, Default)]
+    struct AutomaticDyadicRange {
+        low: i64,
+        high: i64,
+    }
+    impl AutomaticDyadicRange {
+        fn include(&mut self, value: &Float) -> Result<()> {
+            float_bits(value).map_err(|error| ResourceLimited(error.to_string()))?;
+            if !value.is_zero() {
+                let exponent = i64::from(value.get_exp().unwrap());
+                self.low = self.low.min(exponent - i64::from(value.prec()));
+                self.high = self.high.max(exponent);
+            }
+            Ok(())
+        }
+        fn width(self) -> u128 {
+            (self.high - self.low + 1) as u128
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // Explicit dimensions and dyadic ranges, no allocated inputs.
+    fn automatic_matrix_workspace_shape(
+        id: &str,
+        full: usize,
+        dimension: usize,
+        even: bool,
+        precision: u32,
+        matrix: AutomaticDyadicRange,
+        vector: AutomaticDyadicRange,
+        eigenvalue: AutomaticDyadicRange,
+        roots: usize,
+    ) -> Result<u128> {
+        let overflow = || ResourceLimited("automatic matrix workspace estimate overflow".into());
+        let n = full as u128;
+        let d = dimension as u128;
+        let p = u128::from(precision);
+        // Each even-basis factor is a p-bit dyadic near 1/sqrt(2). Forming
+        // sym(Tau) divides by two; two factors can lower the exact lattice by
+        // 2p bits. Directed rounding cannot introduce a finer binary lattice.
+        // This includes cancellation without assuming source precision alone
+        // bounds the numerators/denominators of exact endpoint strings.
+        let low = i128::from(matrix.low) - 1 - if even { 2 * i128::from(precision) } else { 0 };
+        let high = i128::from(matrix.high) + 4;
+        let numerator = p.max(high.max(1) as u128);
+        let denominator = (-low).max(0) as u128 + 1;
+        // The directional shift divides mu by two; the tail fallback divides
+        // it by eight, and its Gershgorin gap is halved. Spectral-window
+        // endpoints can reach mu +/- 2|mu|. Include these transformations in
+        // the endpoint envelope before counting shifted diagonal owners.
+        let shifted_denominator =
+            (denominator + 1).max((-i128::from(eigenvalue.low)).max(0) as u128 + 4);
+        let shifted_high = high.max(i128::from(eigenvalue.high) + 2) + 1;
+        // The solver bounds exact additions at max(2p,65536/4), otherwise
+        // converts outward to p-bit MPFR. Retain the previous per-endpoint
+        // envelope; only the actual number of simultaneously owned entries
+        // changes with diagonal views and owned factorization input.
+        let shifted_numerator = (shifted_high.max(1) as u128 + shifted_denominator)
+            .min((2 * p).max(16_384).max(shifted_high.max(1) as u128));
+        let rational_bytes =
+            |a: u128, b: u128| -> u128 { a.div_ceil(64) * 8 + b.div_ceil(64) * 8 + 128 };
+        // 0.302 is an upper bound for log10(2). Endpoint text now exists for
+        // a single entry during canonical serialization/parsing, rather than
+        // every element of a dense matrix.
+        let endpoint_text = (numerator + denominator)
+            .checked_mul(302)
+            .ok_or_else(overflow)?
+            .div_ceil(1000)
+            + 16;
+        let float_bytes = p.div_ceil(64) * 8 + 96;
+        let square = d.checked_mul(d).ok_or_else(overflow)?;
+        let (inertia_dimension, diagonals) = match id {
+            "spectral_cluster_bound" => (d, 2 * d),
+            "directional_error_bound" => (d, d),
+            "finite_tail_bound" => {
+                let modes = full / 2;
+                let retained = if even {
+                    modes / 2 + 1
+                } else {
+                    2 * (modes / 2) + 1
+                };
+                let omitted = dimension.checked_sub(retained).ok_or_else(overflow)? as u128;
+                (omitted, omitted)
+            }
+            _ => bail!("unknown automatic matrix diagnostic"),
+        };
+        // Immutable packed MPFR input; one parsed Rational matrix and the
+        // actual shifted diagonals; one owned MPFR factorization matrix.
+        let packed = d
+            .checked_mul(d.checked_add(1).ok_or_else(overflow)?)
+            .and_then(|slots| slots.checked_mul(float_bytes))
+            .ok_or_else(overflow)?;
+        let rational = square
+            .checked_add(diagonals)
+            .and_then(|slots| slots.checked_mul(2))
+            .and_then(|slots| {
+                slots.checked_mul(rational_bytes(shifted_numerator, shifted_denominator))
+            })
+            .ok_or_else(overflow)?;
+        let factorization = inertia_dimension
+            .checked_mul(inertia_dimension)
+            .and_then(|slots| slots.checked_mul(2))
+            .and_then(|slots| slots.checked_mul(float_bytes))
+            .ok_or_else(overflow)?;
+        let serialized_entry = 4 * endpoint_text + 64 + 65_536;
+        let dense = packed
+            .checked_add(rational)
+            .and_then(|bytes| bytes.checked_add(factorization))
+            .and_then(|bytes| bytes.checked_add(serialized_entry))
+            .ok_or_else(overflow)?;
+        // Original coefficients, normalized exact ratios, exact residuals and
+        // their temporaries are O(full), not another full Rational matrix.
+        // Include row sums, rational multiplication/division scratch, basis,
+        // pivot columns and worker-owned interval temporaries conservatively.
+        let bits = matrix.width()
+            + 2 * vector.width()
+            + eigenvalue.width()
+            + u128::from(usize::BITS - full.max(1).leading_zeros())
+            + p
+            + 16;
+        let linear_slot = rational_bytes(bits, bits) + float_bytes;
+        let linear = n
+            .checked_mul(64)
+            .and_then(|v| v.checked_add((roots as u128).checked_mul(32)?))
+            .and_then(|v| v.checked_add(4096))
+            .and_then(|v| v.checked_mul(linear_slot))
+            .ok_or_else(overflow)?;
+        dense.checked_add(linear).ok_or_else(|| overflow().into())
+    }
+
+    fn automatic_matrix_workspace(
+        id: &str,
+        s: &RetainedState,
+        m: &RetainedMatrix<'_>,
+        roots: Option<&RetainedRoots>,
+        precision: u32,
+    ) -> Result<u128> {
+        let full = s.coefficients.len();
+        if s.modes.checked_mul(2).and_then(|v| v.checked_add(1)) != Some(full)
+            || full.checked_mul(full) != Some(m.entries.len())
+        {
+            bail!("automatic retained matrix shape");
+        }
+        // The caller admits one guard at a time; completed attempts release
+        // their workspace before a larger guard is considered.
+        let even = s.coefficients.iter().eq(s.coefficients.iter().rev());
+        let dimension = if even { s.modes + 1 } else { full };
+        let mut matrix = AutomaticDyadicRange::default();
+        for value in m.entries.iter() {
+            matrix.include(value)?;
+        }
+        let mut vector = AutomaticDyadicRange::default();
+        for value in &s.coefficients {
+            vector.include(value)?;
+        }
+        let mut eigenvalue = AutomaticDyadicRange::default();
+        eigenvalue.include(&Float::with_val(s.precision, Float::parse(&s.eigenvalue)?))?;
+        automatic_matrix_workspace_shape(
+            id,
+            full,
+            dimension,
+            even,
+            precision,
+            matrix,
+            vector,
+            eigenvalue,
+            roots.map_or(0, |r| r.dataset.points.len()),
+        )
+    }
+
+    fn automatic_symmetric_entry(
+        matrix: &[Float],
+        full: usize,
+        row: usize,
+        column: usize,
+    ) -> Result<Rational> {
+        Ok((exact(&matrix[row * full + column])? + exact(&matrix[column * full + row])?) / 2)
+    }
+
+    /// Immutable lower-triangle backing for the canonical full-matrix input.
+    /// The producer validates entries in its original triangular order before
+    /// this view is used. The solver streams the same endpoint strings in
+    /// full row order, without retaining their dense decimal representation.
+    struct AutomaticMatrixEntries {
+        dimension: usize,
+        lower: Vec<xc_numerics::mpfr_interval::MpfrInterval>,
+    }
+    impl AutomaticMatrixEntries {
+        fn bounds(&self, row: usize, column: usize) -> Result<te::ExactBounds> {
+            if row >= self.dimension || column >= self.dimension {
+                bail!("automatic matrix entry index out of range");
+            }
+            let (row, column) = (row.max(column), row.min(column));
+            let value = &self.lower[row * (row + 1) / 2 + column];
+            value.validate()?;
+            Ok(te::ExactBounds {
+                lower: exact(value.lower())?.to_string(),
+                upper: exact(value.upper())?.to_string(),
+            })
+        }
+    }
+    impl cv::MatrixEntrySource for AutomaticMatrixEntries {
+        fn entry(
+            &self,
+            row: usize,
+            column: usize,
+        ) -> std::result::Result<te::ExactBounds, xc_solver::SolverError> {
+            self.bounds(row, column).map_err(|error| {
+                xc_solver::SolverError::InvalidConfiguration(format!(
+                    "automatic matrix endpoint: {error}"
+                ))
+            })
+        }
+    }
+
+    #[test]
+    fn automatic_matrix_workspace_uses_sector_shape_and_stored_exponents() {
+        let matrix = AutomaticDyadicRange {
+            low: -3386,
+            high: 16,
+        };
+        let vector = AutomaticDyadicRange {
+            low: -3386,
+            high: 1,
+        };
+        let eigenvalue = AutomaticDyadicRange {
+            low: -7000,
+            high: 0,
+        };
+        for modes in [1000usize, 2500] {
+            let full = 2 * modes + 1;
+            let estimate = automatic_matrix_workspace_shape(
+                "spectral_cluster_bound",
+                full,
+                modes + 1,
+                true,
+                4410,
+                matrix,
+                vector,
+                eigenvalue,
+                25,
+            )
+            .unwrap();
+            let old = 32 * (full as u128).pow(2) * (3386u128.div_ceil(8) + 256);
+            assert!(estimate < old);
+            assert!(estimate > (modes as u128 + 1).pow(2) * 4 * 4410u128.div_ceil(8));
+            println!("metadata-only automatic matrix workspace: full={full} sector={} p=4410 bytes={estimate}", modes + 1);
+            let wider = automatic_matrix_workspace_shape(
+                "spectral_cluster_bound",
+                full,
+                modes + 1,
+                true,
+                4410,
+                AutomaticDyadicRange {
+                    low: -20_000,
+                    ..matrix
+                },
+                vector,
+                eigenvalue,
+                25,
+            )
+            .unwrap();
+            assert!(wider > estimate);
+            let directional = automatic_matrix_workspace_shape(
+                "directional_error_bound",
+                full,
+                modes + 1,
+                true,
+                4410,
+                matrix,
+                vector,
+                eigenvalue,
+                25,
+            )
+            .unwrap();
+            let tail = automatic_matrix_workspace_shape(
+                "finite_tail_bound",
+                full,
+                modes + 1,
+                true,
+                4410,
+                matrix,
+                vector,
+                eigenvalue,
+                25,
+            )
+            .unwrap();
+            assert!(tail < directional && directional < estimate);
+            let first_guard = automatic_matrix_workspace_shape(
+                "spectral_cluster_bound",
+                full,
+                modes + 1,
+                true,
+                3450,
+                matrix,
+                vector,
+                eigenvalue,
+                25,
+            )
+            .unwrap();
+            assert!(first_guard < estimate);
+        }
+        assert!(automatic_matrix_workspace_shape(
+            "spectral_cluster_bound",
+            usize::MAX,
+            usize::MAX,
+            true,
+            4410,
+            matrix,
+            vector,
+            eigenvalue,
+            25
+        )
+        .is_err());
+        let mut range = AutomaticDyadicRange::default();
+        assert!(range
+            .include(&(Float::with_val(128, 1) << 1_000_000))
+            .is_err());
+        assert!(range
+            .include(&(Float::with_val(128, 1) >> 1_000_000))
+            .is_err());
+        range
+            .include(&Float::with_val(128, rug::float::Special::NegZero))
+            .unwrap();
+        assert_eq!((range.low, range.high), (0, 0));
+    }
+
+    #[test]
+    fn automatic_matrix_workspace_on_demand_matches_legacy_values_and_reports() {
+        use xc_numerics::mpfr_interval::MpfrInterval as M;
+        let p = 192;
+        let zero = Float::with_val(p, rug::float::Special::NegZero);
+        for matrix in [
+            vec![
+                Float::with_val(p, 4),
+                Float::with_val(p, 0.125),
+                zero.clone(),
+                Float::with_val(p, 0.25),
+                Float::with_val(p, 3),
+                Float::with_val(p, 0.0625),
+                Float::with_val(p, 0),
+                Float::with_val(p, 0.03125),
+                Float::with_val(p, 2),
+            ],
+            vec![
+                Float::with_val(p, 1) << 400,
+                Float::with_val(p, 1) >> 300,
+                zero,
+                -Float::with_val(p, 1) << 400,
+                Float::with_val(p, 3),
+                Float::with_val(p, 1),
+                Float::with_val(p, 0),
+                Float::with_val(p, -1),
+                Float::with_val(p, 2),
+            ],
+        ] {
+            let raw: Vec<_> = matrix.iter().map(exact).collect::<Result<_>>().unwrap();
+            let old: Vec<Rational> = (0..9)
+                .map(|k| Rational::from(&raw[k] + &raw[(k % 3) * 3 + k / 3]) / 2)
+                .collect();
+            let new: Vec<_> = (0..9)
+                .map(|k| automatic_symmetric_entry(&matrix, 3, k / 3, k % 3).unwrap())
+                .collect();
+            assert_eq!(new, old);
+            let v = [
+                Rational::from(1),
+                Rational::from(-1),
+                Rational::from((2, 3)),
+            ];
+            let mu = Rational::from((3, 7));
+            for row in 0..3 {
+                let old_residual = Rational::from(&mu * &v[row])
+                    - old[row * 3..row * 3 + 3]
+                        .iter()
+                        .zip(&v)
+                        .fold(Rational::from(0), |sum, (a, b)| sum + Rational::from(a * b));
+                let new_residual = Rational::from(&mu * &v[row])
+                    - v.iter()
+                        .enumerate()
+                        .fold(Rational::from(0), |sum, (column, b)| {
+                            sum + automatic_symmetric_entry(&matrix, 3, row, column).unwrap() * b
+                        });
+                assert_eq!(new_residual, old_residual);
+            }
+            // The original exact symmetric matrix and the new accessor feed
+            // the identical directed basis operations, in identical order.
+            let one = M::from_i64(1, p);
+            let pair = one.div(&M::from_i64(2, p).sqrt().unwrap()).unwrap();
+            for basis in [
+                vec![
+                    vec![(1, one.clone())],
+                    vec![(0, pair.clone()), (2, pair.clone())],
+                ],
+                vec![
+                    vec![(1, one.clone())],
+                    vec![(0, one.clone())],
+                    vec![(2, one.clone())],
+                ],
+            ] {
+                let encode = |entry: &M| te::ExactBounds {
+                    lower: exact(entry.lower()).unwrap().to_string(),
+                    upper: exact(entry.upper()).unwrap().to_string(),
+                };
+                let form = |values: &[Rational]| {
+                    let d = basis.len();
+                    let mut entries = vec![te::ExactBounds::point("0"); d * d];
+                    for i in 0..d {
+                        for j in 0..=i {
+                            let mut entry = M::from_i64(0, p);
+                            for (u, x) in &basis[i] {
+                                for (v, y) in &basis[j] {
+                                    entry = entry.add(
+                                        &M::from_rational(&values[u * 3 + v], p).mul(x).mul(y),
+                                    );
+                                }
+                            }
+                            entries[i * d + j] = encode(&entry);
+                            entries[j * d + i] = encode(&entry);
+                        }
+                    }
+                    cv::TrialForm {
+                        source_id: "same-source".into(),
+                        basis_id: "same-basis".into(),
+                        normalization_id: "same-normalization".into(),
+                        dimension: d,
+                        entries,
+                    }
+                };
+                let problem = |matrix: cv::TrialForm| {
+                    let n = matrix.dimension;
+                    cv::Problem::Directional(cv::DirectionalProblem {
+                        matrix,
+                        approximate_solution: vec![te::ExactBounds::point("0"); n],
+                        approximate_dual: vec![te::ExactBounds::point("0"); n],
+                        rhs: vec![te::ExactBounds::point("1"); n],
+                        functional: vec![te::ExactBounds::point("1"); n],
+                        coercivity_lower: "1".into(),
+                    })
+                };
+                let old = problem(form(&old));
+                let new = problem(form(&new));
+                assert_eq!(
+                    serde_json::to_vec(&new).unwrap(),
+                    serde_json::to_vec(&old).unwrap()
+                );
+                let options = automatic_matrix_options(basis.len(), p).unwrap();
+                let before = cv::analyze(&old, &options, &CancellationToken::new());
+                let after = cv::analyze(&new, &options, &CancellationToken::new());
+                match (before, after) {
+                    (Ok(a), Ok(b)) => assert_eq!(
+                        serde_json::to_vec(&a).unwrap(),
+                        serde_json::to_vec(&b).unwrap()
+                    ),
+                    (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                    other => panic!("automatic matrix result changed: {other:?}"),
+                }
+                let mut packed = AutomaticMatrixEntries {
+                    dimension: basis.len(),
+                    lower: Vec::new(),
+                };
+                for (i, left) in basis.iter().enumerate() {
+                    for right in &basis[..=i] {
+                        let mut entry = M::from_i64(0, p);
+                        for (u, x) in left {
+                            for (v, y) in right {
+                                let value = automatic_symmetric_entry(&matrix, 3, *u, *v).unwrap();
+                                entry = entry.add(&M::from_rational(&value, p).mul(x).mul(y));
+                            }
+                        }
+                        packed.lower.push(entry);
+                    }
+                }
+                let cv::Problem::Directional(dense) = &new else {
+                    unreachable!()
+                };
+                for i in 0..basis.len() {
+                    for j in 0..basis.len() {
+                        assert_eq!(
+                            packed.bounds(i, j).unwrap(),
+                            dense.matrix.entries[i * basis.len() + j]
+                        );
+                    }
+                }
+                assert!(packed.bounds(basis.len(), 0).is_err());
+                let mut generated = new.clone();
+                let cv::Problem::Directional(generated_problem) = &mut generated else {
+                    unreachable!()
+                };
+                generated_problem.matrix.entries.clear();
+                let expected = cv::analyze(&new, &options, &CancellationToken::new());
+                let actual = cv::analyze_generated_matrix(
+                    &generated,
+                    &packed,
+                    &options,
+                    &CancellationToken::new(),
+                );
+                match (expected, actual) {
+                    (Ok(a), Ok(b)) => assert_eq!(
+                        serde_json::to_vec(&a).unwrap(),
+                        serde_json::to_vec(&b).unwrap()
+                    ),
+                    (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                    other => panic!("packed automatic matrix result changed: {other:?}"),
+                }
+            }
+        }
+    }
+
     // Every coordinate below is constructed from the authenticated source.
     // Reciprocal-even sources use the orthonormal even compression E^T sym(Tau) E;
     // other sources retain the full space, ordered by increasing |frequency|.
@@ -3701,13 +4408,14 @@ pub mod finite_capture {
         let even = s.coefficients.iter().eq(s.coefficients.iter().rev());
         let d = if even { s.modes + 1 } else { full };
         let p = s.precision.saturating_add(guard).max(384);
-        if d > 512 || p > 8192 {
-            return Ok(empty(id,s,"blocked","automatic finite matrix analysis exceeds dimension 512 or precision 8192; primary sources retained for supplemental analysis"));
+        if p > 8192 {
+            return Ok(empty(id,s,"blocked","automatic finite matrix analysis exceeds the supported precision of 8192 bits; primary sources retained for supplemental analysis"));
         }
-        // Workspace admission is the caller's declared working-byte budget,
-        // whose dense estimate exceeds this serialized enclosure. The solver's
-        // input cap is a fixed constant, so its report never depends on the
-        // budget; an input it still rejects is a resource limit, not retained.
+        let options = automatic_matrix_options(d, p)?;
+        // Workspace admission follows the caller's declared working-byte
+        // budget and the stored dyadic spans. Solver limits depend only on
+        // shape/precision, preserving all released small-route report bytes.
+        // A resource refusal is not a retained mathematical outcome.
         let encode = |x: &M| -> Result<te::ExactBounds> {
             x.validate()?;
             Ok(te::ExactBounds {
@@ -3753,10 +4461,6 @@ pub mod finite_capture {
                 basis.push(vec![(s.modes + j, one.clone())]);
             }
         }
-        let raw = m.entries.iter().map(exact).collect::<Result<Vec<_>>>()?;
-        let a: Vec<Rational> = (0..full * full)
-            .map(|k| Rational::from(&raw[k] + &raw[(k % full) * full + k / full]) / 2)
-            .collect();
         let compress = |x: &[Rational]| -> Vec<M> {
             basis
                 .iter()
@@ -3768,18 +4472,33 @@ pub mod finite_capture {
                 .collect()
         };
         let column = compress(&v);
-        let mut entries = vec![te::ExactBounds::point("0"); d * d];
+        let triangle = d
+            .checked_add(1)
+            .and_then(|next| d.checked_mul(next))
+            .map(|count| count / 2)
+            .ok_or_else(|| ResourceLimited("automatic matrix shape overflow".into()))?;
+        let mut entries = AutomaticMatrixEntries {
+            dimension: d,
+            lower: Vec::new(),
+        };
+        entries
+            .lower
+            .try_reserve_exact(triangle)
+            .map_err(|_| ResourceLimited("automatic matrix allocation capacity limit".into()))?;
         for i in 0..d {
             for j in 0..=i {
                 let mut entry = M::from_i64(0, p);
                 for (u, x) in &basis[i] {
                     for (v, y) in &basis[j] {
-                        entry = entry.add(&M::from_rational(&a[u * full + v], p).mul(x).mul(y));
+                        let value = automatic_symmetric_entry(&m.entries, full, *u, *v)?;
+                        entry = entry.add(&M::from_rational(&value, p).mul(x).mul(y));
                     }
                 }
-                let entry = encode(&entry)?;
-                entries[i * d + j] = entry.clone();
-                entries[j * d + i] = entry;
+                // Preserve construction/endpoint-validation failure order.
+                // Decimal text is temporary; subsequent visits use precisely
+                // this retained interval, including for its mirrored entry.
+                let _ = encode(&entry)?;
+                entries.lower.push(entry);
             }
         }
         let basis_id = if even {
@@ -3792,15 +4511,7 @@ pub mod finite_capture {
             basis_id: basis_id.into(),
             normalization_id: "euclidean_orthonormal_coordinates".into(),
             dimension: d,
-            entries,
-        };
-        let options = cv::Options {
-            maximum_dimension: 512,
-            maximum_input_bytes: cv::MAXIMUM_INPUT_BYTES,
-            maximum_interval_operations: 1_000_000_000,
-            maximum_rational_bits: 65536,
-            working_precision_bits: p,
-            ..Default::default()
+            entries: Vec::new(),
         };
         let mut detail = json!({"preparation":"automatic_after_primary_v1","matrix":m.manifest.content_digest,
             "eigenpair":s.manifest.content_digest,"basis":basis_id,"full_dimension":full,"analyzed_dimension":d,
@@ -3849,12 +4560,13 @@ pub mod finite_capture {
                 }
                 let mut gershgorin: Option<Rational> = None;
                 for i in retained..d {
-                    let mut row = rational(&form.entries[i * d + i].lower)? - &mu;
+                    let mut row = rational(&entries.bounds(i, i)?.lower)? - &mu;
                     for j in retained..d {
                         if i != j {
-                            row -= rational(&form.entries[i * d + j].lower)?
+                            let entry = entries.bounds(i, j)?;
+                            row -= rational(&entry.lower)?
                                 .abs()
-                                .max(rational(&form.entries[i * d + j].upper)?.abs());
+                                .max(rational(&entry.upper)?.abs());
                         }
                     }
                     gershgorin = Some(gershgorin.map_or(row.clone(), |old| old.min(row)));
@@ -3883,16 +4595,20 @@ pub mod finite_capture {
                 }
                 // Compute the defect from exact stored dyadics before enclosing it.
                 // Quantizing A first would bury a tiny source residual in cancellation.
-                let residual: Vec<Rational> =
-                    a.chunks(full)
-                        .zip(&v)
-                        .map(|(row, x)| {
-                            Rational::from(&mu * x)
-                                - row.iter().zip(&v).fold(Rational::from(0), |sum, (a, b)| {
-                                    sum + Rational::from(a * b)
-                                })
-                        })
-                        .collect();
+                let residual: Vec<Rational> = v
+                    .iter()
+                    .enumerate()
+                    .map(|(row, x)| -> Result<Rational> {
+                        let sum = v.iter().enumerate().try_fold(
+                            Rational::from(0),
+                            |sum, (column, b)| -> Result<Rational> {
+                                let a = automatic_symmetric_entry(&m.entries, full, row, column)?;
+                                Ok(sum + a * b)
+                            },
+                        )?;
+                        Ok(Rational::from(&mu * x) - sum)
+                    })
+                    .collect::<Result<_>>()?;
                 let rhs = compress(&residual)
                     .iter()
                     .map(&encode)
@@ -3912,7 +4628,12 @@ pub mod finite_capture {
             }
             _ => bail!("unknown automatic matrix diagnostic"),
         };
-        let report = match cv::analyze(&problem, &options, &CancellationToken::new()) {
+        let report = match cv::analyze_generated_matrix(
+            &problem,
+            &entries,
+            &options,
+            &CancellationToken::new(),
+        ) {
             Ok(r) => r,
             Err(xc_solver::SolverError::PremiseNotVerified(reason)) => {
                 detail["reason"] = json!(reason);
@@ -4197,6 +4918,7 @@ pub mod finite_capture {
         roots: Option<&RetainedRoots>,
         input: Option<&ExternalResearchInputs>,
         certificate: Option<&super::super::sector_gap_certificate::PortableCcmSectorGapCertificate>,
+        automatic_working_bytes: u128,
     ) -> Result<Analysis> {
         let extra = input.and_then(|i| i.finite_diagnostics.as_ref());
         if let Some(reason) = extra.and_then(|i| i.not_applicable.get(id)) {
@@ -4304,7 +5026,7 @@ pub mod finite_capture {
                         "retained matrix required after primary acquisition",
                     ));
                 };
-                automatic_matrix(id, s, m, roots)
+                automatic_matrix(id, s, m, roots, automatic_working_bytes)
             }
             "dimension_precision_budget" => {
                 if let Some(c) = extra.and_then(|i| i.refinement_cohort.as_ref()) {
@@ -5098,6 +5820,11 @@ pub mod finite_capture {
         state: RetainedState,
         matrix: Option<RetainedMatrix<'static>>,
         roots: Option<RetainedRoots>,
+        state_payload: Vec<u8>,
+        root_payload: Option<Vec<u8>>,
+        secular_payload: Option<Vec<u8>>,
+        resources: xc_core::RunResources,
+        _source_reservations: Vec<xc_core::MemoryReservation>,
     }
     /// A cohort assembled entirely after acquisition. Retained values and
     /// matrix identities are checked, with no source-solving fallback. The
@@ -5174,6 +5901,49 @@ pub mod finite_capture {
         pub global_ordinal_certified: bool,
         pub roots: Vec<CohortRoot>,
     }
+    /// Match the live adapter's default options without changing a standalone
+    /// diagnostic into a full request merely because recovery retained roots.
+    fn recovery_extension_options(
+        mut options: ExtensionOptions,
+        id: &str,
+        input_precision: u32,
+        roots: Option<(u32, usize)>,
+        policy: &super::super::capture_runtime::CaptureResourcePolicy,
+    ) -> ExtensionOptions {
+        let normalized = id.strip_suffix("_full").unwrap_or(id);
+        let complete = id.ends_with("_full")
+            || super::DIAGNOSTICS.contains(&normalized)
+            || super::super::research_completion::DIAGNOSTICS.contains(&normalized);
+        options.working_precision_bits = options
+            .working_precision_bits
+            .max(input_precision.saturating_add(64))
+            .max(roots.map_or(0, |(precision, _)| precision.saturating_add(64)));
+        if complete {
+            options.maximum_estimated_output_bytes = policy.maximum_output_bytes;
+            options.maximum_working_bytes = Some(policy.maximum_working_bytes);
+            if matches!(normalized, "directional_response" | "root_transport") {
+                options.maximum_directional_rows = roots.map_or(0, |(_, rows)| rows);
+            }
+        }
+        options
+    }
+
+    /// Diagnostics with an immutable-source supplemental execution route.
+    pub fn supports_recovery_diagnostic(id: &str) -> bool {
+        if super::super::capture::FINITE_DIAGNOSTICS.contains(&id)
+            || matches!(
+                id,
+                "indexed_transform" | "prime_power_response" | "u_flow_response"
+            )
+        {
+            return true;
+        }
+        let normalized = id.strip_suffix("_full").unwrap_or(id);
+        super::super::extended_research::DIAGNOSTICS.contains(&normalized)
+            || super::DIAGNOSTICS.contains(&normalized)
+            || super::super::research_completion::DIAGNOSTICS.contains(&normalized)
+    }
+
     impl RetainedFiniteSources {
         /// The numerical value and matrix identity come from authenticated
         /// retained payloads. Branch labels and acquisition acceptance remain
@@ -5214,6 +5984,33 @@ pub mod finite_capture {
             include_matrix: bool,
             cache: &ArtifactCacheContext<'_>,
         ) -> Result<Self> {
+            let resources = match xc_core::RunResources::current() {
+                Some(resources) => resources,
+                None => xc_core::RunResources::new(
+                    super::super::capture_runtime::CaptureResourcePolicy::from_environment()?
+                        .maximum_working_bytes,
+                )?,
+            };
+            Self::from_manifests_with_resources(
+                manifests,
+                include_matrix,
+                cache,
+                &resources,
+                &std::env::temp_dir(),
+            )
+        }
+        /// Read immutable retained sources under a caller-owned budget. Pass the
+        /// same resources for all simultaneously live cohort members. The scratch
+        /// directory stores verified decoded streams; logical payload size is not
+        /// a fixed memory limit. Missing sources never trigger a primary solve.
+        pub fn from_manifests_with_resources(
+            manifests: &[ArtifactManifest],
+            include_matrix: bool,
+            cache: &ArtifactCacheContext<'_>,
+            resources: &xc_core::RunResources,
+            scratch_directory: &std::path::Path,
+        ) -> Result<Self> {
+            let _scope = resources.enter();
             let resolver = cache
                 .resolver
                 .ok_or_else(|| anyhow::anyhow!("retained analysis requires a source resolver"))?;
@@ -5230,26 +6027,73 @@ pub mod finite_capture {
                 }
                 Ok(found.first().copied())
             };
-            let read = |m: &ArtifactManifest| -> Result<Vec<u8>> {
-                if m.size_bytes > 256 * 1024 * 1024 {
-                    bail!("retained supplemental source exceeds the 256 MiB per-payload admission budget");
-                }
-                Ok(resolver.read_exact_payload(&m.key, &m.content_digest, acceptance)?)
+            let read = |m: &ArtifactManifest| -> Result<(Vec<u8>, xc_core::MemoryReservation)> {
+                use std::io::Read;
+                let length = usize::try_from(m.size_bytes)?;
+                // Charge the complete byte buffer only for small structured
+                // state/root records. Matrices take the streaming route below.
+                let reservation = resources.try_reserve_working(
+                    m.size_bytes
+                        .checked_add(2 << 20)
+                        .ok_or_else(|| anyhow::anyhow!("retained input workspace overflow"))?,
+                )?;
+                let mut source = resolver.open_exact_payload(
+                    &m.key,
+                    &m.content_digest,
+                    m.quality,
+                    acceptance,
+                    scratch_directory,
+                    m.size_bytes,
+                )?;
+                let mut bytes = Vec::new();
+                bytes.try_reserve_exact(length)?;
+                source.payload.read_to_end(&mut bytes)?;
+                Ok((bytes, reservation))
             };
             let em = find(&["ccm_weil_eigenpair"])?
                 .ok_or_else(|| anyhow::anyhow!("retained eigenpair manifest missing"))?;
-            let state = RetainedState::from_payload(
-                em,
-                &read(em)?,
-                std::slice::from_ref(&em.content_digest),
-            )?;
+            let mut source_reservations = Vec::new();
+            let (state, state_payload) = {
+                let (bytes, _buffer) = read(em)?;
+                #[derive(serde::Deserialize)]
+                struct Shape {
+                    n_modes: usize,
+                    precision_bits: u32,
+                }
+                let shape: Shape = serde_json::from_slice(&bytes)?;
+                if shape.n_modes > 8192 || !(64..=1_000_000).contains(&shape.precision_bits) {
+                    bail!("unsupported retained state shape or precision");
+                }
+                let numeric = (2 * shape.n_modes as u128 + 1)
+                    * (u128::from(shape.precision_bits).div_ceil(8) + 128);
+                // Includes parse strings, scalar scratch and retained metadata.
+                let estimate = numeric + 8 * u128::from(em.size_bytes);
+                source_reservations.push(resources.try_reserve_retained(u64::try_from(estimate)?)?);
+                let state = RetainedState::from_payload(
+                    em,
+                    &bytes,
+                    std::slice::from_ref(&em.content_digest),
+                )?;
+                (state, bytes)
+            };
             let matrix = if include_matrix {
                 find(&["ccm_tau_matrix"])?
                     .map(|m| -> Result<_> {
-                        let matrix = RetainedMatrix::from_payload(
+                        let spool_workspace = resources.try_reserve_working(2 << 20)?;
+                        let mut source = resolver.open_exact_payload(
+                            &m.key,
+                            &m.content_digest,
+                            m.quality,
+                            acceptance,
+                            scratch_directory,
+                            m.size_bytes,
+                        )?;
+                        drop(spool_workspace);
+                        let matrix = RetainedMatrix::from_reader_with_resources(
                             m,
-                            &read(m)?,
+                            &mut source.payload,
                             std::slice::from_ref(&m.content_digest),
+                            resources,
                         )?;
                         matrix.match_state(&state)?;
                         super::super::retained_evidence::matrix_ancestry(
@@ -5261,25 +6105,42 @@ pub mod finite_capture {
             } else {
                 None
             };
-            let roots = find(&["ccm_root_refinement", "ccm_root_discovery_window"])?
+            let root_sources = find(&["ccm_root_refinement", "ccm_root_discovery_window"])?
                 .map(|m| -> Result<_> {
                     let secular = find(&["ccm_secular_source"])?.ok_or_else(|| {
                         anyhow::anyhow!("retained secular source manifest missing")
                     })?;
-                    RetainedRoots::from_payload(
+                    let (root_bytes, _root_buffer) = read(m)?;
+                    let (secular_bytes, _secular_buffer) = read(secular)?;
+                    let estimated = (u128::from(m.size_bytes) + u128::from(secular.size_bytes))
+                        * 16
+                        + u128::from(state.precision).div_ceil(8) * 16;
+                    source_reservations
+                        .push(resources.try_reserve_retained(u64::try_from(estimated)?)?);
+                    let roots = RetainedRoots::from_payload(
                         m,
-                        &read(m)?,
+                        &root_bytes,
                         secular,
-                        &read(secular)?,
+                        &secular_bytes,
                         &state,
                         &[m.content_digest.clone(), secular.content_digest.clone()],
-                    )
+                    )?;
+                    Ok((roots, root_bytes, secular_bytes))
                 })
                 .transpose()?;
+            let (roots, root_payload, secular_payload) = match root_sources {
+                Some((roots, root, secular)) => (Some(roots), Some(root), Some(secular)),
+                None => (None, None, None),
+            };
             Ok(Self {
                 state,
                 matrix,
                 roots,
+                state_payload,
+                root_payload,
+                secular_payload,
+                resources: resources.clone(),
+                _source_reservations: source_reservations,
             })
         }
         pub fn observation(&self) -> Result<CohortObservation> {
@@ -5298,6 +6159,319 @@ pub mod finite_capture {
                     }).transpose()?})
                 }).collect::<Result<Vec<_>>>())?})
         }
+        /// Validate a supplemental input against the authenticated retained state.
+        /// This route has no primary acquisition or root-solving fallback.
+        pub fn validate_recovery_input(&self, input: &ExternalResearchInputs) -> Result<()> {
+            input.matches(&self.state)
+        }
+
+        /// Restore the live route's explicitly finite reference jets from the
+        /// original authenticated runtime projection, after private preparation.
+        /// Later prepared target coefficients are never reference authority.
+        /// Existing explicit jets prevail. No provider or primary/root solver
+        /// is available through this route.
+        pub fn restore_recovery_reference_jets(
+            &self,
+            original: &ExternalResearchInputs,
+            expected_target_definition: &ContentDigest,
+            input: &mut ExternalResearchInputs,
+        ) -> std::result::Result<bool, xc_cache::CaptureFailure> {
+            self.restore_recovery_reference_jets_checked(
+                original,
+                expected_target_definition,
+                input,
+            )
+            .map_err(super::super::hp::response_repair::retained_capture_failure)
+        }
+
+        fn restore_recovery_reference_jets_checked(
+            &self,
+            original: &ExternalResearchInputs,
+            expected_target_definition: &ContentDigest,
+            input: &mut ExternalResearchInputs,
+        ) -> Result<bool> {
+            let _scope = self.resources.enter();
+            self.validate_recovery_input(input)?;
+            if !input.reference_jets.is_empty() {
+                return Ok(false);
+            }
+            let Some(reference) = super::super::research_completion::ReferencePreparation::from_retained_runtime_projection(
+                original, &self.state, expected_target_definition,
+            )? else {
+                return Ok(false);
+            };
+            let roots = self.roots.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("retained finite reference jets require authenticated roots")
+            })?;
+            let mut prepared = reference.prepare(&self.state, Some(roots))?;
+            if input.precision_bits >= prepared.precision_bits {
+                super::super::research_completion::promote_input_precision(
+                    &mut prepared,
+                    input.precision_bits,
+                )?;
+                // The usual recovery already has higher-precision inputs. Only
+                // jets change, so a failed combined budget/shape check can roll
+                // back without cloning a potentially large supplemental bundle.
+                let previous =
+                    std::mem::replace(&mut input.reference_jets, prepared.reference_jets);
+                if let Err(error) = input.validate() {
+                    input.reference_jets = previous;
+                    return Err(error);
+                }
+            } else {
+                // Match the live merge for lower-precision inputs. Admit its
+                // transactional copy and possible decimal growth before cloning.
+                let bytes = super::super::capture_runtime::retained_json_bytes(input)?
+                    .checked_mul(
+                        u64::from(prepared.precision_bits)
+                            .div_ceil(u64::from(input.precision_bits)),
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "run memory budget exceeded: finite reference merge overflow"
+                        )
+                    })?;
+                let _reservation = self.resources.try_reserve_working(bytes)?;
+                let mut merged = input.clone();
+                super::super::research_completion::align_input_precisions(
+                    &mut merged,
+                    &mut prepared,
+                )?;
+                merged.reference_jets = prepared.reference_jets;
+                merged.validate()?;
+                *input = merged;
+            }
+            Ok(true)
+        }
+
+        /// Prepare finite arithmetic children under the same ledger that admitted
+        /// the retained matrix. The original state and matrix remain immutable.
+        pub fn prepare_recovery_arithmetic_inputs(&self) -> Result<ExternalResearchInputs> {
+            let matrix = self.matrix.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("retained recovery requires its authenticated Tau matrix")
+            })?;
+            super::super::research_prepare::prepare_arithmetic_inputs_with_resources(
+                &self.state,
+                matrix,
+                &self.resources,
+            )
+        }
+
+        /// Add missing arithmetic prerequisites to a frozen retained input.
+        /// Explicit supplied values prevail, as in the live preparation route.
+        pub fn prepare_recovery_inputs(
+            &self,
+            base: Option<&ExternalResearchInputs>,
+        ) -> Result<ExternalResearchInputs> {
+            let mut arithmetic = self.prepare_recovery_arithmetic_inputs()?;
+            let Some(base) = base else {
+                return Ok(arithmetic);
+            };
+            self.validate_recovery_input(base)?;
+            let mut input = base.clone();
+            super::super::research_completion::align_input_precisions(&mut input, &mut arithmetic)?;
+            if input.atoms.is_empty() {
+                input.atoms = arithmetic.atoms;
+                input.atom_coordinate = arithmetic.atom_coordinate;
+                input.atom_coverage = arithmetic.atom_coverage;
+            }
+            if input.energy_allowance.is_none() {
+                input.energy_allowance = arithmetic.energy_allowance;
+            }
+            let run_once = input.run_once.get_or_insert_with(Default::default);
+            if run_once.tail_form.is_none() {
+                run_once.tail_form = arithmetic
+                    .run_once
+                    .as_mut()
+                    .and_then(|r| r.tail_form.take());
+            }
+            input.validate()?;
+            Ok(input)
+        }
+
+        fn response_sources(
+            &self,
+        ) -> Result<super::super::hp::response_repair::RetainedResponseSources<'_>> {
+            Ok(super::super::hp::response_repair::RetainedResponseSources {
+                state: &self.state,
+                matrix: self.matrix.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("retained response requires its authenticated Tau matrix")
+                })?,
+                roots: self.roots.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("retained response requires its authenticated root window")
+                })?,
+                state_payload: &self.state_payload,
+                root_payload: self
+                    .root_payload
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("retained response root payload missing"))?,
+                secular_payload: self
+                    .secular_payload
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("retained response secular payload missing"))?,
+            })
+        }
+
+        /// Authenticate the original response configuration and root selection
+        /// before preparing expensive supplemental inputs or secondary spectra.
+        pub fn validate_recovery_response_options(
+            &self,
+            options: &super::super::hp::response_repair::RetainedResponseOptions,
+        ) -> Result<()> {
+            let _scope = self.resources.enter();
+            super::super::hp::response_repair::validate_retained_response(
+                &self.response_sources()?,
+                options,
+            )
+        }
+
+        /// Extended supplemental capture with the live producer's default
+        /// standalone/full options and receipt qualification, without a live run.
+        pub fn capture_recovery_outcome(
+            &self,
+            id: &str,
+            input: &ExternalResearchInputs,
+            research_sources: &[ArtifactManifest],
+            cache: &ArtifactCacheContext<'_>,
+        ) -> std::result::Result<xc_cache::CapturedDiagnostic, xc_cache::CaptureFailure> {
+            self.capture_recovery_outcome_with_response_options(
+                id,
+                input,
+                research_sources,
+                cache,
+                None,
+            )
+        }
+
+        /// Recover a selected diagnostic from immutable primary sources. Response
+        /// routes additionally require the frozen original request and primary.
+        pub fn capture_recovery_outcome_with_response_options(
+            &self,
+            id: &str,
+            input: &ExternalResearchInputs,
+            research_sources: &[ArtifactManifest],
+            cache: &ArtifactCacheContext<'_>,
+            response_options: Option<&super::super::hp::response_repair::RetainedResponseOptions>,
+        ) -> std::result::Result<xc_cache::CapturedDiagnostic, xc_cache::CaptureFailure> {
+            let attempt = || -> Result<xc_cache::CapturedDiagnostic> {
+                let _scope = self.resources.enter();
+                self.validate_recovery_input(input)?;
+                if id == "indexed_transform" {
+                    let roots = self.roots.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("indexed transform requires its authenticated root window")
+                    })?;
+                    let options = super::super::retained_evidence::TransformOptions::for_roots(
+                        &self.state,
+                        roots,
+                    );
+                    return Ok(xc_cache::CapturedDiagnostic::from_cached(
+                        super::super::retained_evidence::capture_transforms_at_roots(
+                            &self.state,
+                            roots,
+                            &options,
+                            cache,
+                        )?,
+                    )?);
+                }
+                if matches!(id, "prime_power_response" | "u_flow_response") {
+                    let options = response_options.ok_or_else(|| anyhow::anyhow!("retained response requires its frozen original configuration and primary"))?;
+                    return super::super::hp::response_repair::capture_retained_response(
+                        id,
+                        &self.response_sources()?,
+                        options,
+                        cache,
+                    );
+                }
+                if super::super::capture::FINITE_DIAGNOSTICS.contains(&id) {
+                    return Ok(xc_cache::CapturedDiagnostic::from_cached(self.capture(
+                        id,
+                        Some(input),
+                        research_sources,
+                        cache,
+                    )?)?);
+                }
+                let normalized = id.strip_suffix("_full").unwrap_or(id);
+                if !super::super::extended_research::DIAGNOSTICS.contains(&normalized)
+                    && !super::DIAGNOSTICS.contains(&normalized)
+                    && !super::super::research_completion::DIAGNOSTICS.contains(&normalized)
+                {
+                    bail!("unsupported retained recovery diagnostic {id}");
+                }
+                let policy =
+                    super::super::capture_runtime::CaptureResourcePolicy::from_environment()?;
+                let roots = matches!(
+                    normalized,
+                    "directional_response"
+                        | "resolution_budget"
+                        | "complex_transform"
+                        | "root_transport"
+                        | "observable_budget"
+                        | "capture_preflight"
+                        | "configuration_comparison"
+                        | "transform_enclosure"
+                        | "signed_transform"
+                        | "weighted_reference_projection"
+                )
+                .then_some(self.roots.as_ref())
+                .flatten();
+                let options = recovery_extension_options(
+                    ExtensionOptions::for_source(&self.state),
+                    id,
+                    input.precision_bits,
+                    roots.map(|r| (r.dataset.precision_bits, r.dataset.points.len())),
+                    &policy,
+                );
+                let matrix = (matches!(
+                    normalized,
+                    "arithmetic_energy"
+                        | "directional_response"
+                        | "root_transport"
+                        | "operator_cluster"
+                        | "finite_section_transfer"
+                        | "capture_preflight"
+                        | "configuration_comparison"
+                ) || (normalized == "spectral_cluster"
+                    && input.cluster.is_empty()
+                    && input.cluster_preparation_assessment.is_some()))
+                .then_some(self.matrix.as_ref())
+                .flatten();
+                let result = super::super::extended_research::capture_extended(
+                    normalized,
+                    &self.state,
+                    matrix,
+                    roots,
+                    (normalized != "compactness").then_some(input),
+                    &options,
+                    research_sources,
+                    cache,
+                )?;
+                Ok(xc_cache::CapturedDiagnostic::from_cached(result)?)
+            };
+            let result =
+                attempt().map_err(super::super::hp::response_repair::retained_capture_failure)?;
+            // Match RetainedCcmRun's outcome adapter. Qualified numerical
+            // limitations remain measurements; missing prerequisites do not.
+            if result.value["data"]["outcome"] == "missing_input" {
+                return Err(xc_cache::CaptureFailure::Missing {
+                    reason: result.value["data"]["reason"]
+                        .as_str()
+                        .unwrap_or("required retained inputs unavailable")
+                        .into(),
+                });
+            }
+            if result.value["kind"] == "ccm_finite_diagnostic_analysis"
+                && result.value_reference.is_none()
+                && result.value["data"]["outcome"] == "blocked"
+            {
+                return Err(xc_cache::CaptureFailure::Blocked {
+                    reason: result.value["data"]["reason"]
+                        .as_str()
+                        .unwrap_or("diagnostic resource limit")
+                        .into(),
+                });
+            }
+            Ok(result)
+        }
         pub fn capture(
             &self,
             id: &str,
@@ -5305,6 +6479,7 @@ pub mod finite_capture {
             research_sources: &[ArtifactManifest],
             cache: &ArtifactCacheContext<'_>,
         ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<Analysis>>> {
+            let _scope = self.resources.enter();
             // Bind exactly the sources used by the live producer. Loading a
             // source for another requested group must not change this identity.
             let matrix = matches!(
@@ -5349,6 +6524,12 @@ pub mod finite_capture {
         parents: &[ArtifactManifest],
         cache: &ArtifactCacheContext<'_>,
     ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<Analysis>>> {
+        let mut policy = super::super::capture_runtime::CaptureResourcePolicy::from_environment()?;
+        if let Some(resources) = xc_core::RunResources::current() {
+            // An explicitly owned run budget supersedes the standalone fallback.
+            // The shared ledger still charges retained sources and active work.
+            policy.maximum_working_bytes = resources.maximum_bytes();
+        }
         capture_with_context(
             id,
             s,
@@ -5359,7 +6540,7 @@ pub mod finite_capture {
             parents,
             cache,
             &ExecutionContext {
-                policy: super::super::capture_runtime::CaptureResourcePolicy::from_environment()?,
+                policy,
                 ..Default::default()
             },
         )
@@ -5394,15 +6575,24 @@ pub mod finite_capture {
                 .precision
                 .max(certificate.map_or(0, |(c, _)| c.precision_bits));
             let scalar_bytes = (precision as u128).div_ceil(8) + 256;
-            let estimated = (n * 32 + 4096) * scalar_bytes
-                + if matches!(
+            let automatic = matches!(
+                id,
+                "directional_error_bound" | "finite_tail_bound" | "spectral_cluster_bound"
+            ) && input
+                .and_then(|i| i.finite_diagnostics.as_ref())
+                .and_then(|i| i.convergence.get(id))
+                .is_none();
+            let matrix_workspace = if !automatic
+                && matches!(
                     id,
                     "directional_error_bound" | "finite_tail_bound" | "spectral_cluster_bound"
                 ) {
-                    32 * n * n * scalar_bytes
-                } else {
-                    0
-                }
+                32 * n * n * scalar_bytes
+            } else {
+                0
+            };
+            let estimated = (n * 32 + 4096) * scalar_bytes
+                + matrix_workspace
                 + if id == "finite_root_budget" && certificate.is_some() {
                     64 * n * n * scalar_bytes
                 } else {
@@ -5412,6 +6602,13 @@ pub mod finite_capture {
                 *limited.borrow_mut() = Some(empty(id,s,"blocked","finite diagnostic workspace (including certificate reassembly) exceeds the declared resource policy"));
                 bail!("execution resource limit; do not retain");
             }
+            let _workspace = match super::super::capture_runtime::reserve_working(estimated) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    *limited.borrow_mut() = Some(empty(id, s, "blocked", &error.to_string()));
+                    bail!("execution resource limit; do not retain");
+                }
+            };
             if id == "finite_root_budget" && certificate.is_none() {
                 if let Some(reason) = &execution.certificate_error {
                     let mut a = empty(
@@ -5424,7 +6621,15 @@ pub mod finite_capture {
                     return Ok(a);
                 }
             }
-            let result = compute(id, s, m, roots, input, certificate.map(|(c, _)| c));
+            let result = compute(
+                id,
+                s,
+                m,
+                roots,
+                input,
+                certificate.map(|(c, _)| c),
+                u128::from(policy.maximum_working_bytes) - estimated,
+            );
             let a = match result {
                 Ok(a) => a,
                 Err(e) if e.downcast_ref::<ResourceLimited>().is_some() => {
@@ -5676,7 +6881,7 @@ pub mod finite_capture {
             .transpose()?;
         let input_digest = if let (Some(i), Some(admitted)) = (input, &admitted) {
             i.matches(s)?;
-            let artifact = super::super::extended_research::capture_external_source_with_parents(
+            let artifact = super::super::extended_research::admit_external_source_with_parents(
                 s, i, parents, cache,
             )?;
             if let Some(m) = artifact.produced_manifest.or(artifact.reused_manifest) {
@@ -5722,6 +6927,16 @@ pub mod finite_capture {
             // A fixed 120 MiB admission once retained a blocked record; admission
             // now follows the declared working-byte budget.
             request["automatic_matrix_admission"] = json!("declared_working_budget_v2");
+            let dimension = if s.coefficients.iter().eq(s.coefficients.iter().rev()) {
+                s.modes + 1
+            } else {
+                s.coefficients.len()
+            };
+            if dimension > 512 {
+                // The old route retained its fixed-dimension refusal. Only
+                // those previously unsupported shapes need a new identity.
+                request["automatic_matrix_admission"] = json!("declared_shape_and_work_budget_v3");
+            }
             // Records once resolved only above 64 guard bits were retained
             // unresolved; the ladder gives these diagnostics a new identity.
             request["automatic_matrix_precision"] = json!(AUTOMATIC_MATRIX_PRECISION);
@@ -5779,6 +6994,385 @@ pub mod finite_capture {
                 managed(KIND, request, &sources, &unretained, || Ok(data), validate)
             }
             (first, _) => first,
+        }
+    }
+
+    #[cfg(test)]
+    mod recovery_options_contract {
+        use super::*;
+
+        fn finite_reference_fixture() -> (
+            RetainedFiniteSources,
+            ExternalResearchInputs,
+            super::super::super::research_completion::ReferencePreparation,
+        ) {
+            use super::super::super::retained_evidence::{
+                DatasetSpec, EvaluationPoint, ProjectionOptions, ReferenceSpec, ResearchInputs,
+            };
+            let manifest = |kind: &str| -> ArtifactManifest {
+                let digest = ContentDigest::sha256(kind.as_bytes());
+                serde_json::from_value(serde_json::json!({
+                    "schema_version":1,"key":xc_cache::ArtifactKey::new(kind,"finite-reference-fixture",kind.as_bytes()).unwrap(),
+                    "content_digest":digest,"size_bytes":1,"objects":[{"content_digest":digest,"size_bytes":1}],
+                    "created_unix_seconds":1,"producer_toolkit_version":xc_cache::ToolkitVersion::parse("0.16.0").unwrap(),"minimum_reader_version":xc_cache::ToolkitVersion::parse("0.16.0").unwrap(),
+                    "maximum_reader_version":null,"quality":"validated","visibility":"local","immutable":true,
+                    "dependencies":[],"tags":{},"provenance_digest":null
+                })).unwrap()
+            };
+            let state = super::super::super::state_geometry::RetainedState {
+                manifest: manifest("ccm_weil_eigenpair"),
+                cutoff: "9".into(),
+                modes: 1,
+                precision: 128,
+                coefficients: [0, 1, 0].map(|v| Float::with_val(128, v)).to_vec(),
+                eigenvalue: "1".into(),
+                selection_policy: None,
+            };
+            let mut secular = manifest("ccm_secular_source");
+            secular.dependencies.push(xc_cache::DependencyRef {
+                key: state.manifest.key.clone(),
+                content_digest: state.manifest.content_digest.clone(),
+                required_quality: xc_cache::CacheQuality::Validated,
+            });
+            let mut root_manifest = manifest("ccm_root_refinement");
+            root_manifest.dependencies.push(xc_cache::DependencyRef {
+                key: secular.key.clone(),
+                content_digest: secular.content_digest.clone(),
+                required_quality: xc_cache::CacheQuality::Validated,
+            });
+            let roots = super::super::super::retained_evidence::RetainedRoots {
+                manifest: root_manifest,
+                secular_manifest: secular,
+                dataset: DatasetSpec {
+                    schema_version: 1,
+                    role: "retained_ccm_roots".into(),
+                    attribution: "stored finite fixture; no provider or solver available".into(),
+                    coordinate: "mellin_t".into(),
+                    precision_bits: 128,
+                    points: vec![
+                        EvaluationPoint {
+                            ordinal: 1,
+                            value: Some("1".into()),
+                            source_status: "converged".into(),
+                        },
+                        EvaluationPoint {
+                            ordinal: 2,
+                            value: None,
+                            source_status: "failed".into(),
+                        },
+                        EvaluationPoint {
+                            ordinal: 3,
+                            value: Some("2".into()),
+                            source_status: "converged".into(),
+                        },
+                    ],
+                },
+                completeness: "partial".into(),
+                acquisition: serde_json::Value::Null,
+                cutoff: "9".into(),
+                modes: 1,
+            };
+            let definition = ContentDigest::sha256(b"offline original runtime target");
+            let scope = "supplied runtime target sampled on 256 uniform log-coordinate intervals; finite even Fourier projection through mode 1; composite trapezoid; maximum coefficient change on half grid=0; this measured refinement is not a quadrature, source-error, or infinite-tail certificate";
+            let original: ExternalResearchInputs = serde_json::from_value(serde_json::json!({
+                "schema_version":1,"source_eigenpair":state.manifest.content_digest,"lambda_squared":"9","n_modes":1,
+                "precision_bits":192,"convention_id":"runtime-target-samples-and-fourier-v1","definition_digest":definition,"approximation_scope":scope,
+                "target":{"definition_digest":definition,"evaluation_policy":"configured target evaluator; uniform x=log(u) nodes; normalized at u=1",
+                    "approximation_scope":scope,"intervals":256,"values":vec!["1";257],"basis_values":[],"fixed_second_component":null,
+                    "raw_normalizer":"1","trial_coefficients":["0.25","1","0.25"]}
+            })).unwrap();
+            original.validate().unwrap();
+            // The live constructor's retained values, independently assembled
+            // from the original finite reference, without evaluating a provider.
+            let live = super::super::super::research_completion::ReferencePreparation {
+                schema_version:1,
+                finite_reference:Some(ResearchInputs {schema_version:1,
+                    reference:ReferenceSpec {schema_version:1,definition:format!("finite Fourier projection of runtime target {}",definition.0),
+                        lambda_squared:"9".into(),precision_bits:192,coefficients:vec!["0.25".into(),"1".into(),"0.25".into()],approximation_scope:scope.into()},
+                    basis:vec![],projection:ProjectionOptions {working_precision_bits:256,normalization:"center_one".into(),fixed_second_component:None}}),
+                sampled_reference:original.target.clone(),lambda_squared:"9".into(),precision_bits:192,definition_digest:definition,
+                approximation_scope:format!("{scope}; signed jets refer to this explicitly finite Fourier projection, extended by zero outside the run window"),
+                weighted_atoms:vec![],atom_coordinate:None,atom_coverage:None,tail_form:None,tail_recipe:None,completion:None,
+            };
+            (
+                RetainedFiniteSources {
+                    state,
+                    matrix: None,
+                    roots: Some(roots),
+                    state_payload: vec![],
+                    root_payload: None,
+                    secular_payload: None,
+                    resources: xc_core::RunResources::with_worker_limit(256 << 20, 2).unwrap(),
+                    _source_reservations: vec![],
+                },
+                original,
+                live,
+            )
+        }
+
+        #[test]
+        fn retained_finite_reference_matches_live_without_provider_and_preserves_explicit_jets() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let (mut sources, original, live) = finite_reference_fixture();
+                sources.resources = xc_core::RunResources::with_worker_limit(256 << 20, 1).unwrap();
+                let _scope = sources.resources.enter();
+                let mut later = original.clone();
+                // Later smooth-trial coefficients are explicitly not authority.
+                later.target.as_mut().unwrap().trial_coefficients =
+                    Some(vec!["1".into(), "3".into(), "1".into()]);
+                later.precision_bits = 384;
+                let mut expected = later.clone();
+                let mut live_prepared = live
+                    .prepare(&sources.state, sources.roots.as_ref())
+                    .unwrap();
+                super::super::super::research_completion::align_input_precisions(
+                    &mut expected,
+                    &mut live_prepared,
+                )
+                .unwrap();
+                expected.reference_jets = live_prepared.reference_jets;
+                assert!(sources
+                    .restore_recovery_reference_jets(
+                        &original,
+                        &original.definition_digest,
+                        &mut later
+                    )
+                    .unwrap());
+                assert_eq!(later, expected);
+                let mut lower = original.clone();
+                let mut lower_expected = original.clone();
+                let mut live_lower = live
+                    .prepare(&sources.state, sources.roots.as_ref())
+                    .unwrap();
+                super::super::super::research_completion::align_input_precisions(
+                    &mut lower_expected,
+                    &mut live_lower,
+                )
+                .unwrap();
+                lower_expected.reference_jets = live_lower.reference_jets;
+                assert!(sources
+                    .restore_recovery_reference_jets(
+                        &original,
+                        &original.definition_digest,
+                        &mut lower
+                    )
+                    .unwrap());
+                assert_eq!(
+                    lower, lower_expected,
+                    "admitted lower-precision merge must match live promotion"
+                );
+                assert_eq!(
+                    later
+                        .reference_jets
+                        .iter()
+                        .map(|j| j.ordinal)
+                        .collect::<Vec<_>>(),
+                    vec![1, 3]
+                );
+                assert!(later
+                    .reference_jets
+                    .iter()
+                    .all(|j| j.exterior_tail.value == "0" && j.exterior_tail.derivative == "0"));
+                let cache = ArtifactCacheContext {
+                    resolver: None,
+                    reference_resolver: None,
+                    acceptance: None,
+                    ordered_overlays: vec!["disabled".into()],
+                    mode: xc_cache::ArtifactExecutionCacheMode::Disabled,
+                    write_on_miss: false,
+                    write_visibility: xc_cache::CacheVisibility::Local,
+                    requested_assurance: xc_core::AssuranceLevel::Computed,
+                    certification_failure_policy:
+                        xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+                    production_sink: None,
+                };
+                let mut options = ExtensionOptions::for_source(&sources.state);
+                options.working_precision_bits = later.precision_bits;
+                let capture = |input| {
+                    super::super::super::extended_research::capture_extended(
+                        "signed_transform",
+                        &sources.state,
+                        None,
+                        sources.roots.as_ref(),
+                        Some(input),
+                        &options,
+                        &[],
+                        &cache,
+                    )
+                    .unwrap()
+                    .value
+                };
+                assert_eq!(
+                    serde_json::to_value(capture(&later)).unwrap(),
+                    serde_json::to_value(capture(&expected)).unwrap()
+                );
+                let before = later.clone();
+                assert!(!sources
+                    .restore_recovery_reference_jets(
+                        &original,
+                        &ContentDigest::sha256(b"different target"),
+                        &mut later
+                    )
+                    .unwrap());
+                assert_eq!(later, before, "explicit jets must prevail unchanged");
+            });
+        }
+
+        #[test]
+        fn retained_finite_reference_rejects_wrong_authority_and_missing_roots() {
+            let (mut sources, original, _) = finite_reference_fixture();
+            for case in 0..8 {
+                let mut changed = original.clone();
+                match case {
+                    0 => changed.source_eigenpair = ContentDigest::sha256(b"other state"),
+                    1 => changed.precision_bits += 64,
+                    2 => changed.definition_digest = ContentDigest::sha256(b"other target"),
+                    3 => {
+                        changed.target.as_mut().unwrap().definition_digest =
+                            ContentDigest::sha256(b"other sample")
+                    }
+                    4 => changed.target.as_mut().unwrap().trial_coefficients = None,
+                    5 => {
+                        changed.target.as_mut().unwrap().approximation_scope = "other scope".into()
+                    }
+                    6 => changed.target.as_mut().unwrap().fixed_second_component = Some("1".into()),
+                    _ => changed.n_modes = 2,
+                }
+                assert!(
+                    matches!(
+                        sources.restore_recovery_reference_jets(
+                            &changed,
+                            &original.definition_digest,
+                            &mut original.clone()
+                        ),
+                        Err(xc_cache::CaptureFailure::Failed { .. })
+                    ),
+                    "case {case}"
+                );
+            }
+            let mut unsupported = original.clone();
+            unsupported.convention_id = "arbitrary smooth reference".into();
+            assert!(!sources
+                .restore_recovery_reference_jets(
+                    &unsupported,
+                    &original.definition_digest,
+                    &mut original.clone()
+                )
+                .unwrap());
+            sources.roots = None;
+            assert!(sources
+                .restore_recovery_reference_jets(
+                    &original,
+                    &original.definition_digest,
+                    &mut original.clone()
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn finite_reference_workers_use_the_run_memory_owner() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let (mut sources, original, live) = finite_reference_fixture();
+                let resources = xc_core::RunResources::with_worker_limit(1, 2).unwrap();
+                let _scope = resources.enter();
+                let error = live
+                    .prepare(&sources.state, sources.roots.as_ref())
+                    .unwrap_err();
+                assert!(format!("{error:#}").contains("budget"), "{error:#}");
+                assert_eq!(resources.usage().working_bytes, 0);
+                sources.resources = resources.clone();
+                let mut input = original.clone();
+                assert!(matches!(
+                    sources.restore_recovery_reference_jets(
+                        &original,
+                        &original.definition_digest,
+                        &mut input
+                    ),
+                    Err(xc_cache::CaptureFailure::Blocked { .. })
+                ));
+                assert_eq!(
+                    input, original,
+                    "refused restoration must leave every input field unchanged"
+                );
+            });
+        }
+
+        fn defaults() -> ExtensionOptions {
+            ExtensionOptions {
+                working_precision_bits: 192,
+                maximum_rows: 100000,
+                maximum_directional_rows: 16,
+                maximum_estimated_output_bytes: 4096,
+                maximum_working_bytes: None,
+                exponential_rates: vec!["0.5".into(), "1".into()],
+                relative_tolerance: "1e-6".into(),
+            }
+        }
+
+        #[test]
+        fn standalone_recovery_preserves_its_limits_and_admits_root_precision() {
+            let base = defaults();
+            let policy = super::super::super::capture_runtime::CaptureResourcePolicy {
+                maximum_output_bytes: 8192,
+                maximum_working_bytes: 16384,
+                ..Default::default()
+            };
+            let options = recovery_extension_options(
+                base.clone(),
+                "directional_response",
+                160,
+                Some((512, 25)),
+                &policy,
+            );
+            assert_eq!(
+                options,
+                ExtensionOptions {
+                    working_precision_bits: 576,
+                    ..base
+                }
+            );
+        }
+
+        #[test]
+        fn full_and_complete_recovery_follow_the_live_request_policy() {
+            let policy = super::super::super::capture_runtime::CaptureResourcePolicy {
+                maximum_output_bytes: 8192,
+                maximum_working_bytes: 16384,
+                ..Default::default()
+            };
+            for id in ["directional_response_full", "root_transport"] {
+                let base = defaults();
+                let options =
+                    recovery_extension_options(base.clone(), id, 160, Some((512, 25)), &policy);
+                assert_eq!(
+                    options,
+                    ExtensionOptions {
+                        working_precision_bits: 576,
+                        maximum_directional_rows: 25,
+                        maximum_estimated_output_bytes: 8192,
+                        maximum_working_bytes: Some(16384),
+                        ..base
+                    }
+                );
+            }
+            let base = defaults();
+            let options =
+                recovery_extension_options(base.clone(), "compactness", 160, None, &policy);
+            assert_eq!(
+                options,
+                ExtensionOptions {
+                    working_precision_bits: 224,
+                    ..base
+                }
+            );
         }
     }
 }
@@ -5839,6 +7433,22 @@ pub(crate) mod lookahead {
         Extended(Result<ExtendedAnalysis>),
     }
 
+    pub(crate) fn retained_bytes(value: &Value) -> Option<u64> {
+        use super::super::capture_runtime::retained_json_bytes;
+        match value {
+            Value::Finite(unit) if unit.limited.is_none() => unit
+                .result
+                .as_ref()
+                .ok()
+                .and_then(|v| retained_json_bytes(v).ok()),
+            Value::Extended(result) => result
+                .as_ref()
+                .ok()
+                .and_then(|v| retained_json_bytes(v).ok()),
+            _ => None,
+        }
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) struct Inputs {
         id: String,
@@ -5884,7 +7494,7 @@ pub(crate) mod lookahead {
         options: &ExtensionOptions,
     ) -> Result<Vec<(String, Inputs, Job)>> {
         let state = Arc::new(s.clone());
-        let matrix = Arc::new(m.to_owned_entries());
+        let matrix = Arc::new(m.to_owned_entries()?);
         // One copy when both arguments are the same input.
         let shared =
             matches!((finite_input, extended_input), (Some(a), Some(b)) if std::ptr::eq(a, b));

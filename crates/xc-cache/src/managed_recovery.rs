@@ -56,6 +56,41 @@ impl ManagedArtifactCacheSession {
         &self.resources
     }
 
+    /// Retry publication directly from retained managed staging. The caller
+    /// must authenticate its original run and explicitly configure the author
+    /// target and remote mutations. No numerical producer, cache acquisition,
+    /// or domain validator is invoked. Reopened descriptors use normal staging
+    /// validation; ordinary publication refreshes remote permissions, routes,
+    /// heads, leases, dependencies and compare-and-swap state, and checks bytes
+    /// before import. This does not promote assurance or claim coverage.
+    pub fn retry_retained_publication(&self) -> Result<Option<PathBuf>, CacheError> {
+        self.validate_retained_publication_retry()?;
+        self.finalize_publication_inventory_from_staging(true)
+    }
+
+    fn validate_retained_publication_retry(&self) -> Result<(), CacheError> {
+        if self.profile != ManagedRunProfile::Author
+            || !self.execute_remote_mutations
+            || self.publication_target == xc_core::PublicationTarget::None
+            || self.output_validation.is_some()
+        {
+            return Err(CacheError::InvalidTransition(
+                "retained publication retry requires an author session, explicit target and remote mutation, and no output-validation mode".to_owned(),
+            ));
+        }
+        let sink = self.production_sink.as_ref().ok_or_else(|| {
+            CacheError::InvalidTransition(
+                "retained publication retry requires managed staging".to_owned(),
+            )
+        })?;
+        if sink.drafts()?.is_empty() {
+            return Err(CacheError::InvalidTransition(
+                "retained publication retry requires nonempty authenticated staging".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Stage an exact retained artifact and its dependency closure without
     /// executing a numerical producer or domain validator. Existing cache
     /// quality is accepted under the normal policy; no assurance is upgraded.
@@ -252,12 +287,9 @@ mod tests {
         session.stage_cached_artifact(&artifact).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(session.staged_drafts().unwrap().len(), 2);
-        assert!(session.staged_drafts().unwrap().iter().any(|d| d
-            .manifest
-            .canonical_payload
-            .ordered_items[0]
-            .content_digest
-            == artifact.content_digest));
+        assert!(session.staged_drafts().unwrap().iter().any(|d| {
+            d.manifest.canonical_payload.ordered_items[0].content_digest == artifact.content_digest
+        }));
         session.finalize_publication_inventory().unwrap();
         drop(session);
         let reopened = ManagedArtifactCacheSession::new(config(&root)).unwrap();
@@ -266,6 +298,43 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn retained_publication_retry_is_explicit_nonempty_and_keeps_normal_vacuity_guard() {
+        let root = temp();
+        let artifact = produce(&root, "ccm_tau_matrix", vec![]);
+        let session = ManagedArtifactCacheSession::new(config(&root)).unwrap();
+        session.stage_cached_artifact(&dep(&artifact)).unwrap();
+        assert!(session.retry_retained_publication().is_err());
+        drop(session);
+        let mut retry_config = config(&root);
+        retry_config.execute_remote_mutations = true;
+        retry_config.publication_target = xc_core::PublicationTarget::Private;
+        let reopened = ManagedArtifactCacheSession::new(retry_config.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .production_sink
+                .as_ref()
+                .unwrap()
+                .observed_artifact_count()
+                .unwrap(),
+            0
+        );
+        assert!(reopened.validate_retained_publication_retry().is_ok());
+        assert!(reopened
+            .finalize_publication_inventory()
+            .unwrap_err()
+            .to_string()
+            .contains("observed no artifacts"));
+        retry_config.staging_root = Some(root.join("empty"));
+        let empty = ManagedArtifactCacheSession::new(retry_config).unwrap();
+        assert!(empty
+            .retry_retained_publication()
+            .unwrap_err()
+            .to_string()
+            .contains("nonempty"));
+        assert!(!root.join("staging/publication-inventory.json").exists());
+    }
+
     #[test]
     fn recovery_rejects_corrupt_encoded_objects_and_missing_exact_payloads() {
         let root = temp();

@@ -244,6 +244,137 @@ fn midpoint(a: &Float, b: &Float, p: u32) -> Float {
     x += y;
     x
 }
+
+struct RecoveryGuide {
+    scale: Float,
+    values: Vec<Float>,
+    precision_bits: u32,
+}
+
+#[cfg(test)]
+thread_local! {
+    static GUIDE_COMPUTATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn validate_request(
+    n: usize,
+    requested: Option<usize>,
+    value: Option<&Float>,
+    uncertainty: Option<&Float>,
+    opts: TridiagEigvecOptions,
+) -> Result<()> {
+    if opts.max_steps == 0
+        || requested.is_some_and(|k| k >= n)
+        || value.is_some_and(|x| !x.is_finite())
+        || uncertainty.is_some_and(|x| !x.is_finite() || x < &0)
+    {
+        return Err(HpEigenvectorRecoveryFailure::InvalidConfiguration(
+            "invalid index, eigenvalue, uncertainty, or zero iteration budget".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn prepare_guide(matrix: Matrix<'_>, p: u32, opts: TridiagEigvecOptions) -> Result<RecoveryGuide> {
+    let n = matrix.n();
+    let source_bits = matrix.entries().map(Float::prec).max().unwrap_or(p);
+    let w = (p * 2 + 64)
+        .max(source_bits.saturating_add(32))
+        .min(1_000_000);
+    // Includes QR, retained factors, interval inertia, and vector scratch.
+    let entries =
+        if matches!(matrix, Matrix::Dense(..)) || matches!(opts.solver, TridiagSolver::Dense) {
+            8u128 * n as u128 * n as u128 + 32 * n as u128
+        } else {
+            64 * n as u128
+        };
+    if entries * (64 + u128::from(w).div_ceil(8)) > 8 * 1024 * 1024 * 1024 {
+        return Err(unresolved(
+            "eigenvector working storage exceeds the 8 GiB admission bound",
+        ));
+    }
+    let scale = matrix.scale(w)?;
+    #[cfg(test)]
+    GUIDE_COMPUTATIONS.with(|count| count.set(count.get() + 1));
+    let values = matrix.guide(w)?;
+    Ok(RecoveryGuide {
+        scale,
+        values,
+        precision_bits: w,
+    })
+}
+
+/// Reuse one working-precision guide when recovering several vectors of the
+/// same tridiagonal source. Construction owns a copy rounded to `precision_bits`;
+/// the source, precision, and solver options cannot change during its lifetime.
+///
+/// The first valid request prepares the guide. Each request still proves its
+/// index window and checks its returned vector's directed residual and angle.
+/// The guide is not a certificate and is never supplied by the caller. Failed
+/// guide preparation is not remembered. No persistent cache identity is added.
+pub struct TridiagonalEigenvectorRecoveryHp {
+    source: Vec<Float>,
+    dimension: usize,
+    precision_bits: u32,
+    options: TridiagEigvecOptions,
+    guide: Option<RecoveryGuide>,
+}
+
+impl TridiagonalEigenvectorRecoveryHp {
+    pub fn new(
+        d: &[Float],
+        e: &[Float],
+        precision_bits: u32,
+        options: TridiagEigvecOptions,
+    ) -> Result<Self> {
+        let matrix = Matrix::Tridiagonal(d, e);
+        matrix.validate(precision_bits)?;
+        let source: Vec<_> = matrix
+            .entries()
+            .map(|x| Float::with_val(precision_bits, x))
+            .collect();
+        if source.iter().any(|x| !x.is_finite()) {
+            return Err(unresolved("source rounding exceeds the finite range"));
+        }
+        Ok(Self {
+            source,
+            dimension: d.len(),
+            precision_bits,
+            options,
+            guide: None,
+        })
+    }
+
+    /// Recover the member identified by `value`, with the same arithmetic and
+    /// request checks as [`tridiag_eigenvector_for_value_detailed_hp`].
+    pub fn recover_for_value(
+        &mut self,
+        value: &Float,
+        uncertainty: Option<&Float>,
+    ) -> Result<HpEigenvectorRecovery> {
+        validate_request(self.dimension, None, Some(value), uncertainty, self.options)?;
+        let matrix = Matrix::Tridiagonal(
+            &self.source[..self.dimension],
+            &self.source[self.dimension..],
+        );
+        if self.guide.is_none() {
+            let started = std::time::Instant::now();
+            self.guide = Some(prepare_guide(matrix, self.precision_bits, self.options)?);
+            xc_core::progress_message!("[HP eigenvector] shared tridiagonal guide: dimension={}, precision={} bits, computed in {:.3}s", self.dimension, self.guide.as_ref().expect("prepared guide").precision_bits, started.elapsed().as_secs_f64());
+        }
+        recover_with_guide(
+            matrix,
+            None,
+            Some(value),
+            uncertainty,
+            self.precision_bits,
+            self.options,
+            self.guide.as_ref().expect("prepared guide"),
+        )
+    }
+}
+
 fn recover(
     matrix: Matrix<'_>,
     requested: Option<usize>,
@@ -274,34 +405,24 @@ fn recover(
         matrix
     };
     let n = matrix.n();
-    let source_bits = matrix.entries().map(Float::prec).max().unwrap_or(p);
-    let w = (p * 2 + 64)
-        .max(source_bits.saturating_add(32))
-        .min(1_000_000);
-    if opts.max_steps == 0
-        || requested.is_some_and(|k| k >= n)
-        || value.is_some_and(|x| !x.is_finite())
-        || uncertainty.is_some_and(|x| !x.is_finite() || x < &0)
-    {
-        return Err(HpEigenvectorRecoveryFailure::InvalidConfiguration(
-            "invalid index, eigenvalue, uncertainty, or zero iteration budget".into(),
-        )
-        .into());
-    }
-    // Includes QR, retained factors, interval inertia, and vector scratch.
-    let entries =
-        if matches!(matrix, Matrix::Dense(..)) || matches!(opts.solver, TridiagSolver::Dense) {
-            8u128 * n as u128 * n as u128 + 32 * n as u128
-        } else {
-            64 * n as u128
-        };
-    if entries * (64 + u128::from(w).div_ceil(8)) > 8 * 1024 * 1024 * 1024 {
-        return Err(unresolved(
-            "eigenvector working storage exceeds the 8 GiB admission bound",
-        ));
-    }
-    let scale = matrix.scale(w)?;
-    let values = matrix.guide(w)?;
+    validate_request(n, requested, value, uncertainty, opts)?;
+    let guide = prepare_guide(matrix, p, opts)?;
+    recover_with_guide(matrix, requested, value, uncertainty, p, opts, &guide)
+}
+
+fn recover_with_guide(
+    matrix: Matrix<'_>,
+    requested: Option<usize>,
+    value: Option<&Float>,
+    uncertainty: Option<&Float>,
+    p: u32,
+    opts: TridiagEigvecOptions,
+    guide: &RecoveryGuide,
+) -> Result<HpEigenvectorRecovery> {
+    let n = matrix.n();
+    let w = guide.precision_bits;
+    let scale = guide.scale.clone();
+    let values = &guide.values;
     let index = if let Some(k) = requested {
         k
     } else {
@@ -529,6 +650,46 @@ fn assess(
         seed_solves: 0,
     }))
 }
+/// Recheck a stored tridiagonal vector with the recovery path's directed
+/// residual/separation gate, without a spectrum solve or inverse iteration.
+/// The supplied isolating window is proved again by exact-source Sturm counts.
+/// This checks the rounded source matrix and vector, not continuum accuracy.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_tridiag_eigenvector_hp(
+    d: &[Float],
+    e: &[Float],
+    vector: &[Float],
+    index: usize,
+    lower: &Float,
+    upper: &Float,
+    p: u32,
+) -> Result<HpEigenvectorRecovery> {
+    // Reject invalid MPFR precision before invoking Float::with_val, which
+    // otherwise panics instead of returning the public API's error result.
+    Matrix::Tridiagonal(d, e).validate(p)?;
+    let rounded_d: Vec<_> = d.iter().map(|x| Float::with_val(p, x)).collect();
+    let rounded_e: Vec<_> = e.iter().map(|x| Float::with_val(p, x)).collect();
+    let matrix = Matrix::Tridiagonal(&rounded_d, &rounded_e);
+    matrix.validate(p)?;
+    anyhow::ensure!(
+        vector.len() == d.len()
+            && index < d.len()
+            && vector.iter().all(Float::is_finite)
+            && lower.is_finite()
+            && upper.is_finite()
+            && lower < upper,
+        "invalid stored eigenvector or isolating window"
+    );
+    let w = (p * 2 + 64).max(p.saturating_add(32)).min(1_000_000);
+    anyhow::ensure!(
+        matrix.count(lower, w)? == index && matrix.count(upper, w)? == index + 1,
+        "stored eigenvector window does not isolate its source index"
+    );
+    let scale = matrix.scale(w)?;
+    assess(matrix, vector, lower, upper, &scale, index, p, w)?
+        .ok_or_else(|| unresolved("stored eigenvector fails directed residual/separation gate"))
+}
+
 /// Selected-index recovery of the matrix rounded once to `p` bits, with directed angle evidence.
 pub fn dense_symmetric_eigenpair_at_index_hp(
     a: &[Float],
@@ -606,4 +767,192 @@ pub(super) fn tridiagonal_at_index(
         opts,
         false,
     )
+}
+
+#[cfg(test)]
+mod cached_vector_validation_tests {
+    use super::*;
+
+    #[test]
+    fn stored_tridiagonal_vector_rejects_invalid_precision_before_rounding() {
+        let diagonal = [Float::with_val(64, 1)];
+        let vector = [Float::with_val(64, 1)];
+        let lower = Float::with_val(64, 0);
+        let upper = Float::with_val(64, 2);
+        for p in [0, 1, 32, 1_000_001] {
+            assert!(
+                validate_tridiag_eigenvector_hp(&diagonal, &[], &vector, 0, &lower, &upper, p,)
+                    .is_err()
+            );
+        }
+        let report =
+            validate_tridiag_eigenvector_hp(&diagonal, &[], &vector, 0, &lower, &upper, 64)
+                .unwrap();
+        assert_eq!(report.eigenvalue, 1);
+        assert_eq!(report.iterations, 0);
+        assert_eq!(report.seed_solves, 0);
+    }
+}
+
+#[cfg(test)]
+mod shared_guide_tests {
+    use super::*;
+
+    fn assert_identical(a: &HpEigenvectorRecovery, b: &HpEigenvectorRecovery) {
+        assert_eq!(a, b);
+        let scalars = |r: &HpEigenvectorRecovery| {
+            r.eigenvector
+                .iter()
+                .chain([
+                    &r.eigenvalue,
+                    &r.enclosure.lower,
+                    &r.enclosure.upper,
+                    &r.residual_upper_bound,
+                    &r.separation_lower_bound,
+                    &r.sine_angle_upper_bound,
+                    &r.angle_acceptance_bound,
+                ])
+                .map(|x| (x.prec(), x.is_sign_negative(), x.to_string_radix(16, None)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scalars(a), scalars(b));
+    }
+
+    #[test]
+    fn shared_guide_matches_fresh_reports_in_any_request_order() {
+        for solver in [TridiagSolver::Dense, TridiagSolver::BandedInterleaved] {
+            let p = 64;
+            let mut d: Vec<_> = (1..=5).map(|x| Float::with_val(160, x)).collect();
+            d[1] += Float::with_val(160, 2).pow(-100);
+            let e = vec![Float::with_val(160, -0.125); 4];
+            let rounded: Vec<_> = d.iter().map(|x| Float::with_val(p, x)).collect();
+            let values = super::super::tridiag_eigenvalues_hp(&rounded, &e, p).unwrap();
+            let options = TridiagEigvecOptions {
+                solver,
+                ..Default::default()
+            };
+            let order = [4, 0, 1, 4];
+            let expected: Vec<_> = order
+                .iter()
+                .map(|&k| {
+                    tridiag_eigenvector_for_value_detailed_hp(&d, &e, &values[k], None, p, options)
+                        .unwrap()
+                })
+                .collect();
+            let mut context = TridiagonalEigenvectorRecoveryHp::new(&d, &e, p, options).unwrap();
+            // Owning the rounded source prevents later caller mutation from
+            // pairing a retained guide with a different matrix.
+            d[0] += 100;
+            GUIDE_COMPUTATIONS.with(|count| count.set(0));
+            for (&k, expected) in order.iter().zip(&expected) {
+                let actual = context.recover_for_value(&values[k], None).unwrap();
+                assert_identical(&actual, expected);
+                assert_eq!(actual.working_precision_bits, 2 * p + 64);
+            }
+            assert_eq!(GUIDE_COMPUTATIONS.with(std::cell::Cell::get), 1);
+        }
+    }
+
+    #[test]
+    fn shared_guide_invalid_requests_do_not_prepare_and_valid_retry_succeeds() {
+        let d = [Float::with_val(64, 1), Float::with_val(64, 3)];
+        let e = [Float::with_val(64, 0)];
+        let options = TridiagEigvecOptions::default();
+        let mut context = TridiagonalEigenvectorRecoveryHp::new(&d, &e, 64, options).unwrap();
+        GUIDE_COMPUTATIONS.with(|count| count.set(0));
+        for (value, uncertainty) in [
+            (Float::with_val(64, rug::float::Special::Nan), None),
+            (d[0].clone(), Some(Float::with_val(64, -1))),
+            (
+                d[0].clone(),
+                Some(Float::with_val(64, rug::float::Special::Infinity)),
+            ),
+        ] {
+            let shared = context
+                .recover_for_value(&value, uncertainty.as_ref())
+                .unwrap_err();
+            let fresh = tridiag_eigenvector_for_value_detailed_hp(
+                &d,
+                &e,
+                &value,
+                uncertainty.as_ref(),
+                64,
+                options,
+            )
+            .unwrap_err();
+            assert_eq!(
+                shared.downcast_ref::<HpEigenvectorRecoveryFailure>(),
+                fresh.downcast_ref::<HpEigenvectorRecoveryFailure>()
+            );
+            assert!(context.guide.is_none());
+        }
+        assert_eq!(GUIDE_COMPUTATIONS.with(std::cell::Cell::get), 0);
+        for (value, uncertainty) in [
+            (Float::with_val(64, 9), None),
+            (d[0].clone(), Some(Float::with_val(64, 8))),
+        ] {
+            let shared = context
+                .recover_for_value(&value, uncertainty.as_ref())
+                .unwrap_err();
+            let fresh = tridiag_eigenvector_for_value_detailed_hp(
+                &d,
+                &e,
+                &value,
+                uncertainty.as_ref(),
+                64,
+                options,
+            )
+            .unwrap_err();
+            assert_eq!(shared.to_string(), fresh.to_string());
+        }
+        let a = context.recover_for_value(&d[0], None).unwrap();
+        let b =
+            tridiag_eigenvector_for_value_detailed_hp(&d, &e, &d[0], None, 64, options).unwrap();
+        assert_identical(&a, &b);
+    }
+
+    #[test]
+    fn shared_guide_preserves_source_and_option_refusals() {
+        let d = [Float::with_val(64, 1)];
+        for p in [0, 32, 1_000_001] {
+            assert!(TridiagonalEigenvectorRecoveryHp::new(&d, &[], p, Default::default()).is_err());
+        }
+        assert!(TridiagonalEigenvectorRecoveryHp::new(&d, &d, 64, Default::default()).is_err());
+        assert!(TridiagonalEigenvectorRecoveryHp::new(
+            &[Float::with_val(64, rug::float::Special::Nan)],
+            &[],
+            64,
+            Default::default()
+        )
+        .is_err());
+        let options = TridiagEigvecOptions {
+            max_steps: 0,
+            ..Default::default()
+        };
+        let mut context = TridiagonalEigenvectorRecoveryHp::new(&d, &[], 64, options).unwrap();
+        let shared = context.recover_for_value(&d[0], None).unwrap_err();
+        let fresh = tridiag_eigenvector_for_value_detailed_hp(&d, &[], &d[0], None, 64, options)
+            .unwrap_err();
+        assert_eq!(shared.to_string(), fresh.to_string());
+        assert!(context.guide.is_none());
+    }
+
+    #[test]
+    fn shared_guide_repeated_other_members_do_not_reject_simple_member() {
+        let d: Vec<_> = [1, 1, 3]
+            .into_iter()
+            .map(|x| Float::with_val(64, x))
+            .collect();
+        let e = vec![Float::with_val(64, 0); 2];
+        let options = TridiagEigvecOptions::default();
+        let mut context = TridiagonalEigenvectorRecoveryHp::new(&d, &e, 64, options).unwrap();
+        let shared = context.recover_for_value(&d[0], None).unwrap_err();
+        let fresh = tridiag_eigenvector_for_value_detailed_hp(&d, &e, &d[0], None, 64, options)
+            .unwrap_err();
+        assert_eq!(shared.to_string(), fresh.to_string());
+        assert_identical(
+            &context.recover_for_value(&d[2], None).unwrap(),
+            &tridiag_eigenvector_for_value_detailed_hp(&d, &e, &d[2], None, 64, options).unwrap(),
+        );
+    }
 }

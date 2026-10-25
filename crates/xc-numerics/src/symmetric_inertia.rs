@@ -3,7 +3,11 @@ use crate::interval::IntervalError;
 type Result<T> = std::result::Result<T, IntervalError>;
 use crate::mpfr_interval::MpfrInterval as I;
 use rayon::prelude::*;
-use rug::{float::Round, Float};
+use rug::{
+    float::Round,
+    ops::{AddAssignRound, AssignRound},
+    Assign, Float,
+};
 
 fn signed(v: &I) -> bool {
     v.validate().is_ok() && (v.is_strictly_positive() || v.upper() < &0)
@@ -99,6 +103,7 @@ fn block(a: &[I], n: usize, first: usize, second: usize, p: u32) -> Result<Optio
 
 // Choose the same extrema as four-corner interval multiplication before
 // rounding, avoiding products that cannot attain either endpoint.
+#[cfg(test)]
 fn product(a: &I, b: &I) -> Result<I> {
     a.validate()?;
     b.validate()?;
@@ -142,6 +147,189 @@ fn product(a: &I, b: &I) -> Result<I> {
     I::new(lower, upper)
 }
 
+// Fixed-precision buffers owned by one Schur-row job. Assignment evaluates
+// the same MPFR operations as the allocating interval expressions below;
+// only the temporary significand storage is reused.
+struct ScratchInterval {
+    lower: Float,
+    upper: Float,
+}
+impl ScratchInterval {
+    fn new(p: u32) -> Self {
+        Self {
+            lower: Float::new(p),
+            upper: Float::new(p),
+        }
+    }
+    fn endpoints(&self) -> (&Float, &Float) {
+        (&self.lower, &self.upper)
+    }
+    fn finite_ordered(&self, message: &str) -> Result<()> {
+        if !self.lower.is_finite() || !self.upper.is_finite() || self.lower > self.upper {
+            return Err(IntervalError::Invalid(message.into()));
+        }
+        Ok(())
+    }
+    // The historical 1x1 route uses selected corners and Float::min/max,
+    // whose zero handling must remain distinct from the full-corner route.
+    fn selected_product(
+        &mut self,
+        (al, au): (&Float, &Float),
+        (bl, bu): (&Float, &Float),
+        alternate: &mut Float,
+    ) -> Result<()> {
+        let pair = if al >= &0 {
+            if bl >= &0 {
+                Some((al, bl, au, bu))
+            } else if bu <= &0 {
+                Some((au, bl, al, bu))
+            } else {
+                Some((au, bl, au, bu))
+            }
+        } else if au <= &0 {
+            if bl >= &0 {
+                Some((al, bu, au, bl))
+            } else if bu <= &0 {
+                Some((au, bu, al, bl))
+            } else {
+                Some((al, bu, al, bl))
+            }
+        } else if bl >= &0 {
+            Some((al, bu, au, bu))
+        } else if bu <= &0 {
+            Some((au, bl, al, bl))
+        } else {
+            None
+        };
+        if let Some((ll, lr, ul, ur)) = pair {
+            self.lower.assign_round(ll * lr, Round::Down);
+            self.upper.assign_round(ul * ur, Round::Up);
+        } else {
+            self.lower.assign_round(al * bu, Round::Down);
+            alternate.assign_round(au * bl, Round::Down);
+            self.lower.min_mut(alternate);
+            self.upper.assign_round(al * bl, Round::Up);
+            alternate.assign_round(au * bu, Round::Up);
+            self.upper.max_mut(alternate);
+        }
+        // product() previously returned I::new directly at this boundary.
+        self.finite_ordered("MPFR interval endpoints must be finite and ordered")
+    }
+    // Exact operation order and total_cmp extrema from MpfrInterval::mul,
+    // including its signed-zero distinction and point-corner deduplication.
+    fn full_product(
+        &mut self,
+        (al, au): (&Float, &Float),
+        (bl, bu): (&Float, &Float),
+        down: &mut Float,
+        up: &mut Float,
+    ) -> Result<()> {
+        let left = [al, au];
+        let right = [bl, bu];
+        let left_count = if al == au && al.is_sign_negative() == au.is_sign_negative() {
+            1
+        } else {
+            2
+        };
+        let right_count = if bl == bu && bl.is_sign_negative() == bu.is_sign_negative() {
+            1
+        } else {
+            2
+        };
+        let mut first = true;
+        for &x in &left[..left_count] {
+            for &y in &right[..right_count] {
+                down.assign_round(x * y, Round::Down);
+                up.assign_round(x * y, Round::Up);
+                if first || down.total_cmp(&self.lower).is_lt() {
+                    self.lower.assign(&*down);
+                }
+                if first || up.total_cmp(&self.upper).is_gt() {
+                    self.upper.assign(&*up);
+                }
+                first = false;
+            }
+        }
+        // Infallible interval arithmetic propagates invalid intervals to the
+        // final row validation. Preserve its error instead of I::new's error.
+        self.finite_ordered("invalid or unrepresentable MPFR interval")
+    }
+    fn add(&mut self, other: &Self) -> Result<()> {
+        self.lower.add_assign_round(&other.lower, Round::Down);
+        self.upper.add_assign_round(&other.upper, Round::Up);
+        self.finite_ordered("invalid or unrepresentable MPFR interval")
+    }
+    fn subtract_from(&self, previous: &I) -> Result<I> {
+        let p = previous.precision();
+        I::new(
+            Float::with_val_round(p, previous.lower() - &self.upper, Round::Down).0,
+            Float::with_val_round(p, previous.upper() - &self.lower, Round::Up).0,
+        )
+        .map_err(|_| IntervalError::Invalid("invalid or unrepresentable MPFR interval".into()))
+    }
+}
+struct SchurScratch {
+    first: ScratchInterval,
+    second: ScratchInterval,
+    sum: ScratchInterval,
+    down: Float,
+    up: Float,
+}
+impl SchurScratch {
+    fn new(p: u32) -> Self {
+        Self {
+            first: ScratchInterval::new(p),
+            second: ScratchInterval::new(p),
+            sum: ScratchInterval::new(p),
+            down: Float::new(p),
+            up: Float::new(p),
+        }
+    }
+    fn one(&mut self, previous: &I, left: &I, right: &I, inverse: &I) -> Result<I> {
+        self.first.selected_product(
+            (left.lower(), left.upper()),
+            (right.lower(), right.upper()),
+            &mut self.down,
+        )?;
+        self.second.selected_product(
+            self.first.endpoints(),
+            (inverse.lower(), inverse.upper()),
+            &mut self.down,
+        )?;
+        self.second.subtract_from(previous)
+    }
+    fn two(&mut self, previous: &I, ri: &I, si: &I, rj: &I, sj: &I, block: &Block) -> Result<I> {
+        for (index, (left, inverse, right)) in [
+            (ri, &block.inverse_11, rj),
+            (ri, &block.inverse_12, sj),
+            (si, &block.inverse_12, rj),
+            (si, &block.inverse_22, sj),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.first.full_product(
+                (left.lower(), left.upper()),
+                (inverse.lower(), inverse.upper()),
+                &mut self.down,
+                &mut self.up,
+            )?;
+            self.second.full_product(
+                self.first.endpoints(),
+                (right.lower(), right.upper()),
+                &mut self.down,
+                &mut self.up,
+            )?;
+            if index == 0 {
+                std::mem::swap(&mut self.sum, &mut self.second);
+            } else {
+                self.sum.add(&self.second)?;
+            }
+        }
+        self.sum.subtract_from(previous)
+    }
+}
+
 /// Outward MPFR arithmetic at fixed precision with exact dyadic pivot records.
 /// Congruent symmetric swaps and interval Schur updates preserve enclosure of
 /// every admissible symmetric input matrix. Only strictly signed interval
@@ -157,6 +345,20 @@ pub fn inertia_stable(matrix: &[I], n: usize, p: u32) -> Result<MpfrInertiaResul
     inertia_impl(matrix, n, p, true)
 }
 
+/// Consume an interval matrix as the elimination workspace, retaining the
+/// historical pivot route and exactly the borrowed route's validation order.
+pub fn inertia_owned(matrix: Vec<I>, n: usize, p: u32) -> Result<MpfrInertiaResult> {
+    validate_inertia_input(&matrix, n, p)?;
+    inertia_validated(matrix, n, p, false)
+}
+
+/// Consume an interval matrix using the same stable pivot route as
+/// [`inertia_stable`], without cloning its dense endpoint allocation.
+pub fn inertia_stable_owned(matrix: Vec<I>, n: usize, p: u32) -> Result<MpfrInertiaResult> {
+    validate_inertia_input(&matrix, n, p)?;
+    inertia_validated(matrix, n, p, true)
+}
+
 // Every upper-triangle update in one Schur step reads only the retained pivot
 // columns and its own previous entry. Parallel rows preserve each entry's
 // operation/rounding order, so both pivot routes, including the historical
@@ -168,15 +370,18 @@ fn update_schur_rows(
     n: usize,
     start: usize,
     p: u32,
-    update: impl Fn(usize, usize, &I) -> Result<I> + Sync,
+    update: impl Fn(usize, usize, &I, &mut SchurScratch) -> Result<I> + Sync,
 ) -> Result<()> {
     let rows = n - start;
+    if rows == 0 {
+        return Ok(());
+    }
     let cells = rows.saturating_mul(rows.saturating_add(1)) / 2;
     let workers = rayon::current_num_threads();
     let exponent_bounds = (rug::float::exp_min(), rug::float::exp_max());
     let parallel =
         workers > 1 && cells.saturating_mul(p as usize) >= workers.saturating_mul(32_768);
-    let row_update = |(i, row): (usize, &mut [I])| -> Result<()> {
+    let row_update = |scratch: &mut SchurScratch, (i, row): (usize, &mut [I])| -> Result<()> {
         // MPFR exponent bounds can be thread-local. Never clone or operate on
         // a stored endpoint under different bounds and then certify it.
         if (rug::float::exp_min(), rug::float::exp_max()) != exponent_bounds {
@@ -185,7 +390,7 @@ fn update_schur_rows(
             ));
         }
         for (j, entry) in row.iter_mut().enumerate().skip(i) {
-            let value = update(i, j, entry)?;
+            let value = update(i, j, entry, scratch)?;
             value.validate()?;
             *entry = value;
         }
@@ -195,15 +400,21 @@ fn update_schur_rows(
         a.par_chunks_mut(n)
             .enumerate()
             .skip(start)
-            .try_for_each(row_update)?;
+            .try_for_each_init(|| SchurScratch::new(p), row_update)?;
     } else {
+        let mut scratch = SchurScratch::new(p);
         for row in a.chunks_mut(n).enumerate().skip(start) {
-            row_update(row)?;
+            row_update(&mut scratch, row)?;
         }
     }
     Ok(())
 }
 fn inertia_impl(matrix: &[I], n: usize, p: u32, stable_pivots: bool) -> Result<MpfrInertiaResult> {
+    validate_inertia_input(matrix, n, p)?;
+    inertia_validated(matrix.to_vec(), n, p, stable_pivots)
+}
+
+fn validate_inertia_input(matrix: &[I], n: usize, p: u32) -> Result<()> {
     if !(32..=1_000_000).contains(&p) {
         return Err(IntervalError::Invalid(
             "unsupported interval inertia precision".into(),
@@ -236,7 +447,15 @@ fn inertia_impl(matrix: &[I], n: usize, p: u32, stable_pivots: bool) -> Result<M
             ));
         }
     }
-    let mut a = matrix.to_vec();
+    Ok(())
+}
+
+fn inertia_validated(
+    mut a: Vec<I>,
+    n: usize,
+    p: u32,
+    stable_pivots: bool,
+) -> Result<MpfrInertiaResult> {
     let mut pivots = Vec::with_capacity(n);
     let mut positive = 0;
     let mut negative = 0;
@@ -279,10 +498,13 @@ fn inertia_impl(matrix: &[I], n: usize, p: u32, stable_pivots: bool) -> Result<M
             let column = (k + 1..n)
                 .map(|i| below(&a, n, updated, i, k).clone())
                 .collect::<Vec<_>>();
-            update_schur_rows(&mut a, n, k + 1, p, |i, j, previous| {
-                let numerator = product(&column[i - k - 1], &column[j - k - 1])?;
-                let correction = product(&numerator, &inverse_pivot)?;
-                Ok(previous.sub(&correction))
+            update_schur_rows(&mut a, n, k + 1, p, |i, j, previous, scratch| {
+                scratch.one(
+                    previous,
+                    &column[i - k - 1],
+                    &column[j - k - 1],
+                    &inverse_pivot,
+                )
             })?;
             updated = true;
             k += 1;
@@ -327,18 +549,12 @@ fn inertia_impl(matrix: &[I], n: usize, p: u32, stable_pivots: bool) -> Result<M
         let second = (k + 2..n)
             .map(|i| below(&a, n, updated, i, k + 1).clone())
             .collect::<Vec<_>>();
-        update_schur_rows(&mut a, n, k + 2, p, |i, j, previous| {
+        update_schur_rows(&mut a, n, k + 2, p, |i, j, previous, scratch| {
             let ri = &first[i - k - 2];
             let si = &second[i - k - 2];
             let rj = &first[j - k - 2];
             let sj = &second[j - k - 2];
-            let correction = ri
-                .mul(&b.inverse_11)
-                .mul(rj)
-                .add(&ri.mul(&b.inverse_12).mul(sj))
-                .add(&si.mul(&b.inverse_12).mul(rj))
-                .add(&si.mul(&b.inverse_22).mul(sj));
-            Ok(previous.sub(&correction))
+            scratch.two(previous, ri, si, rj, sj, &b)
         })?;
         updated = true;
         k += 2;
@@ -412,6 +628,180 @@ pub fn point_matrix_inertia_at(
 #[cfg(test)]
 mod product_tests {
     use super::*;
+    fn scratch_values(p: u32) -> Vec<I> {
+        let mut values = [(-7, -3), (-7, 0), (-7, 3), (0, 0), (0, 3), (2, 3)]
+            .into_iter()
+            .map(|(lo, hi)| I::new(Float::with_val(p, lo), Float::with_val(p, hi)).unwrap())
+            .collect::<Vec<_>>();
+        let zero = Float::with_val(p, 0);
+        values.extend([
+            I::point(-zero.clone()),
+            I::new(-zero.clone(), zero.clone()).unwrap(),
+            I::new(zero.clone(), -zero).unwrap(),
+        ]);
+        for exponent in [
+            rug::float::exp_min() - 1,
+            -5000,
+            5000,
+            rug::float::exp_max() - 2,
+        ] {
+            let x = Float::with_val(p, 1) << exponent;
+            values.push(I::point(x.clone()));
+            values.push(I::point(-x));
+        }
+        values
+    }
+
+    #[test]
+    fn artifact_scratch_products_preserve_signed_zeros_and_range_failures() {
+        for p in [32, 128, 512] {
+            let values = scratch_values(p);
+            let mut scratch = SchurScratch::new(p);
+            for a in &values {
+                for b in &values {
+                    let expected = product(a, b);
+                    let actual = scratch.first.selected_product(
+                        (a.lower(), a.upper()),
+                        (b.lower(), b.upper()),
+                        &mut scratch.down,
+                    );
+                    match (actual, expected) {
+                        (Ok(()), Ok(expected)) => assert!(same_interval(
+                            &I::new(scratch.first.lower.clone(), scratch.first.upper.clone())
+                                .unwrap(),
+                            &expected,
+                        )),
+                        (Err(actual), Err(expected)) => {
+                            assert_eq!(actual.to_string(), expected.to_string())
+                        }
+                        (actual, expected) => {
+                            panic!("selected product mismatch: {actual:?} {expected:?}")
+                        }
+                    }
+                    let expected = a.mul(b);
+                    let actual = scratch.first.full_product(
+                        (a.lower(), a.upper()),
+                        (b.lower(), b.upper()),
+                        &mut scratch.down,
+                        &mut scratch.up,
+                    );
+                    match (actual, expected.validate()) {
+                        (Ok(()), Ok(())) => assert!(same_interval(
+                            &I::new(scratch.first.lower.clone(), scratch.first.upper.clone())
+                                .unwrap(),
+                            &expected,
+                        )),
+                        (Err(actual), Err(expected)) => {
+                            assert_eq!(actual.to_string(), expected.to_string())
+                        }
+                        (actual, expected) => {
+                            panic!("full product mismatch: {actual:?} {expected:?}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_scratch_updates_match_allocating_reference_at_limits() {
+        let same_update = |actual: Result<I>, expected: Result<I>| match (actual, expected) {
+            (Ok(actual), Ok(expected)) => assert!(same_interval(&actual, &expected)),
+            (Err(actual), Err(expected)) => assert_eq!(actual.to_string(), expected.to_string()),
+            (actual, expected) => panic!("Schur update mismatch: {actual:?} {expected:?}"),
+        };
+        for p in [32, 128, 512] {
+            let values = scratch_values(p);
+            let mut scratch = SchurScratch::new(p);
+            for (i, left) in values.iter().enumerate() {
+                for (j, right) in values.iter().enumerate() {
+                    for inverse in &values {
+                        let previous = &values[(i + j) % values.len()];
+                        let expected = (|| {
+                            let numerator = product(left, right)?;
+                            let correction = product(&numerator, inverse)?;
+                            let result = previous.sub(&correction);
+                            result.validate()?;
+                            Ok(result)
+                        })();
+                        same_update(scratch.one(previous, left, right, inverse), expected);
+                    }
+                    // Vary all seven interval operands while reusing the
+                    // same buffers across both successes and range failures.
+                    for offset in 0..values.len() {
+                        let at = |k: usize| &values[(offset + k) % values.len()];
+                        let b = Block {
+                            low: I::from_i64(-1, p),
+                            high: I::from_i64(1, p),
+                            inverse_11: at(0).clone(),
+                            inverse_12: at(3).clone(),
+                            inverse_22: at(7).clone(),
+                        };
+                        let (previous, si, sj) = (at(1), at(4), at(8));
+                        let correction = left
+                            .mul(&b.inverse_11)
+                            .mul(right)
+                            .add(&left.mul(&b.inverse_12).mul(sj))
+                            .add(&si.mul(&b.inverse_12).mul(right))
+                            .add(&si.mul(&b.inverse_22).mul(sj));
+                        let expected = previous.sub(&correction);
+                        let expected = expected.validate().map(|()| expected);
+                        same_update(scratch.two(previous, left, si, right, sj, &b), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_scratch_inertia_matches_baseline_on_extreme_and_unresolved_inputs() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for p in [32, 128, 512] {
+                for value in scratch_values(p) {
+                    for blocks in [false, true] {
+                        let zero = I::point(-Float::with_val(p, 0));
+                        let one = I::from_i64(1, p);
+                        let matrix = if blocks {
+                            vec![
+                                zero.clone(),
+                                one.clone(),
+                                value.clone(),
+                                one.clone(),
+                                zero.clone(),
+                                value.clone(),
+                                value.clone(),
+                                value.clone(),
+                                zero,
+                            ]
+                        } else {
+                            vec![
+                                one.clone(),
+                                value.clone(),
+                                zero.clone(),
+                                value.clone(),
+                                value.clone(),
+                                one.clone(),
+                                zero,
+                                one,
+                                value.clone(),
+                            ]
+                        };
+                        for stable in [false, true] {
+                            assert!(same_outcome(
+                                &inertia_impl(&matrix, 3, p, stable),
+                                &reference_inertia_impl(&matrix, 3, p, stable),
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Frozen implementation preceding upper-triangle-only Schur storage: the
     // full input and a serial reflection after every update.
     fn reference_swap(a: &mut [I], n: usize, first: usize, second: usize) {
@@ -744,6 +1134,59 @@ mod product_tests {
             }
         }
         a
+    }
+
+    #[test]
+    fn owned_inertia_preserves_reference_pivots_and_validation() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for p in [64, 128, 512] {
+                for kind in 0..4 {
+                    for n in [1, 2, 3, 5] {
+                        let matrix = schur_fixture(kind, n, p);
+                        for stable in [false, true] {
+                            let expected = reference_inertia_impl(&matrix, n, p, stable);
+                            let borrowed = inertia_impl(&matrix, n, p, stable);
+                            let owned = if stable {
+                                inertia_stable_owned(matrix.clone(), n, p)
+                            } else {
+                                inertia_owned(matrix.clone(), n, p)
+                            };
+                            assert!(
+                                same_outcome(&owned, &expected),
+                                "p={p} kind={kind} n={n} stable={stable}"
+                            );
+                            assert!(same_outcome(&owned, &borrowed));
+                        }
+                    }
+                }
+            }
+            let mut asymmetric = schur_fixture(0, 2, 128);
+            asymmetric[1] = I::from_i64(77, 128);
+            let mut different_precision = schur_fixture(0, 2, 128);
+            different_precision[0] = I::from_i64(1, 129);
+            for (matrix, n, p) in [
+                (Vec::new(), 0, 128),
+                (vec![I::from_i64(1, 128)], usize::MAX, 128),
+                (vec![I::from_i64(1, 128)], 1, 31),
+                (asymmetric, 2, 128),
+                (different_precision, 2, 128),
+            ] {
+                for stable in [false, true] {
+                    let expected = inertia_impl(&matrix, n, p, stable);
+                    assert!(expected.is_err());
+                    let actual = if stable {
+                        inertia_stable_owned(matrix.clone(), n, p)
+                    } else {
+                        inertia_owned(matrix.clone(), n, p)
+                    };
+                    assert!(same_outcome(&actual, &expected));
+                }
+            }
+        });
     }
 
     #[test]

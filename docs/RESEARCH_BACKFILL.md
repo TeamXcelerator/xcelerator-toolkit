@@ -16,9 +16,30 @@ cargo build -p xc-spectral --release --features hp --example ccm_research_backfi
 
 Paths in the batch are relative to its file, or absolute. Each source has a
 `manifest`, a decoded logical `payload`, and an optional
-`maximum_payload_bytes` (512 MiB by default). Compressed shard objects must be
+`maximum_payload_bytes` (an explicit optional source-size limit). Without that
+override, the manifest's exact logical size governs reading; there is no default
+512 MiB payload ceiling. Compressed shard objects must be
 verified and decoded through the existing retained-source reader first; do not
 pass ZIP transport bytes as the logical JSON payload.
+
+Set `XC_RESEARCH_WORKING_BYTES` to the memory budget assigned to this process.
+For example, `103079215104` assigns 96 GiB on a machine with enough memory and
+operating-system headroom. An enclosing `RunResources` context takes precedence.
+The library fallback remains 8 GiB when neither is supplied; it is not a maximum.
+Local supervisor or container limits are separate and do not change artifact
+identities. Select a budget within the memory actually available to the process.
+
+Matrices are decoded from authenticated seekable streams, without retaining a
+complete JSON byte buffer. The resolver's file-backed reader needs scratch disk
+space for the decoded logical payload and removes its temporary on ordinary
+success or failure. Numeric allocations and parser scratch share the job budget;
+owned matrix clones share one allocation and reservation. Simultaneous cohort
+members should share the same `RunResources`, so their combined ownership is
+admitted. Missing or corrupt sources never trigger a primary recomputation.
+Read-only cache sessions use `ResourcePolicy.maximum_temporary_disk_bytes` for
+each decoded spool, independently of their buffer-memory admission. Concurrent
+readers need the sum of their spool sizes on disk. Configure storage policy with
+`XC_RESOURCE_POLICY_FILE`; it is separate from the numerical working budget.
 
 ```json
 {

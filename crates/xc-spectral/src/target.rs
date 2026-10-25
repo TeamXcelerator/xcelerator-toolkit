@@ -16,8 +16,12 @@ use std::path::Path;
 
 #[path = "target_external.rs"]
 mod external;
+#[path = "target_input.rs"]
+mod input;
+#[cfg(feature = "hp")]
 pub(crate) use external::provider_declared_pure;
 pub use external::ExternalProfileSpec;
+pub use input::{read_target_specification, target_maximum_bytes, TARGET_MAXIMUM_BYTES_ENV};
 
 /// Environment variable naming the private target-profile specification.
 pub const TARGET_SPEC_FILE_ENV: &str = "XC_TARGET_SPEC_FILE";
@@ -218,14 +222,17 @@ impl TargetProfileSpec {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
+        anyhow::ensure!(
+            u64::try_from(bytes.len())? <= target_maximum_bytes()?,
+            "target specification exceeds its configured byte limit"
+        );
         let spec: Self = serde_json::from_slice(bytes).context("invalid target-profile JSON")?;
         spec.validate()?;
         Ok(spec)
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("failed reading target specification {}", path.display()))?;
+        let bytes = read_target_specification(path)?;
         Self::from_json(&bytes)
     }
 
@@ -1069,6 +1076,16 @@ pub mod hp {
 
         pub fn definition_digest(&self) -> &str {
             &self.definition_digest
+        }
+
+        pub(crate) fn uses_external_provider(&self) -> bool {
+            self.external.is_some()
+        }
+
+        pub(crate) fn has_memoized_value(&self, u: &Float) -> bool {
+            self.external
+                .as_ref()
+                .is_some_and(|source| source.has_memoized_value(u))
         }
 
         /// Reject use of a cutoff-specific source in a different configuration.

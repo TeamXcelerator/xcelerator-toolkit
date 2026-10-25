@@ -242,16 +242,53 @@ pub(super) fn sanity_u_flow(
     Ok(())
 }
 const GEOMETRY_BUDGET_BYTES: u128 = 512 * 1024 * 1024;
-const ROOT_BATCH_SIZE: usize = 16;
+// Keep workers occupied when neighboring roots require different guard ladders.
+// At most `workers` roots run at once; results and errors are consumed by index.
+fn ordered_root_work<T: Send>(
+    count: usize,
+    workers: usize,
+    resources: &xc_core::RunResources,
+    compute: impl Fn(usize) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let first_error = AtomicUsize::new(count);
+    let parts = (0..workers.max(1).min(count.max(1)))
+        .into_par_iter()
+        .map(|_| {
+            let _scope = resources.enter();
+            let mut part = Vec::new();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= count || index > first_error.load(Ordering::Relaxed) {
+                    break;
+                }
+                let result = compute(index);
+                if result.is_err() {
+                    first_error.fetch_min(index, Ordering::Relaxed);
+                }
+                part.push((index, result));
+            }
+            part
+        })
+        .collect::<Vec<_>>();
+    let mut ordered = parts.into_iter().flatten().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|(index, _)| *index);
+    ordered.into_iter().map(|(_, result)| result).collect()
+}
 struct PreparedRoot<'a> {
     value: &'a Float,
     geometry: root_response_math::Geometry,
+    extended: std::sync::Mutex<root_response_math::GeometryCache>,
 }
 pub(super) struct PreparedRootResponses<'a> {
     roots: Vec<Option<PreparedRoot<'a>>>,
     unit: &'a [Float],
     poles: &'a [Float],
     precision_bits: u32,
+    guard_policy: root_response_math::GuardPolicy,
+    resources: xc_core::RunResources,
+    _reservation: xc_core::MemoryReservation,
 }
 impl<'a> PreparedRootResponses<'a> {
     pub(super) fn new(
@@ -260,8 +297,9 @@ impl<'a> PreparedRootResponses<'a> {
         roots: &'a [EigenvalueResult],
         bits: u32,
     ) -> Result<Self> {
-        Self::with_budget(unit, poles, roots, bits, GEOMETRY_BUDGET_BYTES)
+        Self::with_optional_budget(unit, poles, roots, bits, None)
     }
+    #[cfg(test)]
     fn with_budget(
         unit: &'a [Float],
         poles: &'a [Float],
@@ -269,86 +307,211 @@ impl<'a> PreparedRootResponses<'a> {
         bits: u32,
         budget: u128,
     ) -> Result<Self> {
+        Self::with_optional_budget(unit, poles, roots, bits, Some(budget))
+    }
+    fn with_optional_budget(
+        unit: &'a [Float],
+        poles: &'a [Float],
+        roots: &'a [EigenvalueResult],
+        bits: u32,
+        budget: Option<u128>,
+    ) -> Result<Self> {
         root_response_math::validate(unit, bits)?;
         root_response_math::validate(poles, bits)?;
         if unit.len() != poles.len() {
             bail!("root-response source dimensions differ");
         }
-        let point_bytes = u128::from(bits + 4096).div_ceil(8) + 96;
+        let guard_policy = root_response_math::GuardPolicy::configured(bits)?;
+        let resources = match xc_core::RunResources::current() {
+            Some(resources) => resources,
+            None => xc_core::RunResources::with_worker_limit(
+                u64::try_from(super::source_working_budget()?)?,
+                rayon::current_num_threads(),
+            )?,
+        };
+        let _scope = resources.enter();
+        let budget = match budget {
+            Some(value) => value,
+            None => configured_geometry_budget(resources.maximum_bytes())?,
+        };
+        // Retained geometry is always the original 64-bit guard. Larger
+        // attempts reserve their own actual workspace only when reached.
+        let point_bytes = root_response_math::point_bytes(bits, 64)?;
         let bytes = roots.len() as u128 * poles.len() as u128 * point_bytes * 2;
-        let retain = bytes <= budget.min(GEOMETRY_BUDGET_BYTES);
-        let storage =
-            roots.len() as u128 * (point_bytes * 4 + 128) + if retain { bytes } else { 0 };
-        let workers = roots.len().min(rayon::current_num_threads()) as u128;
-        if storage + workers * poles.len() as u128 * point_bytes * 24
-            > super::source_working_budget()?
-        {
+        let base_storage = roots.len() as u128 * (point_bytes * 4 + 128);
+        let workers = roots
+            .len()
+            .min(rayon::current_num_threads())
+            .min(resources.worker_limit())
+            .max(1);
+        let scratch = workers as u128 * poles.len() as u128 * point_bytes * 24;
+        if base_storage + scratch > u128::from(resources.maximum_bytes()) {
             bail!("prepared root responses exceed combined workspace budget");
         }
+        let usage = resources.usage();
+        let available = resources
+            .maximum_bytes()
+            .saturating_sub(usage.working_bytes)
+            .saturating_sub(usage.retained_bytes);
+        // The lifetime-held initial table must not grow beyond the old limit.
+        // Larger optional storage belongs to the evictable reached-guard cache.
+        let optional = if bytes <= GEOMETRY_BUDGET_BYTES
+            && base_storage + bytes <= budget
+            && base_storage + bytes + scratch <= u128::from(available)
+        {
+            resources
+                .try_reserve_working(u64::try_from(base_storage + bytes)?)
+                .ok()
+        } else {
+            None
+        };
+        let retain = optional.is_some();
+        let storage = base_storage + if retain { bytes } else { 0 };
+        let reservation = match optional {
+            Some(reservation) => reservation,
+            None => resources.try_reserve_working(u64::try_from(base_storage)?)?,
+        };
+        let extended_bytes =
+            u64::try_from(budget.saturating_sub(storage) / roots.len().max(1) as u128)?;
         let prepared = roots
-            .par_iter()
-            .map(|outcome| {
-                outcome
-                    .value()
-                    .map(|value| {
-                        Ok(PreparedRoot {
-                            value,
-                            geometry: root_response_math::Geometry::prepare(
-                                unit, poles, value, bits, 64, retain,
-                            )?,
-                        })
+            .par_chunks(roots.len().div_ceil(workers).max(1))
+            .map(|outcomes| {
+                let _scope = resources.enter();
+                outcomes
+                    .iter()
+                    .map(|outcome| {
+                        outcome
+                            .value()
+                            .map(|value| {
+                                Ok(PreparedRoot {
+                                    value,
+                                    geometry: root_response_math::Geometry::prepare(
+                                        unit, poles, value, bits, 64, retain,
+                                    )?,
+                                    extended: std::sync::Mutex::new(
+                                        root_response_math::GeometryCache::new(extended_bytes),
+                                    ),
+                                })
+                            })
+                            .transpose()
                     })
-                    .transpose()
+                    .collect::<Vec<Result<_>>>()
             })
-            .collect::<Vec<Result<_>>>()
+            .collect::<Vec<_>>()
             .into_iter()
+            .flatten()
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             roots: prepared,
             unit,
             poles,
             precision_bits: bits,
+            guard_policy,
+            resources,
+            _reservation: reservation,
         })
     }
     pub(super) fn values(&self, tangent: &[Float]) -> Result<Vec<Option<String>>> {
+        let result = self.values_with_cache(tangent, true);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.is::<xc_core::ConfigError>())
+        {
+            // Optional persistent geometry must not turn a previously admitted
+            // calculation into a failure. Workers have joined before eviction.
+            self.clear_optional();
+            return self.values_with_cache(tangent, false);
+        }
+        result
+    }
+    pub(super) fn clear_optional(&self) -> bool {
+        let mut released = false;
+        for root in self.roots.iter().flatten() {
+            // Eviction does not consume a numerical value, including if a
+            // previous computation panicked while holding this root's lock.
+            released |= root
+                .extended
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        released
+    }
+    fn values_with_cache(&self, tangent: &[Float], cache: bool) -> Result<Vec<Option<String>>> {
+        let _scope = self.resources.enter();
         root_response_math::validate(tangent, self.precision_bits)?;
         if tangent.len() != self.poles.len() {
             bail!("root-response tangent dimensions differ");
         }
-        let chunks = self
+        let workers = self
             .roots
-            .par_chunks(ROOT_BATCH_SIZE)
-            .map(|roots| {
-                roots
-                    .iter()
+            .len()
+            .min(rayon::current_num_threads())
+            .min(self.resources.worker_limit())
+            .max(1);
+        // A finer work queue must not increase memory pressure past admission.
+        // Account for the largest possible attempt, without changing the guard
+        // sequence actually evaluated for any root.
+        let usage = self.resources.usage();
+        let available = self
+            .resources
+            .maximum_bytes()
+            .saturating_sub(usage.working_bytes)
+            .saturating_sub(usage.retained_bytes);
+        let attempt = self.poles.len() as u128
+            * 24
+            * root_response_math::point_bytes(
+                self.precision_bits,
+                self.guard_policy.maximum_guard_bits(),
+            )?;
+        let memory_workers =
+            (u128::from(available) / attempt.max(1)).min(usize::MAX as u128) as usize;
+        ordered_root_work(
+            self.roots.len(),
+            workers.min(memory_workers.max(1)),
+            &self.resources,
+            |index| {
+                self.roots[index]
+                    .as_ref()
                     .map(|root| {
-                        root.as_ref()
-                            .map(|root| {
-                                root_response_math::evaluate(
-                                    self.unit,
-                                    tangent,
-                                    self.poles,
-                                    None,
-                                    root.value,
-                                    self.precision_bits,
-                                    Some(&root.geometry),
-                                )
-                                .map(|x| lossless_hp_decimal(&x))
-                            })
-                            .transpose()
+                        let mut extended = root
+                            .extended
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("root geometry cache poisoned"))?;
+                        root_response_math::evaluate_with_cache(
+                            self.unit,
+                            tangent,
+                            self.poles,
+                            None,
+                            root.value,
+                            self.guard_policy,
+                            Some(&root.geometry),
+                            cache.then_some(&mut *extended),
+                        )
+                        .map(|x| lossless_hp_decimal(&x))
                     })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        Ok(chunks.into_iter().flatten().collect())
+                    .transpose()
+            },
+        )
     }
 }
 
-// Bound concurrent event workspaces while allowing each event's root batches
-// and matrix rows to use the shared Rayon pool. Indexed collection fixes output
-// order and the caller reports the first failure in canonical event order.
+fn configured_geometry_budget(run_bytes: u64) -> Result<u128> {
+    match std::env::var("XC_ROOT_RESPONSE_GEOMETRY_BYTES") {
+        Ok(text) => {
+            let bytes = text.parse::<u64>().ok()
+                .filter(|n| n.to_string() == text)
+                .ok_or_else(|| anyhow::anyhow!("XC_ROOT_RESPONSE_GEOMETRY_BYTES must be a canonical nonnegative decimal byte count"))?;
+            Ok(u128::from(bytes.min(run_bytes)))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(u128::from(run_bytes / 16)),
+        Err(_) => bail!("XC_ROOT_RESPONSE_GEOMETRY_BYTES is not valid Unicode"),
+    }
+}
+
+// Canonical progress and collection chunks for sequential outer events. Each
+// event's root batches and matrix rows can still use the shared Rayon pool;
+// the caller reports the first failure in canonical event order.
 pub(super) fn event_chunk_size(events: usize) -> usize {
     events
         .div_ceil(rayon::current_num_threads().clamp(1, 16))
@@ -377,7 +540,7 @@ impl ResponseProgress {
             state: std::sync::Mutex::new((started, 0)),
         }
     }
-    pub(super) fn completed(&self) {
+    pub(super) fn completed(&self) -> bool {
         let mut state = self.state.lock().expect("response progress mutex poisoned");
         state.1 += 1;
         if self.total >= 64 && (state.1 == self.total || state.0.elapsed().as_secs() >= 30) {
@@ -389,7 +552,39 @@ impl ResponseProgress {
                 self.started.elapsed().as_secs_f64()
             );
             state.0 = Instant::now();
+            return true;
         }
+        false
+    }
+}
+
+/// Operational wall time only. These counters never enter response payloads,
+/// dependency identities, or numerical admission decisions.
+#[derive(Default)]
+pub(super) struct ResponsePhaseTimings {
+    seconds: RefCell<[f64; 6]>,
+}
+#[derive(Clone, Copy)]
+pub(super) enum ResponsePhase {
+    Actions,
+    Projection,
+    Solve,
+    Roots,
+    Residual,
+    Encoding,
+}
+impl ResponsePhaseTimings {
+    pub(super) fn measure<T>(&self, phase: ResponsePhase, work: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let result = work();
+        self.seconds.borrow_mut()[phase as usize] += started.elapsed().as_secs_f64();
+        result
+    }
+    pub(super) fn report(&self) {
+        let [actions, projection, solve, roots, residual, encoding] = *self.seconds.borrow();
+        xc_core::progress_message!(
+            "[HP] prime-power response cumulative seconds: actions={actions:.3}; projection={projection:.3}; bordered_solve={solve:.3}; roots={roots:.3}; residual={residual:.3}; encoding={encoding:.3}"
+        );
     }
 }
 
@@ -510,6 +705,43 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn optional_geometry_is_evicted_before_rejecting_previously_admitted_response() {
+        let p = 64;
+        let weights = [
+            Float::with_val(p, 1),
+            Float::with_val(p, -1),
+            Float::with_val(p, 1) >> 5000u32,
+        ];
+        let poles = [-3, 3, 2].map(|v| Float::with_val(p, v));
+        let tangent = [
+            Float::with_val(p, 0),
+            Float::with_val(p, 0),
+            Float::with_val(p, -1) >> 5001u32,
+        ];
+        let roots = (0..40)
+            .map(|_| outcome(Float::with_val(p, 0)))
+            .collect::<Vec<_>>();
+        let owner = xc_core::RunResources::with_worker_limit(16 << 20, 2).unwrap();
+        let _scope = owner.enter();
+        let mut prepared =
+            PreparedRootResponses::with_budget(&weights, &poles, &roots, p, 8 << 20).unwrap();
+        prepared.guard_policy = root_response_math::GuardPolicy::new(p, 8192).unwrap();
+        let expected = prepared.values(&tangent).unwrap();
+        assert!(expected
+            .iter()
+            .all(|v| v.as_deref() == Some(lossless_hp_decimal(&Float::with_val(p, 1)).as_str())));
+        let usage = owner.usage();
+        let hold = owner
+            .try_reserve_working(owner.maximum_bytes() - usage.working_bytes - usage.retained_bytes)
+            .unwrap();
+        assert_eq!(prepared.values(&tangent).unwrap(), expected);
+        drop(hold);
+        assert!(!prepared.clear_optional());
+        drop(prepared);
+        assert_eq!(owner.usage().working_bytes, 0);
     }
 
     #[test]
@@ -644,7 +876,7 @@ mod tests {
                 },
             );
             let expected = reference(&unit, &poles, &roots, &tangent, bits);
-            for workers in [1, 2, 4] {
+            for workers in [1, 2, 4, 16] {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(workers)
                     .build()
@@ -666,6 +898,50 @@ mod tests {
         }
     }
     #[test]
+    fn root_work_queue_preserves_order_errors_and_worker_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owner = xc_core::RunResources::with_worker_limit(1 << 20, 2).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let values = ordered_root_work(127, 2, &owner, |index| {
+                assert_eq!(xc_core::RunResources::current().unwrap().worker_limit(), 2);
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                if index == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(index)
+            })
+            .unwrap();
+            assert_eq!(values, (0..127).collect::<Vec<_>>());
+            assert!(peak.load(Ordering::SeqCst) <= 2);
+            let error = ordered_root_work(127, 2, &owner, |index| {
+                if index == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    bail!("first root");
+                }
+                if index == 8 {
+                    bail!("later root");
+                }
+                Ok(index)
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "first root");
+            assert!(ordered_root_work::<usize>(0, 2, &owner, |_| unreachable!())
+                .unwrap()
+                .is_empty());
+            assert!(xc_core::RunResources::current().is_none());
+        });
+        pool.broadcast(|_| assert!(xc_core::RunResources::current().is_none()));
+        assert_eq!(owner.usage().working_bytes, 0);
+    }
+    #[test]
     fn prepared_root_responses_preserve_invalid_geometry_rejection() {
         let (unit, poles, roots, tangent) = source(192, 2, 1);
         let at_pole = vec![outcome(poles[0].clone())];
@@ -679,6 +955,76 @@ mod tests {
         assert!(PreparedRootResponses::new(&unit[..2], &poles, &roots, 192).is_err());
         let prepared = PreparedRootResponses::new(&unit, &poles, &roots, 192).unwrap();
         assert!(prepared.values(&tangent[..2]).is_err());
+    }
+    #[test]
+    fn root_response_guard_prepared_owner_survives_parallel_scope_and_replay() {
+        let p = 64;
+        let unit = [
+            Float::with_val(p, 1),
+            Float::with_val(p, -1),
+            Float::with_val(p, 1) >> 5000u32,
+        ];
+        let poles = [-3, 3, 2].map(|x| Float::with_val(p, x));
+        let tangent = [
+            Float::with_val(p, 0),
+            Float::with_val(p, 0),
+            Float::with_val(p, -1) >> 5001u32,
+        ];
+        let mut roots = (0..33)
+            .map(|_| outcome(Float::with_val(p, 0)))
+            .collect::<Vec<_>>();
+        roots[17] = EigenvalueResult::Failed {
+            iterations: 7,
+            reason: "retained failure".into(),
+        };
+        let mut expected = vec![Some(lossless_hp_decimal(&Float::with_val(p, 1))); roots.len()];
+        expected[17] = None;
+        for workers in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            for budget in [0, GEOMETRY_BUDGET_BYTES] {
+                let owner = xc_core::RunResources::with_worker_limit(1 << 20, 1).unwrap();
+                pool.install(|| {
+                    assert!(xc_core::RunResources::current().is_none());
+                    let mut prepared = {
+                        let _scope = owner.enter();
+                        PreparedRootResponses::with_budget(&unit, &poles, &roots, p, budget)
+                            .unwrap()
+                    };
+                    assert!(xc_core::RunResources::current().is_none());
+                    prepared.guard_policy = root_response_math::GuardPolicy::new(p, 4096).unwrap();
+                    assert!(prepared
+                        .values(&tangent)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("within 4096 guard bits"));
+                    prepared.guard_policy = root_response_math::GuardPolicy::new(p, 8192).unwrap();
+                    assert_eq!(prepared.values(&tangent).unwrap(), expected);
+                    assert_eq!(prepared.values(&tangent).unwrap(), expected);
+                    assert!(xc_core::RunResources::current().is_none());
+                    // Exhaust the mandatory workspace after releasing the
+                    // optional cache; cache eviction is tested separately.
+                    prepared.clear_optional();
+                    let stored = owner.usage().working_bytes;
+                    assert!(stored > 0);
+                    let held = owner
+                        .try_reserve_working(owner.maximum_bytes() - stored)
+                        .unwrap();
+                    assert!(prepared
+                        .values(&tangent)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("run memory budget exceeded"));
+                    drop(held);
+                    assert_eq!(owner.usage().working_bytes, stored);
+                    drop(prepared);
+                    assert_eq!(owner.usage().working_bytes, 0);
+                });
+                pool.broadcast(|_| assert!(xc_core::RunResources::current().is_none()));
+            }
+        }
     }
     #[test]
     fn fresh_seal_is_exact_and_never_available_for_cached_or_altered_data() {
@@ -724,6 +1070,78 @@ mod tests {
                 let candidate_seconds = started.elapsed().as_secs_f64();
                 assert_eq!(actual, expected);
                 eprintln!("RESPONSE_BENCH {}", serde_json::json!({"bits":bits,"dimension":801,"roots":400,"events":repeats,"workers":workers,"baseline_seconds":baseline_seconds,"preparation_seconds":preparation_seconds,"candidate_seconds":candidate_seconds,"payload_sha256":expected_digest.0,"bit_identical":true}));
+            });
+        }
+    }
+    #[test]
+    #[ignore = "explicit bounded root scheduling comparison"]
+    fn response_root_scheduling_benchmark() {
+        let bits = 3386;
+        let (unit, poles, roots, tangent) = source(bits, 200, 200);
+        for workers in [1, 4, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let prepared = PreparedRootResponses::new(&unit, &poles, &roots, bits).unwrap();
+                let original = || {
+                    prepared
+                        .roots
+                        .par_chunks(16.max(roots.len().div_ceil(workers)))
+                        .map(|roots| {
+                            let _scope = prepared.resources.enter();
+                            roots
+                                .iter()
+                                .map(|root| {
+                                    root.as_ref()
+                                        .map(|root| {
+                                            root_response_math::evaluate_with_policy(
+                                                &unit,
+                                                &tangent,
+                                                &poles,
+                                                None,
+                                                root.value,
+                                                prepared.guard_policy,
+                                                Some(&root.geometry),
+                                            )
+                                            .map(|x| lossless_hp_decimal(&x))
+                                        })
+                                        .transpose()
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()
+                        .map(|parts| parts.into_iter().flatten().collect::<Vec<_>>())
+                };
+                let mut old_seconds = 0.;
+                let mut new_seconds = 0.;
+                let mut digest = ContentDigest::sha256(b"");
+                for iteration in 0..4 {
+                    let measure = |f: &dyn Fn() -> Result<Vec<Option<String>>>| {
+                        let started = Instant::now();
+                        let result = f().unwrap();
+                        (result, started.elapsed().as_secs_f64())
+                    };
+                    let (old, new) = if iteration % 2 == 0 {
+                        (measure(&original), measure(&|| prepared.values(&tangent)))
+                    } else {
+                        let new = measure(&|| prepared.values(&tangent));
+                        (measure(&original), new)
+                    };
+                    assert_eq!(old.0, new.0);
+                    old_seconds += old.1;
+                    new_seconds += new.1;
+                    digest = ContentDigest::sha256(&serde_json::to_vec(&new.0).unwrap());
+                }
+                eprintln!(
+                    "ROOT_SCHEDULING {}",
+                    serde_json::json!({"workers":workers,"precision_bits":bits,
+                    "poles":401,"roots":200,"events":4,"original_seconds":old_seconds,
+                    "candidate_seconds":new_seconds,"payload_sha256":digest.0})
+                );
             });
         }
     }

@@ -1,5 +1,436 @@
 # Release notes
 
+## 0.17.0 (2026-10-19)
+
+Prime-power root responses reuse directed geometry at the guard precisions
+actually reached, including exact interval reciprocal endpoints. The optional
+cache follows the run memory budget and can be configured with
+`XC_ROOT_RESPONSE_GEOMETRY_BYTES`. Guard order, directed sums, rounding gates,
+numerical payloads, and mathematical artifact identities are preserved.
+
+Complete positive-root discovery uses configured run workspace instead of
+the legacy fixed numerator limit. Its even-source polynomial is built by
+the shared exact integer product tree, retaining identical rational
+coefficients, root-point rounding, and artifact identities. Reservations
+cover construction and isolation; progress messages identify both stages.
+
+Exact CUDA integer products pad the reduction dimension to complete 32-element
+tiles in synchronous and pipelined execution. This avoids rectangular-shape
+refusals observed with Ampere/cuBLAS. Admission includes the extra zero-filled
+storage; integer sums, final rounding, and mathematical artifact identities
+are unchanged.
+
+Residual and deviation profiles evaluate pure external targets concurrently,
+then retain the original point, arithmetic, and error order. Runtime target
+sampling can resume integrity-checked 16-point execution checkpoints across
+worker counts. Independent root responses use a memory-bounded work queue so
+slow guard attempts do not strand fixed root batches. Scientific payloads,
+precision policies, and mathematical artifact identities are unchanged.
+
+Continuous finite-interpolant energy evaluation accepts an explicit operational
+work ceiling through `XC_CONTINUOUS_MAX_OPERATIONS`. The default is unchanged.
+Refusals report both requested and allowed work; raising the ceiling retains the
+complete calculation, numerical payloads, and mathematical artifact identities.
+
+HP tridiagonal QR can resume exact sweep-boundary state from private, integrity-
+checked execution checkpoints. Inputs, requested precision, sweep controls,
+executable digest, native versions, and exponent range bind each checkpoint.
+The full spectrum, arithmetic order, convergence limits, and mathematical
+artifact identities are unchanged. Progress reports deflation and sweep counts.
+
+Run resource ledgers can reserve independent task workspaces and let foreground
+admission wait for their release, including during nested allocations. Dedicated
+tasks use separate capped ledgers; speculative work cannot consume the foreground
+budget permanently. Cooperative cancellation preserves completed artifacts.
+
+Pure external target evaluations for HP distance quadrature run concurrently under
+bounded worker and memory admission. The integrator consumes the same quadrature
+coordinates in their established order; arithmetic, norms, refinement decisions,
+error precedence, and serialized results are unchanged. Conditional refinement evaluates only the requested rules.
+Unsupported providers and unavailable parallel admission use the existing serial
+route. Published artifact identities are unchanged.
+
+Standalone prime-power responses use the existing bounded CPU/GPU action batches,
+retaining canonical event and error order. Repeated bordered-residual checks
+reuse admitted immutable source preparation at the actual working precision;
+independent residual rows preserve their scalar arithmetic and ordered output.
+The explicit CUDA policy applies to both standalone response and u-flow actions.
+
+Finite cluster complement verification reuses MPFR scratch and temporarily
+transposes its owned interval matrix for contiguous contraction reads, without
+another dense allocation. Pivot selection, directed accumulation, guard attempts,
+enclosure endpoints, and mathematical artifact identities are unchanged.
+Operational phase timings distinguish inverse construction, contraction proof,
+right-hand-side verification, and checkpoint storage.
+
+Exact stored-point root discovery constructs its secular numerator with a
+balanced dyadic integer product tree. Arb builds use FLINT polynomial products;
+the portable route uses the same exact tree. Canonical rational coefficients,
+root isolation, multiplicities, endpoint checks, and artifact identities are
+unchanged. The existing source and working-memory admission rules still apply.
+
+Certified finite-transform contours prepare immutable source and precision
+data once, including the near-carrier Taylor powers, and reuse them across
+segment evaluations. Each call owns its workspace under the shared memory
+budget. Interval operations and accumulation order are unchanged; source data
+are copied into the prepared context and released with its memory reservation.
+
+Cold HP finite-Dirichlet mode recovery shares one source-bound, working-precision
+guide spectrum across its selected vectors. It no longer repeats the complete
+QR solve for each vector. Each vector retains its directed index, residual, and
+angle gates; numerical operations after guide preparation and artifact identities
+are unchanged. Progress distinguishes shared guide construction from recovery.
+
+HP finite-Dirichlet prolate admission now estimates its banded recovery,
+piecewise-linear sampling, and cache serialization storage against the active
+run memory budget. It no longer applies Legendre polynomial work ceilings to
+this different numerical model. A planning API checks the same resources before
+primary acquisition. Numerical operations and artifact identities are unchanged.
+
+Exact root discovery within a requested stored-point window admits exact-polynomial construction and
+isolation against the configured run memory budget, with reservations retained
+through root isolation. This replaces the fixed aggregate coefficient ceiling;
+exact source values, endpoint semantics, rounding checks, and artifact identities
+are unchanged. Progress messages distinguish polynomial construction from
+isolation. Memory estimates are admission policy, not measured resident memory.
+
+Finite-Dirichlet prolate comparisons retain recovered mode vectors and sampled
+profiles as separate managed artifacts, with exact source dependencies. Warm
+reuse avoids inverse iteration and profile production; verification and refresh
+recompute them. The complete spectrum and established numerical values are
+unchanged. See [the numerical model](PROLATE_NUMERICAL_MODEL.md).
+
+Complete runtime target documents have configurable byte admission through
+`XC_TARGET_MAXIMUM_BYTES` (64 MiB by default, at most 4 GiB), additionally bounded
+by one eighth of an explicit research working-memory budget. Oversized documents
+and provider request frames are rejected without dropping coefficients.
+
+This release also includes the response-acceleration and retained-recovery updates below. Use the exact Git revision to identify a build.
+
+U-flow prime actions reuse exact coefficient rows across bounded event batches,
+with optional storage admitted by the shared memory budget. Exact quadrant
+rejection avoids rational allocation for ordinary stored quadrature nodes.
+Independent phase evaluations run in bounded parallel chunks with the same
+interval operations, native exponent range, and ordered outputs.
+Successful values, signed zeros, ordered failures, and artifact identities are
+preserved. An explicit CUDA route contracts common-denominator coefficients
+using exact integer products and rigorous interval radii, retaining the original
+unique-rounding requirement. Workspace, tile rows, host workers, and event batch
+size are configurable; CPU batching remains the default. See
+[response performance](CCM_RESPONSE_PERFORMANCE.md) for scope and controls.
+
+Exact interval contractions classify native-range, midpoint/radius, and first
+product-preparation refusals as admission failures before any backend executes.
+Failures after backend entry remain execution failures.
+
+Prime-response event evaluation and verifying replay now retain the shared run
+resource owner. Outer events execute sequentially while rows and root batches
+remain parallel, avoiding simultaneous reservations for the whole worker pool.
+Standalone exact point conversion respects the caller's explicit budget.
+Implicit root responses support a configurable extra-precision guard ceiling
+with admission for each actual attempt and unchanged correct-rounding checks.
+Retained-source recovery can reconstruct explicitly finite runtime-reference
+jets from authenticated projection coefficients, without evaluating a provider
+or inferring an infinite tail. Previously successful artifact values and keys
+are unchanged.
+
+Stored-point response dot products retain their previous interval attempts and
+then use an admitted exact-product sum when cancellation prevents resolution.
+The shared response guard setting also applies to downstream stored-point
+helpers, with workspace admission for extended attempts. Completed u-flow
+derivative actions have validated local, build-bound checkpoints before channel
+solves. Earlier successful artifact bytes and identities remain unchanged;
+resource refusals and unresolved mathematical quantities remain explicit.
+
+Finite signed and indexed transforms can retry cancellation-limited inputs
+with additional directed-arithmetic precision. The legacy precision policy
+and cache identity are tried first; only exhaustion of that policy selects a
+separately identified extended attempt. Previously successful calculations
+retain their arithmetic and artifact identities. Automatic retained-input
+preparation uses the same extended transform support. Accuracy requirements,
+source-state scope, and infinite-tail qualifications are unchanged.
+
+Finite prime-power and u-flow responses now admit exact point-vector
+conversion using its own allocation estimate instead of the unrelated exact
+polynomial-construction estimate. Reservations include source exponent spans
+and concurrent rational row workspace. Insufficient configured memory still
+refuses the operation before conversion; exact arithmetic is unchanged.
+
+Pure external-provider sampling now distributes interleaved points across
+persistent workers, balancing uneven evaluation costs while preserving point
+order, arithmetic, and the lowest failing-point result. Worker threads inherit
+the run resource owner. New phase timings and rate-limited completion counts
+separate provider setup and sampling from Fourier projection and checkpoint
+work. Provider authentication, numerical payloads, and artifact identities are
+unchanged by this scheduling update.
+
+Exact HP products that exceed the single-pass residue family's reconstruction
+capacity now use bounded signed-magnitude limb products on the selected backend.
+Their shifted integer results are combined exactly before any Float rounding.
+This allows high-precision shifted LU solves to continue using CUDA while
+preserving successful arithmetic, factor identities, and saved artifact reuse.
+Aggregate operation admission and retained workspace include the wider route;
+device errors still propagate and no partial product is accepted.
+
+Retained arithmetic preparation streams bounded row batches, releases exact
+coefficient storage between stages, and defers dense block workspace until its
+earlier owners are dropped. `XC_RESEARCH_PREP_WORKERS` controls preparation
+concurrency independently of the global numerical pool and GPU scheduling.
+For supported dyadic inputs, exact forms use bounded integer products and
+triangular accumulators instead of retaining the full matrix-vector product.
+The original rational route remains available outside the proved integer domain.
+Exact tail splitting streams its differences and admits promoted output before
+allocation, while preserving conversion and precision-check order.
+Automatic finite-matrix diagnostics retain packed intervals, generate canonical
+endpoint text on demand, borrow unchanged shifted entries, and transfer their
+converted matrix into interval inertia. Reservations follow each diagnostic
+and attempted precision guard. Numerical order, request hashes, retained
+artifacts, and mathematical checks are preserved; memory stops remain
+unretained. These reservations are allocation estimates, not process RSS limits.
+
+CUDA product logging now defaults to the first admission and rate-limited
+process-wide summaries of successful exact products and per-device residue
+work. `XC_CUDA_LOG=verbose` retains per-product details; `XC_CUDA_TIMINGS=1`
+remains independent. Errors, numerical execution, resource admission, product
+reports, and artifact identities are unchanged.
+
+Filtered Git metadata fetches now clear implicit-fetch configuration on both
+success and failure. A failed configuration cleanup refuses reuse of the
+affected session until explicit session cleanup. Local-commit cache hits retain
+their existing command count. Artifact identities, payload authentication, and
+publication compare-and-swap checks are unchanged.
+
+Automatic dense LU workspace can grow after allocation-admission refusals when
+wide dyadic exponent spans make CRT storage exceed its nominal-precision
+estimate. Each retry releases the previous attempt and reserves its new
+allowance within the original available run memory and automatic ceiling.
+Explicit workspace overrides remain hard limits. Numerical arithmetic and
+artifact identities are unchanged; arithmetic and device execution errors
+still propagate without retry.
+
+Natural-evenness measurement now has an explicit-cache entry point so callers
+can retain its results and defer publication until a campaign finishes. The
+ordinary managed entry point retains immediate finalization. Both routes use
+the same numerical calculation, resource checks, and artifact identities.
+Both public evenness entry points now share the primary path's run-resource
+setup: an existing owner is inherited, or the configured working budget and
+current pool establish one across source construction and both solves. This
+removes the unscoped 1 GiB LU availability fallback on those routes, while
+preserving the automatic ceiling, explicit overrides, arithmetic, and successful
+artifact bytes. Shared-budget and pool-limit violations remain errors, and the
+previous resource scope is restored on return or unwinding.
+
+Exact CUDA products now zero-pad reduction dimensions to complete 16-element
+tiles in both synchronous and pipelined execution. This avoids unsupported
+integer GEMM shapes on recent CUDA libraries while preserving exact products
+and artifact identities. Workspace admission includes the additional padding.
+
+Publication now writes an operational attempt summary outside artifact
+identities, distinguishes a closed telemetry handle from successful execution,
+and shares one staged inventory snapshot and authenticated draft facts across
+destination checks within each finalization. Explicit
+retained-queue retry preserves normal author, mutation, nonempty-inventory and
+destination checks. Resource progress identifies reservation estimates rather
+than measured RSS and prints unlimited worker admission without a raw sentinel.
+
+CUDA products automatically prefer two pinned transfer lanes when there are
+at least 128 residue primes per admitted device. Both lanes are packed before
+their transfers and exact batched digit products are submitted. Planning keeps
+the synchronous path if optional symbols or additional workspace are unavailable,
+or if the pipeline would lose an admitted device. Explicit overrides remain
+available; execution and arithmetic failures never trigger a retry on another
+path. Exact CPU comparisons, lane reuse, wide CRT, and sanitizer checks passed
+on one RTX 5090; this does not establish complete-workload or multi-device speedups.
+
+Publication routes each encoded part directly to its authenticated source root
+and batches missing-path checks by immutable Git commit. Bounded negative lookup
+entries cannot survive a commit change. Cancellation, byte verification, routing,
+authorization, and atomic compare-and-swap remain required. These changes reduce
+local filesystem and Git-process overhead without changing artifact identities.
+
+Retained arithmetic input preparation now admits checked problem shapes against
+the configured shared memory budget rather than a fixed mode-count ceiling.
+Exact rational scratch, output serialization, and checkpoint reads are bounded;
+the bundled ordinate table remains an explicit mathematical prerequisite.
+Numerical formulas, accumulation order, and successful artifact identities stay
+unchanged.
+
+Retained-source capture recovery can authenticate existing state, matrix, and
+root parents without an acquisition fallback. A missing cluster basis may carry
+an explicit source-bound preparation assessment. This records measured
+norm, Rayleigh quotient, and residual with unresolved cluster coverage; it does
+not establish a gap, isolation, simplicity, or a projection bound. Existing
+resolved cluster reports retain their identities.
+
+Unresolved cluster assessments validate their retained eigenvalue at the
+authenticated source precision, matching the precision used to serialize that
+measurement. Parsing its round-trip decimal at a higher working precision no
+longer causes a false exact-equality rejection. This changes no numerical
+calculation, report bytes, artifact identity, or unresolved scientific conclusion;
+source binding and rejection of altered retained eigenvalues remain required.
+
+Research response preparation reuses exact rational coefficients and common
+directed quadrature factors without changing accumulation order. Prime-power
+and u-flow diagnostics can share a run-owned bordered factorization after
+binding the exact matrix, state, precision, exponent range, and arithmetic
+identity. Retention is optional, resource-admitted, and skipped when it would
+consume required working memory. Warm artifact reuse does not construct a
+factorization. Numerical payloads and cache identities are unchanged.
+
+Managed publication reads verified encoded parts from their original staging
+roots and retains immutable Git sessions across dependency waves. Each
+transaction still refreshes authorization, routing, and heads; acquires its
+required lease; and performs atomic compare-and-swap. Shared temporary-disk
+accounting includes every retained session. Ref verification batches related
+queries, and `XC_PUBLICATION_FAMILY_WORKERS` allows a positive concurrency
+limit with the existing default of four. See
+[publication performance](PUBLICATION_PERFORMANCE.md). These changes preserve
+artifact bytes and do not require cache resets.
+
+HP CCM primary LU now uses dimension-bound panels and exact Schur products by
+default for every dimension greater than one, including small claims. Initial
+and shifted-refinement factorizations, standalone evenness, and bordered
+prime-power/u-flow response solves use the same rule. Admitted CUDA devices
+share prime-residue work; CPU execution retains identical product arithmetic.
+The `hp` feature includes runtime discovery of CUDA 12/13 and cuBLAS, without a
+CUDA compile/link dependency. Auto may choose CPU before dispatch; selected-GPU
+failures propagate, and forced CUDA refuses unavailable execution. This changes
+primary factorization/eigenpair identities and standalone cache stamps, including
+the `Require` route. Both response envelopes independently stamp the arithmetic
+at their bordered dimension `N + 2` before lookup. These artifacts require reader
+0.17.0. Historical artifacts are preserved, and unchanged source matrices remain
+reusable. This is a CCM LU integration, not GPU execution of every diagnostic or
+a measured claim-speedup guarantee. See [controls and arithmetic](HIGH_PRECISION_PRODUCTS.md).
+
+CUDA discovery reports visible ordinals and physical PCI bus IDs. Each admitted
+GPU owns its handle and buffers, receives one reserved prime-residue product,
+and then consumes a dynamic shared queue. Independent residue products require
+neither peer access nor NVLink. Matching worker allowances reuse the caller's
+Rayon pool instead of allocating a second pool for each product. Per-device `successful_moduli` counts record
+actual work, and successful return requires checked cleanup and restoration of
+the host worker's previous device. Admission remains bounded by workers, prime
+count, aggregate workspace, and configurable free-memory headroom. CPU and GPU
+execution retain identical exact integer results and the common LU arithmetic
+identity `dense_lu_partial_pivot_dimension_panel512_exact_schur_v1`. Local
+hardware validation used one RTX 5090 with CUDA runtime 13.2; physical two-GPU
+validation and complete-workload timing remain for server runs.
+
+Dense LU output tiling also handles pre-execution workspace refusals from the
+integer bridge and modular reconstruction planner. A tile that fits initial
+preparation but exceeds the combined product allowance is split before any
+output update. Complete panel inner sums, rounding, and cache identities remain
+unchanged. Backend execution and arithmetic-domain errors still propagate;
+an irreducible tile that cannot fit the configured allowance still refuses.
+
+The optional `arb` feature provides certified, nearest-even Gauss-Legendre
+nodes and weights. Select `HighPrecConfig::archimedean_gl_generator =
+GaussLegendreGenerator::ArbCertified` for Archimedean assembly. The default
+remains `LegacyNewton`, with unchanged table, integral, and matrix identities.
+The alternate generator has distinct identities before parent lookups and
+retains rounding evidence; its certification does not bound quadrature
+truncation or the assembled operator error. See
+[high-precision products and quadrature](HIGH_PRECISION_PRODUCTS.md).
+
+Arb builds use the installed shared GMP/MPFR libraries for both Rug and FLINT,
+avoiding mixed bundled and system native contexts. Matching development headers
+and runtime libraries with thread-safe MPFR are required; a native build probe
+checks that prerequisite. FLINT must be built with thread-local storage,
+which the bridge enforces at compile time. Builds without Arb retain bundled
+GMP 6.3.0 and MPFR 4.2.2. The qualified Arb system stack uses FLINT 3.0.1,
+GMP 6.3.0, and MPFR 4.2.1.
+
+Archimedean integration releases completed batches of prepared node tables.
+Successful arithmetic and result ordering are unchanged. Concurrent failures
+are selected deterministically by table order, then mode index; resource
+admission also checks the actual stored-point exponent spans before expansion.
+Ground-index admission accounts for live MPFR intervals and exact pivot
+temporaries rather than charging removed dense rational matrices. These are
+ownership estimates under the run budget, not process-RSS guarantees.
+
+Large managed ZIP writes use a buffered staging file instead of retaining a
+second complete compressed object in memory. Encoding settings, object bytes,
+logical digests, and artifact identities are unchanged. Publication verifies
+concurrent existing objects and cleans up owned staging files on ordinary
+failure paths. Filesystems without hard links retain the earlier buffered
+publication behavior. Optional performance reports separate compression,
+synchronization, hashing, and object/manifest publication time.
+
+Explicit product APIs provide exact stored-dyadic HP products, exact integer
+modular products, and a CUDA INT8 backend with full CRT reconstruction.
+They enforce explicit shape, precision, exponent, operation, and workspace
+limits. HP outputs select one final nearest or directed rounding; this generally
+differs from legacy sequential rounding. Integrated CCM blocked LU uses these products;
+the explicit low-level legacy LU API retains its prior arithmetic. See [high-precision products](HIGH_PRECISION_PRODUCTS.md)
+for features, build requirements, resource limits, and the arithmetic contract.
+
+Retained Tau decoding uses two typed passes over authenticated seekable payload
+streams. Metadata and shared resource checks precede the final Float allocation;
+neither full JSON bytes nor decimal entry strings are retained in a second full matrix.
+Stored values, signed zeros, source admission, and exact-symmetry checks are
+preserved. Malformed scalar errors can include JSON location context. Fixed
+payload and matrix-memory ceilings are replaced by the caller's run budget;
+owned clones share one reservation. Read-only cache sessions honor larger explicit
+budgets. Backfill and retained finite replay use these readers without rerunning
+primary computations. Scratch disk must accommodate the logical decoded payload.
+Automatic finite diagnostics above dimension 512 use checked shape/work admission
+and a new identity only for those formerly blocked shapes. Convergence input-size
+checks and hashing stream without a second complete JSON allocation.
+
+Arb workspace admission counts byte-sized limb storage rather than interpreting
+bit counts as bytes. GL mapping, integral batches, and the SafeCapped owner
+callback propagate cooperative run resources. Explicit source-run budgets are
+preserved; mathematical precision, integrity, and proof checks are unchanged.
+
+This version changes public Rust APIs. Solver reports expose operator-application
+error evidence, `ApproximationKind` has an `OperatorApplication` variant, and
+`CcmStoredStateResolution::residual_angle_upper` is optional. Applications that
+construct reports or exhaustively match these types must update their code.
+See [execution and evidence contracts](EXECUTION_EVIDENCE_CONTRACTS.md) for
+migration and resource-lifetime details.
+
+Stored-state resolution separates residual inclusion from conclusions requiring
+an admitted ground index. The default `Require` policy preserves the 0.16
+resolution record format; the default LU change separately versions its
+Weil-eigenpair semantic identity. The opt-in
+`RecordOutcome` policy uses a distinct resolution identity; when index admission
+fails, separation and angle conclusions are unavailable with an explicit reason.
+Its earlier eigenpair records and dependent results require recomputation.
+The policy, rather than the eventual proof outcome, determines the identity.
+Native operator cross-check records use v3 semantics to include action-error
+agreement. Default matrix, quadrature, and sector-gap-certificate identities and
+their managed artifact floors remain unchanged at 0.16.0. There is no general
+artifact cache reset. New artifacts record producer 0.17.0; publication retains
+the existing producer-version monotonicity rule.
+
+Validated runtime values use explicit run lifetimes, shared ownership, and
+runtime-byte accounting. The legacy owned memoized resolver still validates
+its result but no longer retains an implicit process-wide copy. Retained runs
+share decoded matrices and input admission, account for active diagnostic
+workspaces, and execute diagnostics inline under the shared run budget so
+speculative work cannot consume their required memory allowance. This removes
+speculative overlap for budgeted capture. Arithmetic-energy admission follows
+its owned arrays and streamed matrix actions, with the full guard ladder and
+report serialization included. It no longer charges for dense scratch copies
+that the evaluator does not allocate. Resource estimates are conservative and
+can block a diagnostic when its configured
+budget is insufficient; they are not measurements of process RSS.
+
+Ground-index checks avoid redundant decimal conversions, and directed inertia
+uses reusable scratch values without changing arithmetic order. Root validation
+can run concurrently with stable result and error ordering. Execution
+checkpoints remain build-bound and are revalidated before reuse.
+
+Operator reports preserve declared approximation allowances separately from
+ordinary scalar roundoff. Inconsistent coverage cardinalities are reported as
+unassessed. Decimal formatting retains the established output while avoiding
+allocations proportional to exponent magnitude. Parallel MPFR entry points
+check worker exponent-range agreement.
+
+External-provider failures retain bounded diagnostics and exit information
+without echoing untrusted protocol fields. In particular, malformed protocol
+version values are no longer reproduced verbatim in error messages.
+
+
 ## 0.16.1 (2026-10-16)
 
 Version 0.16.1 is the 0.16.0 release as amended through 2026-10-15, published

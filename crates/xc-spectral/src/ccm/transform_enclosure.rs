@@ -48,11 +48,11 @@ mod certified {
         let digits = Some((u64::from(x.precision()) * 30103 / 100000 + 10) as usize);
         out.insert(
             format!("{name}_lower"),
-            x.lower().to_string_radix_round(10, digits, Round::Down),
+            xc_numerics::fmt::decimal_string_round(x.lower(), digits, Round::Down),
         );
         out.insert(
             format!("{name}_upper"),
-            x.upper().to_string_radix_round(10, digits, Round::Up),
+            xc_numerics::fmt::decimal_string_round(x.upper(), digits, Round::Up),
         );
         Ok(())
     }
@@ -92,8 +92,15 @@ mod certified {
         }
         assert_eq!(checked, 18);
     }
-    #[test]
-    fn retained_contour_endpoints_match_fresh_evaluation_at_any_thread_count() {
+    #[cfg(test)]
+    fn contour_fixture_run(
+        run: usize,
+        reuse: bool,
+        prepared: bool,
+        threads: usize,
+        resources: Option<&xc_core::RunResources>,
+        pressure_bytes: u64,
+    ) -> Result<(String, usize, u128)> {
         // Each run binds a distinct state identity, so contour checkpoints from
         // another run can never stand in for an evaluation.
         let nonce = format!(
@@ -124,31 +131,100 @@ mod certified {
                 selection_policy: None,
             }
         };
-        let run = |run: usize, reuse: bool, threads: usize| {
-            let s = state(run);
-            let o = ExtensionOptions::for_source(&s);
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap()
-                .install(|| {
-                    // The traversal runs on the calling thread, which owns the switch.
-                    ENDPOINT_REUSE.with(|state| state.set((reuse, 0)));
-                    let analysis = analyze(&s, None, &o, None, None, s.precision).unwrap();
-                    (
-                        serde_json::to_string(&analysis).unwrap(),
-                        ENDPOINT_REUSE.with(|state| state.get().1),
-                    )
-                })
+        let s = state(run);
+        let o = ExtensionOptions::for_source(&s);
+        let roots = RetainedRoots {
+            manifest: s.manifest.clone(),
+            secular_manifest: s.manifest.clone(),
+            dataset: DatasetSpec {
+                schema_version: 1,
+                role: "retained_ccm_roots".into(),
+                attribution: "finite transform fixture".into(),
+                coordinate: "mellin_t".into(),
+                precision_bits: 128,
+                points: [Some("0"), Some("0.00000000000000001"), Some("1.25"), None]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, value)| EvaluationPoint {
+                        ordinal: j + 1,
+                        value: value.map(str::to_owned),
+                        source_status: "fixture".into(),
+                    })
+                    .collect(),
+            },
+            completeness: "partial".into(),
+            acquisition: serde_json::Value::Null,
+            cutoff: s.cutoff.clone(),
+            modes: s.modes,
         };
-        let (fresh, _) = run(0, false, 1);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                let _scope = resources.map(xc_core::RunResources::enter);
+                // The traversal owns these switches; workers read captured values.
+                ENDPOINT_REUSE.with(|state| state.set((reuse, 0)));
+                let previous_prepared = PREPARED_TRANSFORM.with(|state| state.replace(prepared));
+                let previous_pressure =
+                    CONTOUR_TEST_PRESSURE_BYTES.with(|state| state.replace(pressure_bytes));
+                let start = std::time::Instant::now();
+                let analysis = analyze(&s, Some(&roots), &o, None, None, s.precision);
+                let elapsed = start.elapsed().as_nanos();
+                PREPARED_TRANSFORM.with(|state| state.set(previous_prepared));
+                CONTOUR_TEST_PRESSURE_BYTES.with(|state| state.set(previous_pressure));
+                Ok((
+                    serde_json::to_string(&analysis?)?,
+                    ENDPOINT_REUSE.with(|state| state.get().1),
+                    elapsed,
+                ))
+            })
+    }
+    #[test]
+    fn retained_contour_endpoints_match_fresh_evaluation_at_any_thread_count() {
+        let (fresh, _, _) = contour_fixture_run(0, false, false, 1, None, 0).unwrap();
         let mut index = 0;
         for threads in [1, 4] {
             for _ in 0..2 {
                 index += 1;
-                let (reused, count) = run(index, true, threads);
+                let (reused, count, _) =
+                    contour_fixture_run(index, true, true, threads, None, 0).unwrap();
                 assert_eq!(reused, fresh);
                 assert!(count > 0, "contour fixture shares no endpoints");
+            }
+        }
+    }
+    #[test]
+    fn contour_workspace_refusal_returns_error_and_more_budget_preserves_report() {
+        let small = xc_core::RunResources::with_worker_limit(1 << 20, 4).unwrap();
+        let error = contour_fixture_run(0, true, true, 4, Some(&small), 512 << 10).unwrap_err();
+        assert!(error.is::<xc_core::ConfigError>());
+        assert!(error.to_string().contains("run memory budget exceeded"));
+        assert_eq!(small.usage().retained_bytes, 0);
+        assert_eq!(small.usage().working_bytes, 0);
+        let large = xc_core::RunResources::with_worker_limit(8 << 20, 4).unwrap();
+        let (report, _, _) =
+            contour_fixture_run(1, true, true, 4, Some(&large), 512 << 10).unwrap();
+        let (reference, _, _) = contour_fixture_run(2, false, false, 1, None, 0).unwrap();
+        assert_eq!(report, reference);
+        assert_eq!(large.usage().retained_bytes, 0);
+        assert_eq!(large.usage().working_bytes, 0);
+    }
+    #[test]
+    #[ignore = "local bounded complete-contour timing comparison; run explicitly"]
+    fn benchmark_prepared_complete_contour() {
+        let (reference, _, _) = contour_fixture_run(0, false, false, 1, None, 0).unwrap();
+        for repeat in 0..5 {
+            let routes = if repeat % 2 == 0 {
+                [(false, 1), (true, 1), (true, 4)]
+            } else {
+                [(true, 4), (true, 1), (false, 1)]
+            };
+            for (prepared, threads) in routes {
+                let (report, _, elapsed) =
+                    contour_fixture_run(repeat + 1, true, prepared, threads, None, 0).unwrap();
+                assert_eq!(report, reference);
+                eprintln!("complete_contour prepared={prepared} threads={threads} repeat={repeat} elapsed_ns={elapsed}");
             }
         }
     }
@@ -218,12 +294,19 @@ mod certified {
             a.1.mul(&b.0).sub(&a.0.mul(&b.1)).div(&den)?,
         ))
     }
-    fn pair(s: &RetainedState, re: &I, im: &I) -> Result<(I, I, I, I)> {
+    fn pair(
+        s: &RetainedState,
+        prepared: Option<&arb_bridge::PreparedFiniteTransform>,
+        re: &I,
+        im: &I,
+    ) -> Result<(I, I, I, I)> {
         // The bridge is the existing plus-sign finite Fourier kernel.
         // Reflect its box and reverse its derivative to evaluate exp(-i*z*x)
         // at the original reported coordinates, including the entire contour.
-        let (vr, vi, dr, di) =
-            arb_bridge::finite_transform(&s.cutoff, &s.coefficients, &re.neg(), &im.neg())?;
+        let (vr, vi, dr, di) = match prepared {
+            Some(prepared) => prepared.evaluate(&re.neg(), &im.neg())?,
+            None => arb_bridge::finite_transform(&s.cutoff, &s.coefficients, &re.neg(), &im.neg())?,
+        };
         Ok((vr, vi, dr.neg(), di.neg()))
     }
 
@@ -336,11 +419,22 @@ mod certified {
         true
     }
     #[cfg(not(test))]
+    fn prepared_transform() -> bool {
+        true
+    }
+    #[cfg(not(test))]
     fn record_endpoint_reuses(_count: usize) {}
     #[cfg(test)]
     std::thread_local! {
         /// Whether retained endpoints are reused, and how many reuses occurred.
         static ENDPOINT_REUSE: std::cell::Cell<(bool, usize)> = const { std::cell::Cell::new((true, 0)) };
+        static PREPARED_TRANSFORM: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        // Deterministic retained pressure after the origin workspace releases.
+        static CONTOUR_TEST_PRESSURE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    #[cfg(test)]
+    fn prepared_transform() -> bool {
+        PREPARED_TRANSFORM.with(std::cell::Cell::get)
     }
     /// Read on the thread that runs the traversal.
     #[cfg(test)]
@@ -460,8 +554,11 @@ mod certified {
         ] {
             put(&mut out.values, name, v);
         }
+        let prepared = prepared_transform()
+            .then(|| arb_bridge::PreparedFiniteTransform::new(&s.cutoff, &s.coefficients, p))
+            .transpose()?;
         let evaluate = |re: &I, im: &I| -> Result<(I, I, I, I)> {
-            let (mut a, mut b, mut d, mut e) = pair(s, re, im)?;
+            let (mut a, mut b, mut d, mut e) = pair(s, prepared.as_ref(), re, im)?;
             if let Some(error) = &source_error {
                 let im_abs = im.lower().clone().abs().max(&im.upper().clone().abs());
                 let allowance = l.sqrt()?.mul(&I::point(im_abs).mul(&half).exp()).mul(error);
@@ -477,6 +574,16 @@ mod certified {
         let anchor = evaluate(&zero, &zero)?;
         bounds(&mut out.values, "origin_real", &anchor.0)?;
         bounds(&mut out.values, "origin_imaginary", &anchor.1)?;
+        #[cfg(test)]
+        let _test_pressure = CONTOUR_TEST_PRESSURE_BYTES.with(|bytes| {
+            (bytes.get() != 0)
+                .then(|| {
+                    xc_core::RunResources::current()
+                        .expect("test contour pressure requires run resources")
+                        .try_reserve_retained(bytes.get())
+                })
+                .transpose()
+        })?;
         let vertices = [
             (left.clone(), bottom.clone()),
             (right.clone(), bottom),
@@ -532,10 +639,12 @@ mod certified {
                 .insert(key, (x.clone(), value.clone()));
             Ok(value)
         };
-        // A segment either certifies its image and argument increment or fails
-        // (an evaluation error counts as a failure, as before).
-        let evaluate_segment = |seg: &Segment| -> Option<SegmentEnclosure> {
-            (|| -> Result<Option<SegmentEnclosure>> {
+        // Numerical failures retain their previous unresolved-segment behavior.
+        // Operational resource refusals are retained until canonical traversal
+        // consumes the segment, so speculative completion cannot choose an error
+        // or turn insufficient memory into a cacheable numerical conclusion.
+        let evaluate_segment = |seg: &Segment| -> Result<Option<SegmentEnclosure>> {
+            let result = (|| -> Result<Option<SegmentEnclosure>> {
                 let (re, im, dr, di) = evaluate(
                     &interval(&seg.a.0, &seg.b.0)?,
                     &interval(&seg.a.1, &seg.b.1)?,
@@ -551,9 +660,12 @@ mod certified {
                     return Ok(None);
                 }
                 Ok(Some((re, im, dr, di, turn)))
-            })()
-            .ok()
-            .flatten()
+            })();
+            match result {
+                Err(error) if error.is::<xc_core::ConfigError>() => Err(error),
+                Err(_) => Ok(None),
+                result => result,
+            }
         };
         let segment_key = |seg: &Segment| -> Result<String> {
             let mut values = std::collections::BTreeMap::new();
@@ -576,7 +688,8 @@ mod certified {
         // pass; a speculative child is only wasted when the budget stops a split.
         xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
         let width = rayon::current_num_threads().max(1);
-        let mut evaluated = std::collections::HashMap::<String, Option<SegmentEnclosure>>::new();
+        let mut evaluated =
+            std::collections::HashMap::<String, Result<Option<SegmentEnclosure>>>::new();
         let _stage = Stage::new("adaptive certified contour");
         while let Some(seg) = pending.pop() {
             let mut rr = row(out.rows.len() + 1, "contour_segment");
@@ -624,7 +737,7 @@ mod certified {
                         .collect::<Vec<_>>();
                     let mut children = Vec::new();
                     for ((wave_key, segment), result) in wave.into_iter().zip(results) {
-                        if result.is_none() && segment.depth < policy.maximum_depth {
+                        if matches!(result, Ok(None)) && segment.depth < policy.maximum_depth {
                             let (a, b) = split(&segment, p);
                             for child in [a, b] {
                                 let child_key = segment_key(&child)?;
@@ -641,7 +754,7 @@ mod certified {
             }
             let result = evaluated
                 .remove(&key)
-                .expect("the wave evaluates the current segment");
+                .expect("the wave evaluates the current segment")?;
             match result {
                 Some((re, im, dr, di, turn)) => {
                     for (name, v) in [

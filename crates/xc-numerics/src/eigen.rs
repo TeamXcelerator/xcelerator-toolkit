@@ -29,18 +29,28 @@ use rayon::prelude::*;
 use rug::{ops::Pow, Assign, Float};
 use xc_core::EigenpairDiagnostics;
 
+#[path = "eigen_checkpoint.rs"]
+mod checkpoint;
 #[path = "eigen_recovery.rs"]
 mod recovery;
 #[path = "eigen_sturm.rs"]
 mod sturm;
 pub use recovery::{
     dense_symmetric_eigenpair_at_index_hp, dense_symmetric_eigenvector_for_value_detailed_hp,
-    tridiag_eigenvector_for_value_detailed_hp, HpEigenvectorRecovery, HpEigenvectorRecoveryFailure,
+    tridiag_eigenvector_for_value_detailed_hp, validate_tridiag_eigenvector_hp,
+    HpEigenvectorRecovery, HpEigenvectorRecoveryFailure, TridiagonalEigenvectorRecoveryHp,
     DENSE_EIGENVECTOR_SEMANTICS,
 };
 
 /// Arithmetic identity for retained QR results.
 pub const TRIDIAG_QR_SEMANTICS: &str = "tridiag-qr-working-unit-deflation-exponent-safe-hypot-v3";
+
+/// Disable QR execution checkpoints on this thread for a fresh-computation or
+/// independent-verification route. Restores the previous policy on unwind.
+/// Call this inside an explicit worker callback when dispatching to other threads.
+pub fn without_qr_checkpoints<T>(f: impl FnOnce() -> T) -> T {
+    checkpoint::without(f)
+}
 
 /// Relative working-unit threshold for symmetric tridiagonal QR deflation.
 fn qr_tolerance(prec: u32) -> Float {
@@ -172,6 +182,60 @@ pub fn tridiag_eigenvalues_hp_with_options(
     }
     e.push(hp_zero(prec)); // sentinel; index n-1 is always 0
 
+    let mut checkpoint = checkpoint::Checkpoint::configured(diag, off_diag, prec, options);
+    let position = checkpoint
+        .as_ref()
+        .and_then(|c| c.load(&mut d, &mut e, prec, options));
+    if position.is_none() {
+        // A rejected checkpoint can have filled scratch values before its seal
+        // failed. Restore every entry before performing any numerical operation.
+        for (v, source) in d.iter_mut().zip(diag) {
+            v.assign(source);
+        }
+        for (v, source) in e.iter_mut().zip(off_diag) {
+            v.assign(source);
+        }
+        e[n - 1].assign(0);
+    }
+    let mut progress = std::time::Instant::now();
+    let resources = xc_core::RunResources::current();
+    if let Some(r) = &resources {
+        r.check_cancelled()?;
+    }
+    tridiag_qr_resume(
+        d,
+        e,
+        prec,
+        options,
+        position.unwrap_or((0, 0)),
+        |l, sweeps, d, e| {
+            if progress.elapsed().as_secs() >= 30 {
+                xc_core::progress_message!(
+                    "[HP QR] dimension={n}, deflated={l}/{n}, current sweeps={sweeps}"
+                );
+                progress = std::time::Instant::now();
+            }
+            if let Some(c) = &mut checkpoint {
+                c.save_due(l, sweeps, d, e, l == n);
+            }
+            if let Some(r) = &resources {
+                r.check_cancelled()?;
+            }
+            Ok(())
+        },
+    )
+}
+
+fn tridiag_qr_resume(
+    mut d: Vec<Float>,
+    mut e: Vec<Float>,
+    prec: u32,
+    options: TridiagQrOptions,
+    position: (usize, usize),
+    mut boundary: impl FnMut(usize, usize, &[Float], &[Float]) -> Result<()>,
+) -> Result<Vec<Float>> {
+    let n = d.len();
+
     let tol = qr_tolerance(prec);
     let max_iter = options.max_iterations_per_eigenvalue;
 
@@ -205,8 +269,8 @@ pub fn tridiag_eigenvalues_hp_with_options(
     // can be reused across sweeps.
 
     // Deflate eigenvalues one by one from the top of the active region [l..n-1].
-    for l in 0..n {
-        let mut iter_count = 0usize;
+    for l in position.0..n {
+        let mut iter_count = if l == position.0 { position.1 } else { 0 };
         loop {
             // Find the smallest m ≥ l such that |e[m]| is negligible
             // relative to |d[m]| + |d[m+1]|. After this point the matrix
@@ -234,6 +298,7 @@ pub fn tridiag_eigenvalues_hp_with_options(
 
             // If e[l] is already negligible, eigenvalue at d[l] is converged.
             if m == l {
+                boundary(l + 1, 0, &d, &e)?;
                 break;
             }
 
@@ -377,6 +442,7 @@ pub fn tridiag_eigenvalues_hp_with_options(
                 e[l].assign(&g);
                 e[m] = hp_zero(prec);
             }
+            boundary(l, iter_count, &d, &e)?;
             // Loop back to find new m; eventually m == l and we break.
         }
     }
@@ -1337,6 +1403,7 @@ pub fn assess_symmetric_reduction_hp(
     q: &[Float],
     prec: u32,
 ) -> Result<xc_core::SymmetricReductionDiagnostics<Float>> {
+    crate::mpfr_interval::ensure_uniform_exponent_range()?;
     let n = diag.len();
     validate_stable_symmetric_input(a, n, prec)?;
     if off_diag.len() != n - 1
@@ -1494,6 +1561,7 @@ fn householder_tridiag_hp_route(
     prec: u32,
     accumulate_q: bool,
 ) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
+    crate::mpfr_interval::ensure_uniform_exponent_range()?;
     if n == 0 || n.checked_mul(n) != Some(a.len()) {
         return Err(anyhow!("invalid Householder matrix dimension or length"));
     }

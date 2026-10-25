@@ -45,15 +45,14 @@ fn retained_eigenstate_replays_parity_and_normalization() {
         ground_index: None,
     };
     artifact.stored_state_resolution = Some(
-        stored_resolution::bounds(
+        stored_resolution::resolved(
             &tau,
             &parse_hp_vector(&artifact.eigenvector, p).unwrap(),
             &Float::with_val(p, 1),
             p,
             cfg.effective_parity_policy(),
         )
-        .unwrap()
-        .record,
+        .unwrap(),
     );
     assert!(decode_weil_eigenpair(&artifact, &params, &cfg, &tau).is_ok());
     artifact.eigenvector = vec!["0".into(), "0".into(), a.to_string()];
@@ -87,15 +86,14 @@ fn retained_eigenstate_replays_parity_and_normalization() {
         .collect::<Vec<_>>();
     artifact.eigenvector = vec!["0".into(), "0".into(), a.to_string()];
     artifact.stored_state_resolution = Some(
-        stored_resolution::bounds(
+        stored_resolution::resolved(
             &tau,
             &parse_hp_vector(&artifact.eigenvector, p).unwrap(),
             &Float::with_val(p, 1),
             p,
             cfg.effective_parity_policy(),
         )
-        .unwrap()
-        .record,
+        .unwrap(),
     );
     assert!(decode_weil_eigenpair(&artifact, &params, &cfg, &tau).is_ok());
     // Ordinary computed reuse keeps every quadratic gate but not the cubic

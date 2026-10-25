@@ -119,12 +119,24 @@ input, the precision and the exact point string, and only successful replies
 are kept. The declaration is the operator's: it does not change any identity,
 and an impure provider must not be declared pure. For a provider declared pure,
 the research sampling of the target, which is 16 points per retained mode, is
-spread over several provider processes. Each process evaluates one contiguous
-range of points, and the values are combined in point order, so every sample
+spread over several persistent provider processes. Points are interleaved across
+processes to balance nonuniform evaluation costs. Values are combined in their
+original point order, so every sample
 and every sum is identical to sequential evaluation. The default number of
 processes is the Rayon worker count, capped at 64; `XC_TARGET_PROVIDER_WORKERS`
 (1 to 256) sets it explicitly. A provider not declared pure is always
-evaluated by a single process. With diagnostic
+evaluated by a single process. Concurrent failures are reported at the lowest
+failing point index, including a worker initialization failure at its first
+assigned point. Provider and cache authentication are unchanged.
+
+Operational progress distinguishes evaluator setup, node generation, point
+evaluation, Fourier projection, and output validation/checkpoint work. Sampling
+reports completed-point counts at most once every 30 seconds plus a final
+summary. Maximum provider setup time is a per-worker measurement; overlapping
+phase and worker times must not be added to the total. These counters and
+timings do not enter artifact identities or numerical payloads.
+
+With diagnostic
 logging enabled, each construction creates a separate file, and a failed launch
 may leave an empty file. Logs are not rotated automatically. Enable the setting
 for a bounded troubleshooting session and manage the private directory afterward.

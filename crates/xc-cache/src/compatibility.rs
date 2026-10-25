@@ -109,6 +109,8 @@ pub fn artifact_compatibility_policy(
         "ccm_weil_sonin_state" => CLEAN_SLATE,
         "ccm_source_eigenbasis" => CLEAN_SLATE,
         "prolate_eigenvalue_spectrum" => CLEAN_SLATE,
+        "prolate_finite_dirichlet_modes" => CLEAN_SLATE,
+        "prolate_finite_dirichlet_profile" => CLEAN_SLATE,
         "ccm_prolate_spectrum" => CLEAN_SLATE,
         "ccm_prolate_basis" => CLEAN_SLATE,
         "ccm_prolate_candidate" => CLEAN_SLATE,

@@ -88,6 +88,8 @@ struct CompleteDiscovery {
     coefficients: Vec<Rational>,
     #[cfg(feature = "arb")]
     squares: Vec<xc_numerics::mpfr_interval::MpfrInterval>,
+    #[cfg(feature = "arb")]
+    _workspace: super::verified_discovery::DiscoveryWorkspace,
 }
 
 impl CompleteDiscovery {
@@ -177,8 +179,8 @@ fn positive_roots(n: usize, l: &Float, xi: &[Float], precision: u32) -> Result<C
     discover_points(&poles, xi, precision)
 }
 
-#[cfg(feature = "arb")]
-fn numerator(poles: &[Float], weights: &[Float]) -> Result<Vec<Rational>> {
+#[cfg(all(test, feature = "arb"))]
+fn numerator_sequential_oracle(poles: &[Float], weights: &[Float]) -> Result<Vec<Rational>> {
     if poles.is_empty() || poles.len().is_multiple_of(2) || poles.len() != weights.len() {
         bail!("complete even discovery requires matching odd-sized pole and weight arrays");
     }
@@ -246,6 +248,93 @@ fn numerator(poles: &[Float], weights: &[Float]) -> Result<Vec<Rational>> {
 }
 
 #[cfg(feature = "arb")]
+struct FoldedSource {
+    poles: Vec<Float>,
+    weights: Vec<Float>,
+    _reservation: Option<xc_core::MemoryReservation>,
+}
+
+#[cfg(feature = "arb")]
+impl FoldedSource {
+    fn new(poles: &[Float], weights: &[Float]) -> Result<Self> {
+        if poles.is_empty() || poles.len().is_multiple_of(2) || poles.len() != weights.len() {
+            bail!("complete even discovery requires matching odd-sized pole and weight arrays");
+        }
+        let precision = poles.iter().chain(weights).map(Float::prec).max().unwrap();
+        boundary::source_budget(poles.len(), precision)?;
+        // Validate exponent/finiteness before squaring, without charging for a
+        // nonexistent product of all coefficient denominators.
+        boundary::rational_point_vector_workspace(poles.iter().chain(weights))?;
+        let n = poles.len() / 2;
+        if poles[n] != 0
+            || poles.windows(2).any(|p| p[0] >= p[1])
+            || (0..n)
+                .any(|j| poles[j] != -poles[2 * n - j].clone() || weights[j] != weights[2 * n - j])
+        {
+            bail!(
+                "complete movable-root discovery requires exact even weights and symmetric distinct pole points; no parity projection is applied"
+            );
+        }
+        let point_bytes = (n + 1) as u128 * (u128::from(precision).div_ceil(8) * 3 + 256) + 4096;
+        super::source_workspace(point_bytes, "complete root source folding")?;
+        let reservation = xc_core::RunResources::current()
+            .map(|r| r.try_reserve_working(point_bytes as u64))
+            .transpose()?;
+        let mut square_poles = Vec::with_capacity(n + 1);
+        let mut folded_weights = Vec::with_capacity(n + 1);
+        square_poles.push(Float::with_val(precision, 0));
+        folded_weights.push(weights[n].clone());
+        for j in n + 1..poles.len() {
+            // A product of two p-bit dyadics fits exactly in 2p bits. These
+            // are squares of the retained rounded poles, not a new lattice.
+            square_poles.push(Float::with_val(poles[j].prec() * 2, &poles[j]).square());
+            folded_weights.push(weights[j].clone() * 2u32);
+        }
+        Ok(Self {
+            poles: square_poles,
+            weights: folded_weights,
+            _reservation: reservation,
+        })
+    }
+}
+
+#[cfg(feature = "arb")]
+fn admitted_numerator(
+    poles: &[Float],
+    weights: &[Float],
+    precision: u32,
+) -> Result<(Vec<Rational>, super::verified_discovery::DiscoveryWorkspace)> {
+    let source = FoldedSource::new(poles, weights)?;
+    // In s=t^2, w0/s + sum(2*wj/(s-aj^2)) has exactly the old
+    // numerator w0*D(s) + 2*s*sum(wj*D(s)/(s-aj^2)). Omitting a
+    // zero central residue removes one zero factor, which the old route
+    // removes below as well. All construction arithmetic is exact.
+    let workspace = super::verified_discovery::DiscoveryWorkspace::estimate(
+        &source.poles,
+        &source.weights,
+        &Rational::from(0),
+        &Rational::from(1),
+        precision,
+    )?
+    .admit()?;
+    let _stage = crate::ccm::capture_runtime::Stage::new(format!(
+        "complete root discovery numerator ({} retained poles, {precision} bits, {} admitted bytes)",
+        poles.len(), workspace.bytes,
+    ));
+    let mut coefficients =
+        super::verified_discovery::numerator(&source.poles, &source.weights, &workspace)?;
+    while coefficients.len() > 1 && coefficients[0] == 0 {
+        coefficients.remove(0);
+    }
+    Ok((coefficients, workspace))
+}
+
+#[cfg(all(test, feature = "arb"))]
+fn numerator(poles: &[Float], weights: &[Float]) -> Result<Vec<Rational>> {
+    admitted_numerator(poles, weights, 128).map(|(coefficients, _)| coefficients)
+}
+
+#[cfg(feature = "arb")]
 fn discover_points(
     poles: &[Float],
     weights: &[Float],
@@ -254,12 +343,13 @@ fn discover_points(
     if !(64..=1_000_000).contains(&precision) {
         bail!("unsupported complete-discovery output precision");
     }
-    let coefficients = numerator(poles, weights)?;
+    let (coefficients, workspace) = admitted_numerator(poles, weights, precision)?;
     if coefficients.len() == 1 {
         return Ok(CompleteDiscovery {
             values: vec![],
             coefficients,
             squares: vec![],
+            _workspace: workspace,
         });
     }
     let leading = coefficients
@@ -275,6 +365,14 @@ fn discover_points(
     // Cauchy's strict bound covers every complex root, without reference
     // heights and without treating the largest pole as a root boundary.
     let upper = maximum + 2;
+    // The bound is a ratio of two admitted coefficients plus a constant;
+    // its scalar storage fits the existing polynomial-equivalent allowance.
+    workspace.check(std::slice::from_ref(&upper))?;
+    let _stage = crate::ccm::capture_runtime::Stage::new(format!(
+        "complete root discovery isolation (degree {}, {} bits)",
+        coefficients.len() - 1,
+        precision.saturating_add(32).min(1_000_000),
+    ));
     let (mut squares, square_free) = super::super::arb_bridge::rational_polynomial_real_roots(
         &coefficients,
         &Rational::from(0),
@@ -306,6 +404,7 @@ fn discover_points(
         values: roots,
         coefficients,
         squares,
+        _workspace: workspace,
     })
 }
 
@@ -317,6 +416,128 @@ fn roots_from_points(poles: &[Float], weights: &[Float], precision: u32) -> Resu
 #[cfg(all(test, feature = "arb"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_tree_preserves_every_exact_coefficient_and_root_point() {
+        for precision in [64, 128, 512] {
+            for n in [0usize, 1, 2, 4, 8] {
+                for variant in 0..5 {
+                    let mut poles = vec![Float::with_val(precision, 0); 2 * n + 1];
+                    let mut weights = poles.clone();
+                    weights[n] = Float::with_val(precision, if variant == 0 { 0 } else { -3 });
+                    for j in 1..=n {
+                        let point = Float::with_val(precision, j) / (j + 1);
+                        poles[n + j] = point.clone();
+                        poles[n - j] = -point;
+                        let weight = if variant == 1 && j % 2 == 0 {
+                            Float::with_val(precision, 0)
+                        } else {
+                            Float::with_val(precision, if (j + variant) % 2 == 0 { 1 } else { -1 })
+                                / (j + 3)
+                        };
+                        weights[n + j] = weight.clone();
+                        weights[n - j] = weight;
+                    }
+                    match numerator_sequential_oracle(&poles, &weights) {
+                        Ok(expected) => assert_eq!(numerator(&poles, &weights).unwrap(), expected),
+                        Err(_) => assert!(numerator(&poles, &weights).is_err()),
+                    }
+                }
+            }
+            let (poles, weights) = source(&[2.5, -20., 36., -20., 2.5]);
+            let expected = numerator_sequential_oracle(&poles, &weights).unwrap();
+            let leading = expected.last().unwrap().clone().abs();
+            let upper = expected[..expected.len() - 1]
+                .iter()
+                .map(|v| v.clone().abs() / &leading)
+                .max()
+                .unwrap()
+                + 2;
+            let (mut squares, square_free) =
+                crate::ccm::arb_bridge::rational_polynomial_real_roots(
+                    &expected,
+                    &Rational::from(0),
+                    &upper,
+                    precision + 32,
+                )
+                .unwrap();
+            assert!(square_free);
+            squares.sort_by(|a, b| a.lower().partial_cmp(b.lower()).unwrap());
+            let old_points: Vec<_> = squares
+                .iter()
+                .map(|s| {
+                    let root = s.sqrt().unwrap();
+                    Float::with_val(precision, root.midpoint_point().lower())
+                        .to_string_radix(16, None)
+                })
+                .collect();
+            let new = discover_points(&poles, &weights, precision).unwrap();
+            assert_eq!(
+                new.values
+                    .iter()
+                    .map(|x| x.to_string_radix(16, None))
+                    .collect::<Vec<_>>(),
+                old_points
+            );
+            assert!(new.values.iter().all(|x| x.prec() == precision));
+            assert_eq!(new.coefficients, expected);
+        }
+    }
+
+    #[test]
+    fn complete_workspace_retains_ownership_and_releases_on_failure() {
+        let (poles, weights) = source(&[2.5, -20., 36., -20., 2.5]);
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let _scope = resources.enter();
+        let result = discover_points(&poles, &weights, 256).unwrap();
+        assert!(resources.usage().working_bytes > 0);
+        drop(result);
+        assert_eq!(resources.usage().working_bytes, 0);
+        let pressure = resources.try_reserve_retained((1 << 20) - 1).unwrap();
+        assert!(discover_points(&poles, &weights, 256).is_err());
+        assert_eq!(resources.usage().working_bytes, 0);
+        drop(pressure);
+        let (poles, weights) = source(&[25., -256., 486., -256., 25.]);
+        assert!(discover_points(&poles, &weights, 256).is_err());
+        assert_eq!(resources.usage().working_bytes, 0);
+    }
+
+    #[test]
+    fn complete_workspace_n500_hp1500_uses_configured_budget_without_large_allocation() {
+        let p = 5047;
+        let spacing = Float::with_val(p, 1) + (Float::with_val(p, 1) >> (p - 1));
+        let poles = super::super::secular_poles(&spacing, 500, p);
+        let weights = vec![Float::with_val(p, 1); poles.len()];
+        assert!(boundary::rational_budget(poles.iter().chain(&weights), poles.len()).is_err());
+        let source = FoldedSource::new(&poles, &weights).unwrap();
+        let estimate = || {
+            super::super::verified_discovery::DiscoveryWorkspace::estimate(
+                &source.poles,
+                &source.weights,
+                &Rational::from(0),
+                &Rational::from(1),
+                p,
+            )
+            .unwrap()
+        };
+        let bytes = estimate().bytes;
+        assert!(
+            bytes > 8u128 << 30 && bytes < 384u128 << 30,
+            "estimate={bytes}"
+        );
+        let small = xc_core::RunResources::new((bytes - 1) as u64).unwrap();
+        {
+            let _scope = small.enter();
+            assert!(estimate().admit().is_err());
+            assert_eq!(small.usage().peak_bytes, 0);
+        }
+        let large = xc_core::RunResources::new(384u64 << 30).unwrap();
+        let _scope = large.enter();
+        let reservation = estimate().admit().unwrap();
+        assert_eq!(large.usage().working_bytes, bytes as u64);
+        drop(reservation);
+        assert_eq!(large.usage().working_bytes, 0);
+    }
 
     #[test]
     fn complete_discovery_uses_the_public_certificate_pole_source() {

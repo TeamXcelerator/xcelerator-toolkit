@@ -11,8 +11,8 @@ repository.workspace = true
 
 [features]
 default = []
-hp = ["dep:sha2", "dep:rug", "dep:zip", "dep:xc-operator", "dep:xc-solver", "xc-numerics/hp", "xc-zeta/hp", "xc-certify/hp", "xc-root/hp", "xc-solver/hp-reference"]
-arb = ["hp"]
+hp = ["dep:sha2", "dep:rug", "dep:num-bigint", "dep:zip", "dep:xc-operator", "dep:xc-solver", "xc-numerics/hp", "xc-zeta/hp", "xc-certify/hp", "xc-root/hp", "xc-solver/hp-reference"]
+arb = ["hp", "xc-numerics/arb"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -25,6 +25,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true, optional = true }
 rug = { workspace = true, optional = true }
+num-bigint = { version = "=0.4.8", optional = true }
 zip = { workspace = true, optional = true }
 xc-numerics = { workspace = true }
 xc-zeta = { workspace = true }

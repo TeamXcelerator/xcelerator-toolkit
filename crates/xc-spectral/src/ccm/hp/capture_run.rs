@@ -4,10 +4,20 @@
 //! changes the primary parity, acquisition policy, or retained numerical state.
 use super::*;
 use std::sync::Mutex;
+#[path = "capture_admission.rs"]
+mod admissions;
+#[path = "capture_preparation.rs"]
+mod preparation;
 use xc_cache::{ArtifactProductionSink, CapturedDiagnostic, ProducedArtifactRecord};
 
 /// A completed primary calculation and its exact retained sources.
 pub struct RetainedCcmRun {
+    resources: xc_core::RunResources,
+    validated_values: xc_cache::ValidatedValueMemo,
+    bordered_response_memo: BorderedResponseMemo,
+    _bordered_response_eviction: std::sync::Arc<dyn Fn() + Send + Sync>,
+    source_admissions: std::sync::Arc<Mutex<admissions::Sources>>,
+    _source_admission_eviction: std::sync::Arc<dyn Fn() + Send + Sync>,
     params: CcmParams,
     cfg: HighPrecConfig,
     primary: HighPrecResult,
@@ -15,7 +25,7 @@ pub struct RetainedCcmRun {
     eigenpair: Option<ProducedArtifactRecord>,
     retained_records: Vec<ProducedArtifactRecord>,
     research_inputs: Option<crate::ccm::retained_evidence::ResearchInputs>,
-    extended_inputs: Option<crate::ccm::extended_research::ExternalResearchInputs>,
+    extended_inputs: Option<crate::ccm::extended_research::RunInput>,
     extended_input_error: Option<String>,
     extended_inputs_loaded: bool,
     extended_options: Option<crate::ccm::extended_research::ExtensionOptions>,
@@ -243,11 +253,13 @@ impl ArtifactProductionSink for RecordingSink<'_> {
 /// can resolve within its declared resources; that is not an error in its
 /// inputs, and it is reported as a coverage limit, as larger configurations on
 /// smaller machines meet it routinely. Every other error remains a failure.
-fn capture_failure(error: anyhow::Error) -> xc_cache::CaptureFailure {
+pub(super) fn capture_failure(error: anyhow::Error) -> xc_cache::CaptureFailure {
     let limited = error.chain().any(|cause| {
         let text = cause.to_string();
         (text.contains("unresolved within") && text.contains("guard bits"))
             || text.contains("exceeds the rational workspace budget")
+            || text.contains("run memory budget exceeded")
+            || text.contains("run worker budget exceeded")
     });
     match xc_cache::CaptureFailure::failed(format!("{error:#}")) {
         xc_cache::CaptureFailure::Failed { reason } if limited => {
@@ -335,6 +347,20 @@ fn recorded(mut records: Vec<ProducedArtifactRecord>) -> Result<CapturedDiagnost
     )?)
 }
 
+/// Reuse the live response observer, including encoded publication forwarding.
+/// The closure may produce secondary artifacts only; its caller owns the exact
+/// authenticated primary inputs.
+pub(super) fn record_retained_response(
+    cache: &ArtifactCacheContext<'_>,
+    kind: &str,
+    produce: impl FnOnce(&ArtifactCacheContext<'_>) -> Result<()>,
+) -> Result<CapturedDiagnostic> {
+    let kinds = [kind];
+    let sink = RecordingSink::new(cache, &kinds);
+    produce(&observing(cache, &sink))?;
+    recorded(sink.finish()?)
+}
+
 impl RetainedCcmRun {
     /// Execute an explicitly indexed reference-seeded claim once.
     pub fn seeded(
@@ -383,6 +409,19 @@ impl RetainedCcmRun {
         acquisition: RootAcquisition<'_>,
         cache: &ArtifactCacheContext<'_>,
     ) -> Result<Self> {
+        let resources = match xc_core::RunResources::current() {
+            Some(resources) => resources,
+            None => xc_core::RunResources::with_worker_limit(
+                crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?
+                    .maximum_working_bytes,
+                rayon::current_num_threads(),
+            )?,
+        };
+        resources.check_workers(rayon::current_num_threads())?;
+        let _resource_scope = resources.enter();
+        let validated_values =
+            xc_cache::ValidatedValueMemo::new(resources.clone(), resources.maximum_bytes() / 4);
+        let _memo_scope = validated_values.enter();
         let sink = RecordingSink::new(
             cache,
             &[
@@ -411,7 +450,28 @@ impl RetainedCcmRun {
                 })
             })
             .cloned();
+        let source_admissions = std::sync::Arc::new(Mutex::new(admissions::Sources::default()));
+        let weak_admissions = std::sync::Arc::downgrade(&source_admissions);
+        let source_admission_eviction: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || {
+                if let Some(admissions) = weak_admissions.upgrade() {
+                    admissions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
+                }
+            });
+        validated_values.register_eviction(&source_admission_eviction);
+        let bordered_response_memo = BorderedResponseMemo::default();
+        let bordered_response_eviction = bordered_response_memo.eviction_callback();
+        validated_values.register_eviction(&bordered_response_eviction);
         Ok(Self {
+            resources,
+            validated_values,
+            bordered_response_memo,
+            _bordered_response_eviction: bordered_response_eviction,
+            source_admissions,
+            _source_admission_eviction: source_admission_eviction,
             params: params.clone(),
             cfg: cfg.clone(),
             primary,
@@ -484,7 +544,7 @@ impl RetainedCcmRun {
         inputs.matches(&state)?;
         self.run_once_prepared = false;
         self.run_once_sources.clear();
-        self.extended_inputs = Some(inputs);
+        self.extended_inputs = Some(inputs.into());
         self.extended_input_error = None;
         self.extended_inputs_loaded = true;
         Ok(())
@@ -498,6 +558,8 @@ impl RetainedCcmRun {
     /// to be computed ahead of their turn (the default; see
     /// [`Self::set_lookahead_requests`]). Results, artifacts and their order
     /// are the same either way; this changes only when the numerical work runs.
+    /// Retained captures currently decline lookahead under their shared run
+    /// budget, including when this preference is enabled.
     #[doc(hidden)]
     pub fn set_capture_lookahead(&mut self, enabled: bool) {
         self.lookahead_enabled = enabled;
@@ -508,6 +570,7 @@ impl RetainedCcmRun {
     /// Declare the diagnostics this run will request. Only declared
     /// diagnostics are computed ahead, so no work runs for a diagnostic the
     /// caller never requests; without a declaration nothing runs ahead.
+    /// This declaration does not override the run's resource admission.
     pub fn set_lookahead_requests(&mut self, ids: impl IntoIterator<Item = String>) {
         self.lookahead_requests = Some(ids.into_iter().collect());
     }
@@ -578,7 +641,7 @@ impl RetainedCcmRun {
             self.extended_inputs = None;
             self.run_once_sources.clear();
         }
-        let mut input=self.extended_inputs.clone().unwrap_or_else(|| serde_json::from_value(serde_json::json!({
+        let mut input=self.extended_inputs.as_deref().cloned().unwrap_or_else(|| serde_json::from_value(serde_json::json!({
             "schema_version":1,"source_eigenpair":record.manifest.content_digest,"lambda_squared":state.cutoff,"n_modes":state.modes,"precision_bits":state.precision,
             "convention_id":"toolkit_retained_run_inputs_v1","definition_digest":ContentDigest::sha256(b"toolkit_retained_run_inputs_v1"),"approximation_scope":"finite retained sources; automatic component actions and response reuse; no target formula"
         })).expect("static automatic input shape"));
@@ -634,6 +697,12 @@ impl RetainedCcmRun {
         derived.producer_notes.push(format!("operator quadrature: policy={:?}; actual per-mode orders retained in ccm_archimedean_integrals; order_table_digest={}; minimum={}; maximum={}",
             self.cfg.research_quadrature_policy,ContentDigest::sha256(&serde_json::to_vec(&actual_orders)?).0,
             actual_orders.iter().min().unwrap(),actual_orders.iter().max().unwrap()));
+        if !self.cfg.archimedean_gl_generator.is_legacy() {
+            derived.producer_notes.push(format!(
+                "operator quadrature generator: {}; certified node and weight rounding does not establish a quadrature truncation bound",
+                self.cfg.archimedean_gl_generator.semantic_id()
+            ));
+        }
         if self.extended_input_error.is_some() {
             derived.producer_notes.push("supplied external input rejected; source-only automatic diagnostics preserved; reference-dependent diagnostics remain failed".into());
         }
@@ -678,17 +747,49 @@ impl RetainedCcmRun {
                 )?;
                 let portable: PortablePrimeComponent = serde_json::from_slice(&source.payload)?;
                 let matrix = decode_prime_component(&portable, &self.params, state.precision)?;
-                let v = crate::ccm::extended_research::source_unit(&state, state.precision)?;
-                let n = v.len();
-                let action = matrix
-                    .par_chunks(n)
-                    .map(|row| -> Result<String> {
-                        Ok(lossless_hp_decimal(
-                            &(-crate::ccm::retained_evidence::dot(row, &v, state.precision)?),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok((OperatorAction{label:"tau_prime_direct".into(),source_digest:source.manifest.content_digest.clone(),action,convention:"negative direct unsigned prime matrix action on the same signed unit state; exact retained Tau parent".into()},source.manifest))
+                let convention = "negative direct unsigned prime matrix action on the same signed unit state; exact retained Tau parent";
+                let action = preparation::actions(
+                    &(
+                        "independent-prime",
+                        &state.manifest,
+                        tau,
+                        &source.manifest,
+                        state.precision,
+                    ),
+                    cache.mode.consults_cache_for_result_reuse(),
+                    &[(
+                        "tau_prime_direct",
+                        &source.manifest.content_digest,
+                        convention,
+                    )],
+                    2 * state.modes + 1,
+                    state.precision,
+                    || {
+                        let v =
+                            crate::ccm::extended_research::source_unit(&state, state.precision)?;
+                        let n = v.len();
+                        let action = matrix
+                            .par_chunks(n)
+                            .map(|row| -> Result<String> {
+                                Ok(lossless_hp_decimal(
+                                    &(-crate::ccm::retained_evidence::dot(
+                                        row,
+                                        &v,
+                                        state.precision,
+                                    )?),
+                                ))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(vec![OperatorAction {
+                            label: "tau_prime_direct".into(),
+                            source_digest: source.manifest.content_digest.clone(),
+                            action,
+                            convention: convention.into(),
+                        }])
+                    },
+                )?
+                .remove(0);
+                Ok((action, source.manifest))
             })();
             match direct {
                 Ok((action, manifest)) => {
@@ -836,15 +937,49 @@ impl RetainedCcmRun {
                         }
                     }
                 }
-                Err(error) => derived
-                    .producer_notes
-                    .push(format!("sector inputs unavailable: {error}")),
+                Err(error) => {
+                    // Retain an actual resolution-limit attempt separately
+                    // from an absent optional request or invalid source. Its
+                    // reason is provenance, never a substitute eigenvector.
+                    if super::is_sector_resolution_limit(&error)
+                        && input.cluster_preparation_assessment.is_none()
+                    {
+                        if let (Some(policy), Some(matrix)) =
+                            (options.sector_analysis, self.source.tau_manifest.as_ref())
+                        {
+                            let reason = format!("{error:#}");
+                            let route = policy.eigenvalue_route.as_str().to_owned();
+                            let evidence_digest = ContentDigest::sha256_json(&serde_json::json!({
+                                "source_eigenpair": state.manifest.content_digest,
+                                "source_matrix": matrix.content_digest,
+                                "source_precision_bits": state.precision,
+                                "requested_eigenpairs_per_sector": policy.requested_eigenpairs,
+                                "eigenvalue_route": route,
+                                "reason": reason,
+                            }))?;
+                            input.cluster_preparation_assessment =
+                                Some(ClusterPreparationAssessment {
+                                    source_eigenpair: state.manifest.content_digest.clone(),
+                                    source_matrix: matrix.content_digest.clone(),
+                                    source_precision_bits: state.precision,
+                                    requested_eigenpairs_per_sector: policy.requested_eigenpairs,
+                                    eigenvalue_route: route,
+                                    origin: "automatic_sector_attempt".into(),
+                                    evidence_digest,
+                                    reason,
+                                });
+                        }
+                    }
+                    derived
+                        .producer_notes
+                        .push(format!("sector inputs unavailable: {error}"));
+                }
             }
         }
         derived.completion = Some(completion);
         input.run_once = Some(derived);
         input.validate()?;
-        self.extended_inputs = Some(input);
+        self.extended_inputs = Some(input.into());
         self.run_once_prepared = true;
         Ok(())
     }
@@ -887,40 +1022,61 @@ impl RetainedCcmRun {
         if !xc_cache::manifest_depends_on(tau, &manifest)? {
             bail!("archimedean primitives do not match retained Tau ancestry");
         }
-        let v = crate::ccm::extended_research::source_unit(state, p)?;
-        let rows = matrix_point_math::component_actions(
-            state.modes,
-            &l,
-            p,
-            &integrals,
-            &self.source.tau,
-            &v,
-        )?;
         let notes = "correctly rounded stored-matrix action on center-oriented unit coefficient state; pole and archimedean from exact retained primitive ancestry; prime=Tau-pole-archimedean is an algebraic reconstruction, not an independent prime-closure validation";
-        let actions = ["tau_pole", "tau_archimedean", "tau_prime_reconstructed"]
-            .iter()
-            .enumerate()
-            .map(|(j, label)| OperatorAction {
-                label: (*label).into(),
-                source_digest: if j == 1 {
-                    manifest.content_digest.clone()
-                } else {
-                    tau.content_digest.clone()
-                },
-                action: rows
+        let expected = [
+            ("tau_pole", &tau.content_digest, notes),
+            ("tau_archimedean", &manifest.content_digest, notes),
+            ("tau_prime_reconstructed", &tau.content_digest, notes),
+        ];
+        let actions = preparation::actions(
+            &("automatic-components", &state.manifest, tau, &manifest, p),
+            cache.mode.consults_cache_for_result_reuse(),
+            &expected,
+            2 * state.modes + 1,
+            p,
+            || {
+                let v = crate::ccm::extended_research::source_unit(state, p)?;
+                let rows = matrix_point_math::component_actions(
+                    state.modes,
+                    &l,
+                    p,
+                    &integrals,
+                    &self.source.tau,
+                    &v,
+                )?;
+                let actions = ["tau_pole", "tau_archimedean", "tau_prime_reconstructed"]
                     .iter()
-                    .map(|x| {
-                        lossless_hp_decimal(match j {
-                            0 => &x.0,
-                            1 => &x.1,
-                            _ => &x.2,
-                        })
+                    .enumerate()
+                    .map(|(j, label)| OperatorAction {
+                        label: (*label).into(),
+                        source_digest: if j == 1 {
+                            manifest.content_digest.clone()
+                        } else {
+                            tau.content_digest.clone()
+                        },
+                        action: rows
+                            .iter()
+                            .map(|x| {
+                                lossless_hp_decimal(match j {
+                                    0 => &x.0,
+                                    1 => &x.1,
+                                    _ => &x.2,
+                                })
+                            })
+                            .collect(),
+                        convention: notes.into(),
                     })
-                    .collect(),
-                convention: notes.into(),
-            })
-            .collect();
+                    .collect();
+                Ok(actions)
+            },
+        )?;
         Ok((actions, manifest))
+    }
+
+    /// Cooperative allocation telemetry for this run, including shared values
+    /// and admitted capture work. This is not an operating-system RSS measure.
+    pub fn resource_usage(&self) -> xc_core::RunResourceUsage {
+        self.resources.usage()
     }
 
     pub fn primary(&self) -> &HighPrecResult {
@@ -936,6 +1092,8 @@ impl RetainedCcmRun {
         &self,
         cache: &ArtifactCacheContext<'_>,
     ) -> Result<PortableResponseSpectralIsolation> {
+        let _resources = self.resources.enter();
+        let _memo = self.validated_values.enter();
         let tau_manifest = self
             .source
             .tau_manifest
@@ -986,10 +1144,12 @@ impl RetainedCcmRun {
         Vec<super::super::prefix::RetainedEvenEigenpair>,
     )> {
         use super::super::prefix::{RetainedEvenEigenpair, RetainedEvenMatrix};
+        let _resources = self.resources.enter();
+        let _memo = self.validated_values.enter();
         let sink = RecordingSink::new(cache, &["ccm_even_sector_matrix"]);
         let observed = observing(cache, &sink);
         let mut tau = self.source.tau.clone();
-        force_symmetric(&mut tau, self.params.matrix_size())?;
+        force_shared_symmetric(&mut tau, self.params.matrix_size())?;
         let manifest = self
             .source
             .tau_manifest
@@ -1130,7 +1290,16 @@ impl RetainedCcmRun {
         options: &CcmResearchCaptureOptions,
         cache: &ArtifactCacheContext<'_>,
     ) -> Result<CapturedDiagnostic> {
-        xc_numerics::hp_runtime::run_hp(|| self.capture_inner(id, options, cache))
+        self.resources.check_workers(rayon::current_num_threads())?;
+        let _resources = self.resources.enter();
+        let _memo = self.validated_values.enter();
+        let result = xc_numerics::hp_runtime::run_hp(|| self.capture_inner(id, options, cache));
+        // A cache hit never claims its prefetched value. Release that slot so
+        // the bounded lane can advance and its unused allocations can drop.
+        if let Some(lane) = &self.lookahead {
+            lane.claim(id.strip_suffix("_full").unwrap_or(id), |_| false);
+        }
+        result
     }
     /// Prepare configured source-bound inputs without capturing or publishing a diagnostic.
     /// The caller may extend the returned data, then set it back through the checked setter.
@@ -1142,7 +1311,7 @@ impl RetainedCcmRun {
         if let Some(error) = &self.extended_input_error {
             bail!("external research preparation: {error}");
         }
-        Ok(self.extended_inputs.clone())
+        Ok(self.extended_inputs.as_deref().cloned())
     }
 
     #[doc(hidden)]
@@ -1364,7 +1533,7 @@ impl RetainedCcmRun {
             self.extended_inputs_loaded = true;
             if let Some(path) = std::env::var_os("XC_RESEARCH_INPUTS_FILE") {
                 match ExternalResearchInputs::from_file(std::path::Path::new(&path)) {
-                    Ok(input) => self.extended_inputs = Some(input),
+                    Ok(input) => self.extended_inputs = Some(input.into()),
                     Err(e) => self.extended_input_error = Some(e.to_string()),
                 }
             }
@@ -1415,7 +1584,7 @@ impl RetainedCcmRun {
                         if self.research_inputs.is_none() {
                             self.research_inputs = Some(reference);
                         }
-                        self.extended_inputs = Some(input);
+                        self.extended_inputs = Some(input.into());
                     }
                     Err(e) => {
                         self.extended_input_error =
@@ -1450,7 +1619,7 @@ impl RetainedCcmRun {
                         std::slice::from_ref(&record.manifest.content_digest),
                     )?;
                     match reference.prepare(&state, None) {
-                        Ok(i) => self.extended_inputs = Some(i),
+                        Ok(i) => self.extended_inputs = Some(i.into()),
                         Err(e) => {
                             self.extended_input_error = Some(format!("reference preparation: {e}"))
                         }
@@ -1468,10 +1637,15 @@ impl RetainedCcmRun {
     /// runs, and only if the inputs it was computed from equal the inputs
     /// there; otherwise that diagnostic is computed inline, as before. The
     /// look-ahead copy of Tau and a second concurrent workspace must fit
-    /// within half the declared working budget.
+    /// within half the declared working budget. Run-owned budgets decline the
+    /// lane before cloning inputs: speculative retention must not prevent a
+    /// required diagnostic from fitting. Budgeted captures lose cold overlap
+    /// but keep their serial arithmetic, outcomes, and artifact identities.
     fn start_lookahead(&mut self, state: &crate::ccm::state_geometry::RetainedState) {
         use crate::ccm::convergence_capture::{finite_capture::ExecutionContext, lookahead};
-        if !self.lookahead_enabled
+        if xc_core::RunResources::current().is_some()
+            || !self.lookahead_enabled
+            || rayon::current_thread_index().is_some()
             || self.lookahead_started
             || !self.run_once_prepared
             || (self.prepared_reference.is_some() && !self.prepared_reference_jets)
@@ -1495,8 +1669,8 @@ impl RetainedCcmRun {
             // external input, which the jobs share when both roles use it.
             let input_bytes = self
                 .extended_inputs
-                .as_ref()
-                .map(|input| serde_json::to_vec(input).map(|bytes| bytes.len() as u64))
+                .as_deref()
+                .map(crate::ccm::capture_runtime::retained_json_bytes)
                 .transpose()?
                 .unwrap_or(0);
             if entry_bytes
@@ -1506,6 +1680,11 @@ impl RetainedCcmRun {
             {
                 bail!("look-ahead exceeds the declared working budget");
             }
+            let input_allowance = entry_bytes
+                .saturating_mul(2)
+                .saturating_add(input_bytes.saturating_mul(2))
+                .saturating_add(1 << 20);
+            let reservation = self.resources.try_reserve_retained(input_allowance)?;
             let manifest = self
                 .source
                 .tau_manifest
@@ -1525,7 +1704,7 @@ impl RetainedCcmRun {
             let finite_input = if self.extended_input_error.is_some() {
                 None
             } else {
-                self.extended_inputs.as_ref()
+                self.extended_inputs.as_deref()
             };
             let execution = ExecutionContext {
                 policy: policy.clone(),
@@ -1536,18 +1715,23 @@ impl RetainedCcmRun {
                 &self.extension_options("finite_section_transfer", true, state, None)?,
                 &policy,
             );
-            lookahead::jobs(
+            let jobs = lookahead::jobs(
                 &ids,
                 state,
                 &matrix,
                 finite_input,
                 &execution,
-                self.extended_inputs.as_ref(),
+                self.extended_inputs.as_deref(),
                 &options,
-            )
+            )?;
+            Ok((jobs, reservation))
         })();
-        if let Ok(jobs) = jobs {
-            self.lookahead = crate::ccm::capture_runtime::LookAhead::start(jobs);
+        if let Ok((jobs, reservation)) = jobs {
+            self.lookahead = crate::ccm::capture_runtime::LookAhead::start_reserved(
+                jobs,
+                Some(reservation),
+                lookahead::retained_bytes,
+            );
         }
     }
 
@@ -1608,8 +1792,6 @@ impl RetainedCcmRun {
             || crate::ccm::research_completion::DIAGNOSTICS.contains(&id)
         {
             use crate::ccm::extended_research::*;
-            use crate::ccm::retained_evidence::{RetainedMatrix, RetainedRoots};
-            use crate::ccm::state_geometry::RetainedState;
             // Requested here: never computed ahead from now on.
             self.lookahead_reached.insert(id.to_owned());
             let mut certificate_error = self.sector_certificate_error.clone();
@@ -1661,16 +1843,8 @@ impl RetainedCcmRun {
                     bail!("external research inputs invalid: {error}");
                 }
             }
-            let record = self
-                .eigenpair
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("retained eigenpair unavailable"))?;
-            let state = RetainedState::from_payload(
-                &record.manifest,
-                &record.payload,
-                std::slice::from_ref(&record.manifest.content_digest),
-            )?;
-            let matrix = if matches!(
+            let state = self.admitted_state()?;
+            let matrix_handle = if matches!(
                 id,
                 "trial_vector_energy"
                     | "trial_vector_parity"
@@ -1684,23 +1858,15 @@ impl RetainedCcmRun {
                     | "finite_section_transfer"
                     | "capture_preflight"
                     | "configuration_comparison"
-            ) {
-                self.source
-                    .tau_manifest
-                    .as_ref()
-                    .map(|manifest| {
-                        RetainedMatrix::from_admitted_runtime(
-                            manifest.clone(),
-                            state.cutoff.clone(),
-                            state.modes,
-                            state.precision,
-                            &self.source.tau,
-                        )
-                    })
-                    .transpose()?
+            ) || (id == "spectral_cluster"
+                && self.extended_inputs.as_ref().is_some_and(|i| {
+                    i.cluster.is_empty() && i.cluster_preparation_assessment.is_some()
+                })) {
+                self.admitted_matrix(&state)?
             } else {
                 None
             };
+            let matrix = matrix_handle.as_ref().map(|m| m.view());
             let roots = if matches!(
                 id,
                 "finite_root_budget"
@@ -1717,34 +1883,13 @@ impl RetainedCcmRun {
                     | "signed_transform"
                     | "weighted_reference_projection"
             ) {
-                match (&self.source.root_manifest, &self.source.secular_manifest) {
-                    (Some(r), Some(m)) => {
-                        let root = self.retained_records.iter().find(|a| {
-                            a.manifest.key == r.key && a.manifest.content_digest == r.content_digest
-                        });
-                        let secular = self.retained_records.iter().find(|a| {
-                            a.manifest.key == m.key && a.manifest.content_digest == m.content_digest
-                        });
-                        match (root, secular) {
-                            (Some(root), Some(secular)) => Some(RetainedRoots::from_payload(
-                                r,
-                                &root.payload,
-                                m,
-                                &secular.payload,
-                                &state,
-                                &[r.content_digest.clone(), m.content_digest.clone()],
-                            )?),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                }
+                self.admitted_roots(&state)?
             } else {
                 None
             };
             if !self.prepared_reference_jets && roots.is_some() {
                 if let Some(reference) = &self.prepared_reference {
-                    match reference.prepare(&state, roots.as_ref()) {
+                    match reference.prepare(&state, roots.as_ref().map(|r| &***r)) {
                         Ok(mut prepared) => {
                             if let Some(existing) = &mut self.extended_inputs {
                                 crate::ccm::research_completion::align_input_precisions(
@@ -1755,7 +1900,7 @@ impl RetainedCcmRun {
                                     existing.reference_jets = prepared.reference_jets;
                                 }
                             } else {
-                                self.extended_inputs = Some(prepared);
+                                self.extended_inputs = Some(prepared.into());
                             }
                             self.prepared_reference_jets = true;
                         }
@@ -1766,7 +1911,8 @@ impl RetainedCcmRun {
                     }
                 }
             }
-            let options = self.extension_options(id, complete, &state, roots.as_ref())?;
+            let options =
+                self.extension_options(id, complete, &state, roots.as_ref().map(|r| &***r))?;
             let input = if id == "compactness"
                 || (crate::ccm::capture::FINITE_DIAGNOSTICS.contains(&id)
                     && self.extended_input_error.is_some())
@@ -1775,6 +1921,8 @@ impl RetainedCcmRun {
             } else {
                 self.extended_inputs.as_ref()
             };
+            let _input_admission = input.map(|i| i.admit()).transpose()?;
+            let input = input.map(std::ops::Deref::deref);
             let certificate = self
                 .sector_certificate
                 .as_ref()
@@ -1802,7 +1950,8 @@ impl RetainedCcmRun {
                     certificate_error,
                     input_preparation_error: self.extended_input_error.clone(),
                 };
-                let (state_ref, matrix_ref, roots_ref) = (&state, matrix.as_ref(), roots.as_ref());
+                let (state_ref, matrix_ref, roots_ref) =
+                    (&state, matrix.as_ref(), roots.as_ref().map(|r| &***r));
                 let execution_ref = &execution;
                 let prepared = self.lookahead.as_ref().map(|lane| -> Prepared<'_> {
                     Box::new(move || {
@@ -1822,7 +1971,7 @@ impl RetainedCcmRun {
                     id,
                     &state,
                     matrix.as_ref(),
-                    roots.as_ref(),
+                    roots.as_ref().map(|r| &***r),
                     input,
                     certificate,
                     &self.run_once_sources,
@@ -1845,7 +1994,7 @@ impl RetainedCcmRun {
                     id,
                     &state,
                     matrix.as_ref(),
-                    roots.as_ref(),
+                    roots.as_ref().map(|r| &***r),
                     input,
                     certificate,
                     &options,
@@ -1856,6 +2005,7 @@ impl RetainedCcmRun {
                 let produced = result.produced_manifest.is_some();
                 (CapturedDiagnostic::from_cached(result)?, produced)
             };
+            drop(_input_admission);
             if produced {
                 self.start_lookahead(&state);
             }
@@ -2124,7 +2274,7 @@ impl RetainedCcmRun {
                 required(&source.secular_manifest)?,
             );
             if id == "prime_power_response" {
-                resolve_prime_power_response_analysis_via_cache(
+                resolve_prime_power_response_analysis_via_cache_with_memo(
                     p,
                     cfg,
                     &l,
@@ -2138,9 +2288,10 @@ impl RetainedCcmRun {
                     &args.2,
                     &args.3,
                     &observed,
+                    Some(&self.bordered_response_memo),
                 )?;
             } else {
-                resolve_u_flow_response_analysis_via_cache(
+                resolve_u_flow_response_analysis_via_cache_with_memo(
                     p,
                     cfg,
                     &l,
@@ -2154,6 +2305,7 @@ impl RetainedCcmRun {
                     &args.2,
                     &args.3,
                     &observed,
+                    Some(&self.bordered_response_memo),
                 )?;
             }
         } else if id == "root_conditioning" {
@@ -2261,6 +2413,223 @@ impl RetainedCcmRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_recovery_routes_match_live_artifacts_and_refuse_foreign_sources() {
+        use crate::ccm::convergence_capture::finite_capture as f;
+        use crate::ccm::hp::response_repair::RetainedResponseOptions;
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
+            ZipJsonFilesystemCacheStore as FilesystemCacheStore,
+        };
+        let directory = xc_core::test_support::TestDir::new("retained-recovery-routes");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "local",
+                &*directory,
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let params = CcmParams::from_lambda_sq_integer(13, 16);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.n_eigenvalues = 2;
+        cfg.quad_points = 32;
+        let dataset = xc_zeta::zeros::bundled_dataset_identity().unwrap();
+        let seeds = xc_zeta::zeros::bundled_first_n_strings(2)
+            .unwrap()
+            .iter()
+            .map(|s| Float::with_val(cfg.precision_bits, Float::parse(s).unwrap()))
+            .collect::<Vec<_>>();
+        let mut run = RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &cache).unwrap();
+        // Response selection is narrower than the immutable two-row root source.
+        // Indexed transforms must still use the complete retained root window.
+        run.primary.eigenvalues_pos.truncate(1);
+        let input: crate::ccm::extended_research::ExternalResearchInputs =
+            serde_json::from_value(serde_json::json!({"schema_version":1,
+                "source_eigenpair":run.source.eigenpair_manifest.as_ref().unwrap().content_digest,
+                "lambda_squared":"13", "n_modes":16, "precision_bits":cfg.precision_bits,
+                "convention_id":"retained recovery fixture",
+                "definition_digest":ContentDigest::sha256(b"retained recovery fixture"),
+                "approximation_scope":"finite stored source",
+                "reference_jets":[{"ordinal":1,"t":"1",
+                    "reference_window":{"value":"1","derivative":"0"},
+                    "reference_full":{"value":"1","derivative":"0"},
+                    "exterior_tail":{"value":"0","derivative":"0"},
+                    "endpoint_tail_part":null,"fitted_interior_parts":[],
+                    "source_value_error":null,"tail_value_error":null,
+                    "source_derivative_error":null,"root_separation_radius":null}]}))
+            .unwrap();
+        run.set_extended_research_inputs(input.clone()).unwrap();
+        let options = super::super::super::capture::CcmCapturePlan::ultra(2, 17)
+            .unwrap()
+            .primary_options()
+            .unwrap();
+        let response_options = RetainedResponseOptions {
+            primary: PortableHighPrecResult::from_runtime(run.primary()).unwrap(),
+            lambda_squared: 13,
+            n_modes: 16,
+            precision_bits: cfg.precision_bits,
+            quadrature_base_points: cfg.quad_points,
+            parity_policy: cfg.effective_parity_policy(),
+        };
+        let manifests = run.primary_sources();
+        let retained = f::RetainedFiniteSources::from_manifests(&manifests, true, &cache).unwrap();
+        retained
+            .validate_recovery_response_options(&response_options)
+            .unwrap();
+        // Refresh forces actual recomputation instead of comparing two cache hits.
+        let fresh = ArtifactCacheContext {
+            resolver: cache.resolver,
+            reference_resolver: None,
+            acceptance: cache.acceptance,
+            ordered_overlays: cache.ordered_overlays.clone(),
+            mode: ArtifactExecutionCacheMode::Refresh,
+            write_on_miss: true,
+            write_visibility: cache.write_visibility,
+            requested_assurance: cache.requested_assurance,
+            certification_failure_policy: cache.certification_failure_policy,
+            production_sink: None,
+        };
+        for id in [
+            "indexed_transform",
+            "signed_transform",
+            "prime_power_response",
+            "u_flow_response",
+        ] {
+            assert!(f::supports_recovery_diagnostic(id));
+            let live = run.capture_diagnostic(id, &options, &cache).unwrap();
+            let recovered = retained
+                .capture_recovery_outcome_with_response_options(
+                    id,
+                    &input,
+                    &[],
+                    &fresh,
+                    Some(&response_options),
+                )
+                .unwrap();
+            assert_eq!(live.value, recovered.value, "{id}");
+            assert_eq!(
+                live.sources
+                    .iter()
+                    .map(|m| (&m.key, &m.content_digest))
+                    .collect::<Vec<_>>(),
+                recovered
+                    .sources
+                    .iter()
+                    .map(|m| (&m.key, &m.content_digest))
+                    .collect::<Vec<_>>(),
+                "{id}"
+            );
+            if id == "indexed_transform" {
+                assert_eq!(recovered.value["data"]["rows"].as_array().unwrap().len(), 2);
+            }
+        }
+        for id in [
+            "primary",
+            "root_refinement",
+            "indexed_transform_full",
+            "prime_power_response_full",
+            "u_flow_response_full",
+        ] {
+            assert!(!f::supports_recovery_diagnostic(id), "{id}");
+        }
+        let before = cache_snapshot(&directory);
+        assert!(retained
+            .capture_recovery_outcome("prime_power_response", &input, &[], &cache)
+            .is_err());
+        let mut changed = response_options.clone();
+        changed.primary.xi[0] =
+            xc_numerics::fmt::PortableHpFloat::from_float(&Float::with_val(cfg.precision_bits, 99))
+                .unwrap();
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        changed = response_options.clone();
+        changed.primary.first_positive_root_index = 3;
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        changed = response_options.clone();
+        changed.primary.eigenvalues_pos[0] = PortableEigenvalueResult::Failed {
+            iterations: 9,
+            reason: "changed failure".into(),
+        };
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        changed = response_options.clone();
+        changed.lambda_squared = 17;
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        changed = response_options.clone();
+        changed.quadrature_base_points = 0;
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        let no_matrix =
+            f::RetainedFiniteSources::from_manifests(&manifests, false, &cache).unwrap();
+        assert!(no_matrix
+            .validate_recovery_response_options(&response_options)
+            .is_err());
+        let no_roots = manifests
+            .iter()
+            .filter(|m| {
+                !matches!(
+                    m.key.kind.as_str(),
+                    "ccm_root_refinement" | "ccm_root_discovery_window" | "ccm_secular_source"
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let no_roots = f::RetainedFiniteSources::from_manifests(&no_roots, true, &cache).unwrap();
+        assert!(no_roots
+            .validate_recovery_response_options(&response_options)
+            .is_err());
+        assert!(no_roots
+            .capture_recovery_outcome("indexed_transform", &input, &[], &cache)
+            .is_err());
+        let mut changed_manifest = manifests.clone();
+        changed_manifest
+            .iter_mut()
+            .find(|m| {
+                matches!(
+                    m.key.kind.as_str(),
+                    "ccm_root_refinement" | "ccm_root_discovery_window"
+                )
+            })
+            .unwrap()
+            .content_digest = ContentDigest::sha256(b"changed root payload");
+        assert!(f::RetainedFiniteSources::from_manifests(&changed_manifest, true, &cache).is_err());
+        assert_eq!(
+            cache_snapshot(&directory),
+            before,
+            "refused sources must not acquire replacements"
+        );
+    }
+
     #[test]
     fn retained_run_survives_diagnostic_failure_and_authenticates_warm_sources() {
         retained_run_round_trip(false, false);
@@ -2488,6 +2857,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "arb")]
     #[test]
     fn sector_certificate_is_fixed_by_the_first_request_and_bound_to_its_manifest() {
         use crate::ccm::sector_gap_certificate::CcmSectorGapCertificationOptions;
@@ -2614,6 +2984,30 @@ mod tests {
 
         // Source-only acquisition survives an unrelated optional-input failure,
         // while retaining both that failure and the actual certificate error.
+        // Compactness intentionally excludes external inputs. An unrelated
+        // malformed optional input must not be admitted for this diagnostic.
+        let compactness = run
+            .capture_diagnostic("compactness", &options, &cache)
+            .unwrap();
+        let excluded: crate::ccm::extended_research::ExternalResearchInputs =
+            serde_json::from_value(serde_json::json!({
+                "schema_version":1,
+                "source_eigenpair":run.eigenpair.as_ref().unwrap().manifest.content_digest,
+                "lambda_squared":"13", "n_modes":16, "precision_bits":1,
+                "convention_id":"excluded-input-regression",
+                "definition_digest":ContentDigest::sha256(b"excluded-input-regression"),
+                "approximation_scope":"deliberately invalid optional input, excluded by this diagnostic"
+            })).unwrap();
+        run.extended_inputs = Some(excluded.into());
+        run.extended_inputs_loaded = true;
+        run.run_once_prepared = true;
+        assert!(run.extended_inputs.as_ref().unwrap().admit().is_err());
+        assert_eq!(
+            run.capture_diagnostic("compactness", &options, &cache)
+                .unwrap()
+                .value,
+            compactness.value
+        );
         run.extended_inputs_loaded = true;
         run.extended_input_error = Some("synthetic optional preparation failure".into());
         run.sector_certificate = None;
@@ -2731,6 +3125,9 @@ mod tests {
             None
         };
         let mut run = RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &cache).unwrap();
+        if !with_staging && !wider_window {
+            assert_even_helpers_use_run_scopes(&run, &cache);
+        }
         if let Some(wider) = &wider {
             let manifest = run.source.root_manifest.as_ref().unwrap();
             assert_eq!(
@@ -2931,12 +3328,67 @@ mod tests {
                 let live = run
                     .capture_diagnostic("trial_vector_energy", &options, &cache)
                     .unwrap();
+                if !with_staging && !wider_window {
+                    let resources = xc_core::RunResources::new(128 << 20).unwrap();
+                    let held = resources.try_reserve_retained((128 << 20) - 1).unwrap();
+                    let scratch = xc_core::test_support::TestDir::new("retained-stream-spool");
+                    let readonly = ArtifactCacheContext {
+                        resolver: cache.resolver,
+                        reference_resolver: cache.reference_resolver,
+                        acceptance: cache.acceptance,
+                        ordered_overlays: cache.ordered_overlays.clone(),
+                        mode: ArtifactExecutionCacheMode::RequireReuse,
+                        write_on_miss: false,
+                        write_visibility: cache.write_visibility,
+                        requested_assurance: cache.requested_assurance,
+                        certification_failure_policy: cache.certification_failure_policy,
+                        production_sink: None,
+                    };
+                    let before = cache_snapshot(&root);
+                    assert!(f::RetainedFiniteSources::from_manifests_with_resources(
+                        &run.primary_sources(),
+                        true,
+                        &readonly,
+                        &resources,
+                        &scratch,
+                    )
+                    .is_err());
+                    assert_eq!(resources.usage().retained_bytes, held.bytes());
+                    assert_eq!(resources.usage().working_bytes, 0);
+                    assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+                    drop(held);
+                    let retained = f::RetainedFiniteSources::from_manifests_with_resources(
+                        &run.primary_sources(),
+                        true,
+                        &readonly,
+                        &resources,
+                        &scratch,
+                    )
+                    .unwrap();
+                    assert!(resources.usage().retained_bytes > 0);
+                    assert_eq!(resources.usage().working_bytes, 0);
+                    let replay = retained
+                        .capture(
+                            "trial_vector_energy",
+                            run.extended_inputs.as_deref(),
+                            &run.run_once_sources,
+                            &readonly,
+                        )
+                        .unwrap();
+                    assert_eq!(live.value, serde_json::to_value(replay.value).unwrap());
+                    assert!(replay.reused_manifest.is_some());
+                    assert_eq!(cache_snapshot(&root), before);
+                    assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+                    drop(retained);
+                    assert_eq!(resources.usage().retained_bytes, 0);
+                    assert_eq!(resources.usage().working_bytes, 0);
+                }
                 let replay =
                     f::RetainedFiniteSources::from_manifests(&run.primary_sources(), true, &cache)
                         .unwrap()
                         .capture(
                             "trial_vector_energy",
-                            run.extended_inputs.as_ref(),
+                            run.extended_inputs.as_deref(),
                             &run.run_once_sources,
                             &cache,
                         )
@@ -2967,7 +3419,7 @@ mod tests {
                     );
                 }
             }
-            let inputs = run.extended_inputs.as_ref().unwrap();
+            let inputs = run.extended_inputs.as_deref().unwrap();
             let auto = inputs.run_once.as_ref().unwrap();
             assert_eq!(auto.component_actions.len(), 3, "{:?}", auto.producer_notes);
             assert!(
@@ -3134,7 +3586,7 @@ mod tests {
                     .unwrap()
                     .capture(
                         id,
-                        run.extended_inputs.as_ref(),
+                        run.extended_inputs.as_deref(),
                         &run.run_once_sources,
                         &cache,
                     )
@@ -3222,12 +3674,12 @@ mod tests {
                     f::capture_retained_refinement_cohort(&cohort, &[&retained], &cache).is_err()
                 );
             }
-            let inputs = run.extended_inputs.as_ref().unwrap();
+            let inputs = run.extended_inputs.as_deref().unwrap();
             let mut foreign = inputs.clone();
             foreign.source_eigenpair = ContentDigest::sha256(b"foreign state");
             assert!(run.set_extended_research_inputs(foreign.clone()).is_err());
             // Simulate a structurally valid but foreign file loaded by the environment adapter.
-            run.extended_inputs = Some(foreign);
+            run.extended_inputs = Some(foreign.into());
             run.run_once_prepared = false;
             assert!(run
                 .capture_diagnostic("complex_transform", &options, &cache)
@@ -3309,6 +3761,54 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn assert_even_helpers_use_run_scopes(run: &RetainedCcmRun, cache: &ArtifactCacheContext<'_>) {
+        // An embedding caller may have its own active budget/memo. These
+        // helpers must use the retained run's scope and restore the caller's.
+        let outer_resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let outer_memo = xc_cache::ValidatedValueMemo::new(outer_resources.clone(), 1 << 29);
+        let _resources = outer_resources.enter();
+        let _memo = outer_memo.enter();
+        run.validated_values.clear();
+        let (first, first_states) = run.retained_even_sources(cache).unwrap();
+        let before = xc_cache::validated_value_memo_thread_statistics();
+        let (second, second_states) = run.retained_even_sources(cache).unwrap();
+        assert!(xc_cache::validated_value_memo_thread_statistics().hits > before.hits);
+        assert_eq!(first.manifest(), second.manifest());
+        assert_eq!(
+            first.source_precision_bits(),
+            second.source_precision_bits()
+        );
+        assert_eq!(first.entries(), second.entries());
+        for (left, right) in first.entries().iter().zip(second.entries()) {
+            assert_eq!(left.prec(), right.prec());
+            assert_eq!(left.is_sign_negative(), right.is_sign_negative());
+        }
+        assert_eq!(first_states.len(), second_states.len());
+        for (left, right) in first_states.iter().zip(&second_states) {
+            assert_eq!(left.manifest(), right.manifest());
+        }
+        let first = run.even_state_spectral_isolation(cache).unwrap();
+        let before = xc_cache::validated_value_memo_thread_statistics();
+        let second = run.even_state_spectral_isolation(cache).unwrap();
+        assert!(xc_cache::validated_value_memo_thread_statistics().hits > before.hits);
+        assert_eq!(first, second);
+        assert!(run.validated_values.retained_bytes() > 0);
+        assert_eq!(outer_memo.retained_bytes(), 0);
+        assert_eq!(outer_resources.usage().retained_bytes, 0);
+        let restored = xc_cache::ValidatedValueMemo::current().unwrap();
+        restored.clear();
+        assert!(
+            run.validated_values.retained_bytes() > 0,
+            "the caller's memo was restored"
+        );
+        let charge = xc_core::RunResources::current()
+            .unwrap()
+            .try_reserve_retained(1)
+            .unwrap();
+        assert_eq!(outer_resources.usage().retained_bytes, 1);
+        drop(charge);
+    }
+
     // Every file below `root` as (relative path, content). Only creation
     // times may differ between runs: they are removed, with every manifest
     // digest (which covers its creation time) and the file and staging-draft
@@ -3384,9 +3884,8 @@ mod tests {
     /// One cold capture through the receipt collector, as an application
     /// drives it: the persisted record, every measurement value and outcome,
     /// and all cache and publication-staging files. Also returns how many
-    /// results came from the look-ahead lane. `wait` lets the lane finish after
-    /// each capture, so every look-ahead result is taken; otherwise claims
-    /// race the lane.
+    /// results came from the look-ahead lane. Budgeted retained runs must
+    /// decline that lane even when requested, on global and custom pools.
     fn lookahead_sequence(
         lookahead: bool,
         wait: bool,
@@ -3496,6 +3995,25 @@ mod tests {
         }
         run.set_extended_research_inputs(input).unwrap();
         run.run_once_prepared = true;
+        if lookahead {
+            let resources = run.resources.clone();
+            let _scope = resources.enter();
+            let before = resources.usage();
+            run.start_lookahead(&state);
+            assert!(
+                run.lookahead.is_none(),
+                "no speculative worker may be started"
+            );
+            assert!(
+                !run.lookahead_started,
+                "decline before job preparation and input copies"
+            );
+            assert_eq!(
+                resources.usage(),
+                before,
+                "no speculative input reservation"
+            );
+        }
         let plan = crate::ccm::capture::CcmCapturePlan::ultra(2, 17).unwrap();
         let options = plan.primary_options().unwrap();
         let ids = [
@@ -3515,6 +4033,11 @@ mod tests {
             ids.iter().map(|id| id.to_string()).collect(),
             |id| {
                 let outcome = run.capture_diagnostic_outcome(id, &options, &cache);
+                assert!(
+                    run.lookahead.is_none(),
+                    "budgeted capture must remain inline"
+                );
+                assert!(!run.lookahead_started, "no look-ahead job was prepared");
                 if wait {
                     if let Some(lane) = &run.lookahead {
                         lane.wait_idle();
@@ -3526,7 +4049,7 @@ mod tests {
         )
         .unwrap();
         let taken = crate::ccm::capture_runtime::lookahead_results_taken() - taken;
-        assert_eq!(run.lookahead.is_some(), lookahead);
+        assert!(run.lookahead.is_none());
         drop(run);
         let mut outputs = vec![(
             "record".to_owned(),
@@ -3566,9 +4089,7 @@ mod tests {
     }
 
     #[test]
-    fn lookahead_capture_matches_serial_capture_byte_for_byte() {
-        use crate::ccm::convergence_capture::lookahead;
-        let lanes = lookahead::FINITE.len() + lookahead::EXTENDED.len();
+    fn budgeted_lookahead_capture_stays_inline_and_matches_serial_artifacts_byte_for_byte() {
         for failing_trials in [false, true] {
             let (serial, taken) = lookahead_sequence(false, false, failing_trials);
             assert_eq!(taken, 0);
@@ -3618,7 +4139,10 @@ mod tests {
             };
             // An application thread on the global pool, as in production.
             let taken = compare("global", lookahead_sequence(true, true, failing_trials));
-            assert_eq!(taken, lanes);
+            assert_eq!(
+                taken, 0,
+                "requested look-ahead does not start under the run budget"
+            );
             for threads in [1, 4] {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
@@ -3630,9 +4154,7 @@ mod tests {
                         &label,
                         pool.install(|| lookahead_sequence(true, wait, failing_trials)),
                     );
-                    if wait {
-                        assert_eq!(taken, lanes, "{label}");
-                    }
+                    assert_eq!(taken, 0, "{label}: nested pools use inline capture");
                 }
             }
         }
@@ -3694,6 +4216,32 @@ mod unresolved_certificate_contract {
                 xc_cache::CaptureFailure::Failed { .. }
             ));
         }
+    }
+
+    #[test]
+    fn run_resource_limits_are_blocked_without_relaxing_admission() {
+        let resources = xc_core::RunResources::with_worker_limit(100, 1).unwrap();
+        let retained = resources.try_reserve_retained(80).unwrap();
+        let memory_error = match resources.reserve_working(40) {
+            Err(error) => error,
+            Ok(_) => panic!("the combined budget is enforced"),
+        };
+        let worker_error = resources.check_workers(2).unwrap_err();
+        for error in [memory_error, worker_error] {
+            let error = anyhow::Error::new(error).context("retained capture");
+            let reason = format!("{error:#}");
+            assert_eq!(
+                capture_failure(error),
+                xc_cache::CaptureFailure::Blocked { reason }
+            );
+        }
+        assert_eq!(resources.usage().retained_bytes, 80);
+        assert_eq!(resources.usage().working_bytes, 0);
+        resources.check_workers(1).unwrap();
+        drop(retained);
+        let work = resources.reserve_working(100).unwrap();
+        assert_eq!(resources.usage().working_bytes, 100);
+        drop(work);
     }
 
     #[test]

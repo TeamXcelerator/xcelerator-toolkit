@@ -178,21 +178,29 @@ fn concurrent_writes_retain_every_manifest_in_the_index() {
         true,
         CacheVisibility::Local,
     ));
-    let barrier = Arc::new(Barrier::new(32));
+    // Exercise all 32 distinct writes without requiring more than 32 OS
+    // threads once the test harness and a resource supervisor are included.
+    let barrier = Arc::new(Barrier::new(16));
     let seed = store.put(&draft("test", "concurrent"), &[255]).unwrap();
-    let workers = (0u8..32)
+    let workers = (0u8..16)
         .map(|i| {
             let store = Arc::clone(&store);
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                barrier.wait();
-                store.put(&draft("test", "concurrent"), &[i]).unwrap()
+                (0..2)
+                    .map(|round| {
+                        barrier.wait();
+                        store
+                            .put(&draft("test", "concurrent"), &[i + 16 * round])
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
             })
         })
         .collect::<Vec<_>>();
     let mut expected = workers
         .into_iter()
-        .map(|w| w.join().unwrap().content_digest)
+        .flat_map(|w| w.join().unwrap().into_iter().map(|m| m.content_digest))
         .collect::<BTreeSet<_>>();
     expected.insert(seed.content_digest);
     let actual = store
