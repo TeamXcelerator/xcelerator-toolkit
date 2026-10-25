@@ -6,19 +6,24 @@ fn evenness_accepts_qualified_positive_ground_state() {
     let params = CcmParams::from_lambda_sq_integer(2, 1);
     let mut cfg = HighPrecConfig::for_decimal_digits(25);
     cfg.precision_bits = p;
-    cfg.inverse_iter_steps = 64;
+    cfg.inverse_iter_steps = 1;
     // Same exact parity basis: even eigenvalues1,3, odd eigenvalue10.
     let matrix = [13, 0, -7, 0, 2, 0, -7, 0, 13]
         .into_iter()
         .map(|n| Float::with_val(p, n) / 2u32)
         .collect::<Vec<_>>();
-    // Preserve the original work budget as a refusal control for a partial candidate.
-    let error = measure_evenness_from_tau(&params, &cfg, matrix.clone())
-        .err()
-        .expect("64 steps do not reach the residual floor");
-    assert!(error.to_string().contains("work budget"), "{error:#}");
+    // A single iteration leaves a partial candidate under either LU arithmetic.
+    let error =
+        measure_evenness_from_tau(&params, &cfg, shared_float_vector(matrix.clone()).unwrap())
+            .err()
+            .expect("one step does not reach the residual floor");
+    assert!(
+        error.to_string().contains("directed source residual gate"),
+        "{error:#}"
+    );
     cfg.inverse_iter_steps = 256;
-    let result = measure_evenness_from_tau(&params, &cfg, matrix).unwrap();
+    let result =
+        measure_evenness_from_tau(&params, &cfg, shared_float_vector(matrix).unwrap()).unwrap();
     let tolerance = Float::with_val(p, 1) >> 90u32;
     assert!((result.natural_eigenvalue - 1u32).abs() < tolerance);
     assert!((result.forced_eigenvalue - 1u32).abs() < tolerance);
@@ -31,19 +36,23 @@ fn evenness_must_qualify_algebraic_ground_state() {
     let params = CcmParams::from_lambda_sq_integer(2, 1);
     let mut cfg = HighPrecConfig::for_decimal_digits(25);
     cfg.precision_bits = p;
-    cfg.inverse_iter_steps = 64;
+    cfg.inverse_iter_steps = 1;
     // Exact manufactured centrosymmetric source: (1,0,-1) has eigenvalue -10,
     // (0,1,0) has eigenvalue 1, and (1,0,1) has eigenvalue 3.
     let matrix = [-7, 0, 13, 0, 2, 0, 13, 0, -7]
         .into_iter()
         .map(|n| Float::with_val(p, n) / 2u32)
         .collect::<Vec<_>>();
-    let error = measure_evenness_from_tau(&params, &cfg, matrix.clone())
-        .err()
-        .expect("64 steps do not qualify a ground state");
-    assert!(error.to_string().contains("work budget"), "{error:#}");
+    let error =
+        measure_evenness_from_tau(&params, &cfg, shared_float_vector(matrix.clone()).unwrap())
+            .err()
+            .expect("one step does not qualify a ground state");
+    assert!(
+        error.to_string().contains("directed source residual gate"),
+        "{error:#}"
+    );
     cfg.inverse_iter_steps = 256;
-    match measure_evenness_from_tau(&params, &cfg, matrix) {
+    match measure_evenness_from_tau(&params, &cfg, shared_float_vector(matrix).unwrap()) {
         Ok(result) => {
             xc_core::progress_message!(
                 "manufactured source: reported natural={}, forced={}, deviation={}",

@@ -121,6 +121,7 @@ fn with_remaining_cache(test: impl FnOnce(&ArtifactCacheContext<'_>)) {
     };
     test(&cache);
 }
+#[cfg(feature = "arb")]
 #[test]
 fn admitted_empty_window_records_evidence_cold_and_warm() {
     with_remaining_cache(|cache| {
@@ -162,8 +163,8 @@ fn managed_matrix_matches_off_computation() {
             let expected = direct_matrix_tau(&params, &l, &cfg)?;
             let (cold, cm) = build_tau_hp_via_cache(&params, &l, &cfg, cache)?;
             let (warm, wm) = build_tau_hp_via_cache(&params, &l, &cfg, cache)?;
-            assert_eq!(cold, expected);
-            assert_eq!(warm, expected);
+            assert_eq!(*cold, expected);
+            assert_eq!(*warm, expected);
             assert_eq!(cm, wm);
             assert_eq!(cm.dependencies.len(), 2);
             Ok(())
@@ -215,7 +216,7 @@ fn wide_cached_window_admits_only_the_requested_converged_prefix() {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let l = log_lambda_sq_hp(&params, cfg.precision_bits)?;
             let (mut tau, tau_manifest) = build_tau_hp_via_cache(&params, &l, &cfg, cache)?;
-            force_symmetric(&mut tau, params.matrix_size())?;
+            force_shared_symmetric(&mut tau, params.matrix_size())?;
             let (_, xi, _, eigenpair_manifest, resolved_solver) =
                 weil_eigenpair_via_cache_with_seed(
                     &params, &cfg, &l, &tau, &tau_manifest, cache, None, None,

@@ -1,17 +1,327 @@
-//! Derive finite research inputs from the retained run and the bundled ordinate table.
+//! Derive finite research inputs from the retained run and an authenticated ordinate table.
 //! No result from another run, fitted energy, or assumed ordinate-tail constant is used.
 use super::research_prepare_math as arithmetic;
 use super::{
     convergence_capture::TailForm, extended_research::*, retained_evidence::*,
     state_geometry::RetainedState,
 };
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
 #[cfg(test)]
 use rug::float::Constant;
 use rug::Float;
 use xc_cache::ContentDigest;
 use xc_numerics::prefix::lossless_decimal as dec;
+
+/// Explicit, content-authenticated extension of the bundled reference ordinates.
+///
+/// The bytes are a JSON array of positive, strictly increasing fixed-point
+/// decimal strings. The first 1,000 strings must exactly preserve the bundled
+/// table. Authentication checks byte identity and finite input structure; it
+/// does not establish that supplied values are zeros or certify their digits.
+/// Callers retain the independent dataset-generation evidence separately.
+/// This selection affects arithmetic preparation only, not root acquisition.
+#[derive(Clone, Copy)]
+pub struct ArithmeticReferenceDataset<'a> {
+    pub identity: &'a xc_zeta::zeros::ReferenceZeroDatasetIdentity,
+    pub json: &'a [u8],
+}
+
+/// Validate explicit reference bytes before an expensive primary calculation.
+///
+/// The temporary decoding reservation is additional to existing live owners.
+/// Success authenticates the supplied finite dataset and unchanged bundled
+/// prefix, not the mathematical accuracy or zero-count provenance of its values.
+pub fn validate_arithmetic_reference_dataset(
+    selection: ArithmeticReferenceDataset<'_>,
+    resources: &xc_core::RunResources,
+) -> Result<()> {
+    let _workspace = resources
+        .try_reserve_working(reference_dataset_workspace(selection.json.len())?)
+        .context("arithmetic reference validation exceeds remaining working budget")?;
+    load_reference_extension(selection)?;
+    Ok(())
+}
+
+pub(super) struct OwnedArithmeticReferenceDataset {
+    identity: xc_zeta::zeros::ReferenceZeroDatasetIdentity,
+    json: Vec<u8>,
+    _retained: xc_core::MemoryReservation,
+}
+
+impl OwnedArithmeticReferenceDataset {
+    pub(super) fn new(
+        identity: xc_zeta::zeros::ReferenceZeroDatasetIdentity,
+        json: Vec<u8>,
+        resources: &xc_core::RunResources,
+    ) -> Result<Self> {
+        let retained = resources
+            .try_reserve_retained(
+                u64::try_from(
+                    json.capacity() as u128
+                        + identity.resource_id.capacity() as u128
+                        + identity.content_sha256.capacity() as u128,
+                )
+                .context("arithmetic reference byte capacity overflow")?
+                .checked_add(4096)
+                .context("arithmetic reference byte capacity overflow")?,
+            )
+            .context("arithmetic reference bytes exceed remaining working budget")?;
+        validate_arithmetic_reference_dataset(
+            ArithmeticReferenceDataset {
+                identity: &identity,
+                json: &json,
+            },
+            resources,
+        )?;
+        Ok(Self {
+            identity,
+            json,
+            _retained: retained,
+        })
+    }
+
+    pub(super) fn borrowed(&self) -> ArithmeticReferenceDataset<'_> {
+        ArithmeticReferenceDataset {
+            identity: &self.identity,
+            json: &self.json,
+        }
+    }
+}
+
+fn reference_dataset_workspace(bytes: usize) -> Result<u64> {
+    // Admit borrowed bytes, JSON string/vector growth, decoded records, and
+    // the original bundled-prefix comparison before parsing. This reservation
+    // remains live until preparation releases the decoded table.
+    u64::try_from((bytes as u128) * 32 + (16 << 20))
+        .context("arithmetic reference dataset workspace overflow")
+}
+
+fn reference_decimal_parts(text: &str, digits: u32) -> Result<(&str, &str)> {
+    let (whole, fraction) = text
+        .split_once('.')
+        .context("reference ordinate must be a fixed-point decimal")?;
+    ensure!(
+        !whole.is_empty()
+            && !fraction.is_empty()
+            && whole.bytes().all(|b| b.is_ascii_digit())
+            && fraction.bytes().all(|b| b.is_ascii_digit())
+            && (whole == "0" || !whole.starts_with('0')),
+        "reference ordinate has noncanonical decimal syntax"
+    );
+    let significant = if whole == "0" {
+        fraction.trim_start_matches('0').len()
+    } else {
+        whole.len() + fraction.len()
+    };
+    ensure!(
+        significant > 0 && significant == digits as usize,
+        "reference ordinate does not have its declared significant digits"
+    );
+    Ok((whole, fraction))
+}
+
+fn validate_reference_records(
+    records: &[String],
+    identity: &xc_zeta::zeros::ReferenceZeroDatasetIdentity,
+) -> Result<()> {
+    ensure!(
+        records.len() == identity.record_count,
+        "reference ordinate count mismatch"
+    );
+    let mut previous: Option<(&str, &str)> = None;
+    for text in records {
+        let parts = reference_decimal_parts(text, identity.decimal_digits)?;
+        if let Some((whole, fraction)) = previous {
+            // Equal significant-digit counts and equal integer widths imply
+            // equal fractional widths, so lexicographic order is exact here.
+            ensure!(
+                (whole.len(), whole, fraction) < (parts.0.len(), parts.0, parts.1),
+                "reference ordinates must be strictly increasing"
+            );
+        }
+        previous = Some(parts);
+    }
+    Ok(())
+}
+
+fn load_reference_extension(selection: ArithmeticReferenceDataset<'_>) -> Result<Vec<String>> {
+    let identity = selection.identity;
+    ensure!(
+        identity.validate(),
+        "invalid arithmetic reference dataset identity"
+    );
+    ensure!(
+        (1001..=1_000_000).contains(&identity.record_count)
+            && identity.decimal_digits == 2500
+            && identity.resource_id.len() <= 1024
+            && identity.resource_id != xc_zeta::zeros::BUNDLED_ZETA_ZEROS_RESOURCE,
+        "arithmetic reference extension must preserve and extend the 2500-significant-digit bundled table under a distinct resource identity"
+    );
+    ensure!(
+        ContentDigest::sha256(selection.json).0 == identity.content_sha256,
+        "arithmetic reference dataset digest mismatch"
+    );
+    let records: Vec<String> = serde_json::from_slice(selection.json)
+        .context("invalid arithmetic reference dataset JSON")?;
+    validate_reference_records(&records, identity)?;
+    ensure!(
+        ContentDigest::sha256(xc_zeta::zeros::BUNDLED_ZETA_ZEROS_JSON).0
+            == xc_zeta::zeros::BUNDLED_ZETA_ZEROS_SHA256,
+        "bundled reference prefix differs from its pinned dataset"
+    );
+    let bundled = xc_zeta::zeros::bundled_first_n_strings(1000)?;
+    ensure!(
+        records[..1000] == bundled,
+        "arithmetic reference extension changed the bundled prefix"
+    );
+    Ok(records)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparationShape {
+    modes: usize,
+    dimension: usize,
+    degree: usize,
+    prefix: usize,
+    basis_dimension: usize,
+    ordinates: usize,
+}
+
+impl PreparationShape {
+    fn new(modes: usize, ordinates: usize) -> Result<Self> {
+        ensure!(
+            modes > 0,
+            "arithmetic preparation requires a positive mode count"
+        );
+        ensure!(
+            (1..=1_000_000).contains(&ordinates),
+            "arithmetic preparation requires a nonempty admitted ordinate table"
+        );
+        let dimension = modes
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("arithmetic preparation dimension overflow"))?;
+        dimension
+            .checked_mul(dimension)
+            .context("arithmetic preparation matrix size overflow")?;
+        modes
+            .checked_mul(modes)
+            .context("arithmetic preparation lattice size overflow")?;
+        ensure!(
+            u32::try_from(dimension).is_ok(),
+            "arithmetic preparation factorial exponent exceeds its integer representation"
+        );
+        let degree = modes.min(64);
+        let prefix = modes - degree;
+        ensure!(
+            prefix <= ordinates,
+            "arithmetic preparation needs {prefix} prefix ordinates, but the bundled table has only {ordinates}; supply explicit inputs backed by sufficient ordinate data; no atoms were omitted"
+        );
+        Ok(Self {
+            modes,
+            dimension,
+            degree,
+            prefix,
+            basis_dimension: degree + 1,
+            ordinates,
+        })
+    }
+}
+
+fn preparation_float_bytes(precision: u32) -> u128 {
+    u128::from(precision).div_ceil(64) * 8 + 96
+}
+
+fn preparation_output_bytes(shape: PreparationShape, precision: u32) -> Result<u64> {
+    // Lossless decimal uses fewer than p/3 significant decimal digits.
+    // Include strings, row metadata, promotion/validation, and serialization
+    // scratch. This bounds this producer's shape, not arbitrary external JSON.
+    let scalars = 2 * (shape.ordinates as u128 + shape.modes as u128 + 1)
+        + 3 * (shape.basis_dimension as u128).pow(2)
+        + 64;
+    u64::try_from(4 * scalars * (u128::from(precision).div_ceil(3) + 256) + (1 << 20))
+        .context("arithmetic preparation output estimate overflow")
+}
+
+fn preparation_working_bytes(
+    shape: PreparationShape,
+    source_precision: u32,
+    precision: u32,
+    workers: usize,
+) -> Result<u64> {
+    ensure!(
+        workers > 0,
+        "arithmetic preparation needs a positive worker count"
+    );
+    let dim = shape.dimension as u128;
+    let side = shape.modes as u128 + 1;
+    let basis = shape.basis_dimension as u128;
+    let point = preparation_float_bytes(precision);
+    let guarded = preparation_float_bytes(
+        precision
+            .checked_add(4096)
+            .context("arithmetic preparation guard precision overflow")?,
+    );
+    // Block allowance: interval block, point copy, Householder copy, parallel
+    // Schur columns, and linear scratch. Basis/row arrays remain resident.
+    let blocks_and_basis =
+        (12 * side * side + 8 * dim * basis + 64 * dim + 32 * 4096 + 2 * shape.ordinates as u128)
+            * point;
+    // Every simultaneously active transform worker owns a guarded coefficient
+    // vector and bounded scalar/interval scratch; no table atom is dropped.
+    let transforms = workers as u128 * (8 * dim + 512) * guarded;
+    let state = dim * preparation_float_bytes(source_precision);
+    let table_strings = shape.ordinates as u128 * 512;
+    let output = u128::from(preparation_output_bytes(shape, precision)?);
+    u64::try_from(blocks_and_basis + transforms + state + table_strings + output + (1 << 20))
+        .context("arithmetic preparation workspace estimate overflow")
+}
+
+fn preparation_block_bytes(shape: PreparationShape, precision: u32) -> Result<u64> {
+    let side = shape.modes as u128 + 1;
+    u64::try_from(12 * side * side * preparation_float_bytes(precision))
+        .context("arithmetic preparation block size overflow")
+}
+
+fn preparation_rational_bytes(
+    shape: PreparationShape,
+    coordinates: &[Float],
+    length: &Float,
+    workers: usize,
+) -> Result<u64> {
+    let point_bits = coordinates
+        .iter()
+        .chain(std::iter::once(length))
+        .map(|value| {
+            2 * u128::from(value.prec())
+                + u128::from(i64::from(value.get_exp().unwrap_or(0)).unsigned_abs())
+                + 8
+        })
+        .max()
+        .unwrap_or(8);
+    let n = shape.modes as u128;
+    let prefix = shape.prefix as u128;
+    let log = u128::from(usize::BITS - shape.dimension.leading_zeros());
+    // Dyadic coordinate differences and rational lattice factors accumulate
+    // exact numerator/denominator spans. Bound the complete products before
+    // conversion, including the squared head coefficient. Each arithmetic
+    // kernel independently enforces its per-value exact-rational bit budget.
+    let basis_bits = 8 * n * log
+        + prefix * (2 * point_bits + 4 * log + 8)
+        + shape.basis_dimension as u128 * (4 * log + 8)
+        + point_bits;
+    let head_bits = 2 * (prefix * (2 * point_bits + 8) + n * (point_bits + 4 * log + 8)) + 128;
+    let intermediate = basis_bits
+        .max(head_bits)
+        .min(2 * u128::from(arithmetic::RATIONAL_BIT_BUDGET));
+    let worker_scratch = workers as u128 * (8 * intermediate.div_ceil(8) + 4096);
+    let roots =
+        (shape.ordinates as u128 + shape.prefix as u128 + 2) * (point_bits.div_ceil(8) + 96);
+    let factorials = shape.dimension as u128 * ((2 * n * log).div_ceil(8) + 96);
+    u64::try_from(worker_scratch + roots + factorials)
+        .context("arithmetic preparation rational estimate overflow")
+}
 
 /// Prepare weighted atoms, a finite arithmetic tail form, and Fourier block bounds.
 ///
@@ -23,15 +333,115 @@ pub fn prepare_arithmetic_inputs(
     state: &RetainedState,
     matrix: &RetainedMatrix<'_>,
 ) -> Result<ExternalResearchInputs> {
+    match xc_core::RunResources::current() {
+        Some(resources) => prepare_arithmetic_inputs_with_resources(state, matrix, &resources),
+        None => {
+            let resources = xc_core::RunResources::new(
+                super::capture_runtime::CaptureResourcePolicy::from_environment()?
+                    .maximum_working_bytes,
+            )?;
+            // Standalone borrowed parents have no shared run owner. Include
+            // the already-resident matrix instead of treating it as free.
+            let matrix_bytes = u64::try_from(
+                matrix.entries.len() as u128 * preparation_float_bytes(matrix.precision) + 4096,
+            )
+            .context("arithmetic preparation parent estimate overflow")?;
+            let _parent = resources
+                .try_reserve_retained(matrix_bytes)
+                .context("arithmetic preparation retained matrix exceeds working budget")?;
+            prepare_arithmetic_inputs_with_resources(state, matrix, &resources)
+        }
+    }
+}
+
+/// Explicit shared-budget preparation for an already-admitted retained matrix.
+///
+/// The matrix must already be charged to `resources`; live borrowed matrices
+/// and matrices decoded with `RetainedMatrix::from_reader_with_resources` meet
+/// that contract. New work and the state view are reserved against remaining
+/// capacity through validation and checkpoint serialization. The returned input
+/// is owned by its caller, whose retained-output accounting remains separate.
+pub fn prepare_arithmetic_inputs_with_resources(
+    state: &RetainedState,
+    matrix: &RetainedMatrix<'_>,
+    resources: &xc_core::RunResources,
+) -> Result<ExternalResearchInputs> {
+    prepare_arithmetic_inputs_selected(state, matrix, resources, None)
+}
+
+/// Prepare finite arithmetic inputs using an explicitly selected reference extension.
+///
+/// The matrix must already be charged to `resources`, as for the bundled
+/// entry point. Dataset bytes and parsing are additionally admitted before
+/// decoding and remain charged throughout this call. No file or environment
+/// lookup, implicit selection, truncation, root discovery, or publication is
+/// performed. Every supplied ordinate participates in the finite atom form.
+///
+/// The expected dataset identity enters the preparation definition/checkpoint
+/// key and the output scope. A changed identity cannot reuse bundled or other
+/// dataset preparations. Existing bundled entry points retain their original
+/// selection and output bytes. A caller wishing to extend only large-N rows
+/// must explicitly keep small-N rows on those bundled entry points.
+pub fn prepare_arithmetic_inputs_with_reference_dataset_and_resources(
+    state: &RetainedState,
+    matrix: &RetainedMatrix<'_>,
+    resources: &xc_core::RunResources,
+    reference: ArithmeticReferenceDataset<'_>,
+) -> Result<ExternalResearchInputs> {
+    prepare_arithmetic_inputs_selected(state, matrix, resources, Some(reference))
+}
+
+fn prepare_arithmetic_inputs_selected(
+    state: &RetainedState,
+    matrix: &RetainedMatrix<'_>,
+    resources: &xc_core::RunResources,
+    reference: Option<ArithmeticReferenceDataset<'_>>,
+) -> Result<ExternalResearchInputs> {
     matrix.match_state(state)?;
-    ensure!(
-        state.modes > 0 && state.modes <= 512,
-        "automatic polynomial preparation supports 1..512 modes; larger sections require an explicit resource policy"
-    );
-    let _stage = super::capture_runtime::Stage::new("retained arithmetic research preparation");
-    let p = state.precision.saturating_add(128);
+    let _scope = resources.enter();
+    let workers = arithmetic::preparation_workers()?;
+    // The block eigensolver still uses the existing pool. Bounded producer
+    // tasks must not mask that pool's independent worker admission.
+    resources.check_workers(rayon::current_num_threads())?;
+    let p = state
+        .precision
+        .checked_add(128)
+        .context("arithmetic preparation precision overflow")?;
     precision(p)?;
-    let table = xc_zeta::zeros::bundled_dataset_identity()?;
+    let reference_owner = reference
+        .map(|selected| {
+            resources
+                .try_reserve_working(reference_dataset_workspace(selected.json.len())?)
+                .context("arithmetic reference dataset exceeds remaining working budget")
+        })
+        .transpose()?;
+    let external_records = reference.map(load_reference_extension).transpose()?;
+    let table = match reference {
+        Some(selected) => selected.identity.clone(),
+        None => xc_zeta::zeros::bundled_dataset_identity()?,
+    };
+    let shape = PreparationShape::new(state.modes, table.record_count)?;
+    let working = preparation_working_bytes(shape, state.precision, p, workers)?;
+    let output = preparation_output_bytes(shape, p)?;
+    let blocks = preparation_block_bytes(shape, p)?;
+    // Dense interval/eigensolver blocks are not built until block_allowance.
+    // Keep serialized output covered throughout, and reserve that later stage
+    // only after the earlier Float arrays and exact coefficients are dropped.
+    let arithmetic_working = working
+        .checked_sub(output)
+        .and_then(|bytes| bytes.checked_sub(blocks))
+        .context("arithmetic preparation stage size overflow")?;
+    let _output = resources.try_reserve_working(output).with_context(|| {
+        format!("arithmetic preparation workspace requires {output} additional output bytes")
+    })?;
+    let arithmetic_workspace = resources
+        .try_reserve_working(arithmetic_working)
+        .with_context(|| {
+            format!(
+                "arithmetic preparation workspace requires {arithmetic_working} additional bytes"
+            )
+        })?;
+    let _stage = super::capture_runtime::Stage::new("retained arithmetic research preparation");
     let definition = ContentDigest::sha256(&serde_json::to_vec(&(
         "retained-arithmetic-polynomial-v4",
         &matrix.manifest.content_digest,
@@ -44,26 +454,44 @@ pub fn prepare_arithmetic_inputs(
         &definition,
         &state.manifest.content_digest,
     ))?;
-    if let Some(input) = store.load::<ExternalResearchInputs>("arithmetic-inputs")? {
+    if let Some(input) = store
+        .limited_bytes(preparation_output_bytes(shape, p)? / 4)
+        .load::<ExternalResearchInputs>("arithmetic-inputs")?
+    {
         input.matches(state)?;
         return Ok(input);
     }
     let n = state.modes;
-    let dim = 2 * n + 1;
+    let dim = shape.dimension;
     let l = finite_math::rounded_log_cutoff(&state.cutoff, p)?;
-    let zeros = xc_zeta::zeros::bundled_first_n_strings(table.record_count)?;
+    let zeros = match external_records {
+        Some(records) => records,
+        None => xc_zeta::zeros::bundled_first_n_strings(table.record_count)?,
+    };
     let ordinates = coeffs(&zeros, p)?;
     let z = arithmetic::coordinates(&ordinates, &l, n, p)?;
     // Fixed before any solve: retain at most degree 64 after a known-ordinate prefix.
-    let degree = n.min(64);
-    let prefix = n - degree;
-    let d = degree + 1;
-    let scope = format!(
-        "finite retained arithmetic section with correctly rounded point stages at {p} bits and exact dyadic head/tail splitting; coordinate z=(t/(2*pi*N/log(C)))^2; first {prefix} bundled ordinate decimals fixed as prefix; monomial basis 1,z,...,z^{degree} after that prefix; all {} bundled atoms through t={}; table sha256={}; arithmetic remainder=V^T*A*V/2-explicit head, includes all omitted signed form contributions of the stored matrix; no RH, complete critical-line head, continuum transfer, or source-accuracy premise",
+    let degree = shape.degree;
+    let prefix = shape.prefix;
+    let d = shape.basis_dimension;
+    let rational_bytes = preparation_rational_bytes(shape, &z, &l, workers)?;
+    let source_label = if reference.is_some() {
+        "explicit reference"
+    } else {
+        "bundled"
+    };
+    let mut scope = format!(
+        "finite retained arithmetic section with correctly rounded point stages at {p} bits and exact dyadic head/tail splitting; coordinate z=(t/(2*pi*N/log(C)))^2; first {prefix} {source_label} ordinate decimals fixed as prefix; monomial basis 1,z,...,z^{degree} after that prefix; all {} {source_label} atoms through t={}; table sha256={}; arithmetic remainder=V^T*A*V/2-explicit head, includes all omitted signed form contributions of the stored matrix; no RH, complete critical-line head, continuum transfer, or source-accuracy premise",
         table.record_count,
         zeros.last().unwrap(),
         table.content_sha256
     );
+    if reference.is_some() {
+        scope.push_str(&format!(
+            "; explicit reference identity={}; decimal significant digits={}; original 1000-record bundled prefix preserved; dataset authentication does not replay zero isolation or prove source accuracy",
+            table.resource_id, table.decimal_digits
+        ));
+    }
     let mut input: ExternalResearchInputs = serde_json::from_value(serde_json::json!({
         "schema_version":1,"source_eigenpair":state.manifest.content_digest,
         "lambda_squared":state.cutoff,"n_modes":n,"precision_bits":p,
@@ -71,20 +499,27 @@ pub fn prepare_arithmetic_inputs(
         "approximation_scope":scope
     }))?;
     // State-weighted measures: transform squared and physical unit coefficient masses.
-    input.atoms = ordinates
-        .par_iter()
-        .enumerate()
-        .map(|(j, t)| -> Result<_> {
-            let (v, _, _, _) = transform_terms(state, t, p)?;
-            Ok(WeightedAtom {
-                ordinal: j + 1,
-                coordinate: dec(&z[j]),
-                weight: dec(&arithmetic::square_sum(&[v], p)?),
-                family: "zero".into(),
-                partition: "bundled_decimal_head".into(),
-            })
+    input.atoms = arithmetic::preparation_map(ordinates.len(), workers, |j| -> Result<_> {
+        let t = &ordinates[j];
+        // Exact weight squaring reserves from its actual exponent span.
+        // Workers must participate in the same run ledger as the owner.
+        let _scope = resources.enter();
+        let (v, _, _, _) = transform_terms(state, t, p)?;
+        Ok(WeightedAtom {
+            ordinal: j + 1,
+            coordinate: dec(&z[j]),
+            weight: dec(&arithmetic::square_sum(&[v], p)?),
+            family: "zero".into(),
+            partition: if reference.is_some() {
+                "explicit_reference_decimal_head"
+            } else {
+                "bundled_decimal_head"
+            }
+            .into(),
         })
-        .collect::<Result<Vec<_>>>()?;
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
     let unit = source_unit(state, p)?;
     for k in 0..=n {
         let mass = arithmetic::square_sum(
@@ -112,15 +547,40 @@ pub fn prepare_arithmetic_inputs(
     input.atom_coordinate = Some("z=(t/(2*pi*N/log(C)))^2; lattice z=(mode/N)^2".into());
     input.atom_coverage = Some(scope.clone());
 
-    let v = arithmetic::basis(&z, &l, n, d, p)?;
+    let v = {
+        let _rational = resources.try_reserve_working(rational_bytes)
+            .with_context(|| format!("arithmetic preparation exact coefficients require {rational_bytes} additional bytes"))?;
+        arithmetic::basis(&z, &l, n, d, p)?
+    };
     let (gram, actual) = arithmetic::forms(&matrix.entries, &v, dim, d, p)?;
-    let head = arithmetic::head(&ordinates, &z, &l, n, d, p)?;
-    let (output_precision, tail) = arithmetic::split(&actual, &head, p)?;
+    drop(v);
+    let head = {
+        let _rational = resources.try_reserve_working(rational_bytes)
+            .with_context(|| format!("arithmetic preparation exact coefficients require {rational_bytes} additional bytes"))?;
+        arithmetic::head(&ordinates, &z, &l, n, d, p)?
+    };
+    let (output_precision, tail, _promoted_output) =
+        arithmetic::split(&actual, &head, p, resources, |target| {
+            let promoted_bytes = preparation_output_bytes(shape, target)?
+                .saturating_sub(preparation_output_bytes(shape, p)?);
+            resources
+                .try_reserve_working(promoted_bytes)
+                .context("arithmetic preparation exact output exceeds remaining working budget")
+        })?;
     let form=TailForm {definition_digest:definition.clone(),dimension:d,finite_zero_form:head.iter().map(dec).collect(),tail_correction:vec!["0".into();d*d],lattice_gram:gram.iter().map(dec).collect(),tail_operator_error:None,coverage:scope.clone(),hypotheses:vec!["Point arithmetic of the exact retained parent; assembly/source error is not bounded here. Model energy is computed without retained eigenvalue or eigenvector inputs.".into()],polynomial_coordinate:Some(input.atom_coordinate.clone().unwrap())};
     input.run_once = Some(super::convergence_capture::RunOnceInputs {
         tail_form: Some(form),
         ..Default::default()
     });
+    let tail_correction = tail.iter().map(dec).collect();
+    drop((actual, gram, head, tail, l, z, ordinates, zeros, unit));
+    drop(reference_owner);
+    drop(arithmetic_workspace);
+    // Reuse the original conservative stage estimate rather than assuming
+    // that dropping reservations alone freed still-owned native storage.
+    let _blocks = resources
+        .try_reserve_working(working - output)
+        .context("arithmetic preparation block bounds exceed remaining workspace")?;
     input.energy_allowance = Some(block_allowance(state, matrix, p)?);
     super::research_completion::promote_input_precision(&mut input, output_precision)?;
     input
@@ -130,7 +590,7 @@ pub fn prepare_arithmetic_inputs(
         .tail_form
         .as_mut()
         .unwrap()
-        .tail_correction = tail.iter().map(dec).collect();
+        .tail_correction = tail_correction;
     input.validate()?;
     if let Err(e) = store.save("arithmetic-inputs", &input) {
         xc_core::progress_message!("arithmetic preparation checkpoint unavailable: {e}");
@@ -156,15 +616,18 @@ fn bound_decimal(value: &Float, upper: bool) -> String {
 fn ordered_sum(
     start: xc_numerics::mpfr_interval::MpfrInterval,
     count: usize,
+    workers: usize,
     term: impl Fn(usize) -> xc_numerics::mpfr_interval::MpfrInterval + Sync,
 ) -> xc_numerics::mpfr_interval::MpfrInterval {
     const CHUNK: usize = 4096;
     let mut sum = start;
     for first in (0..count).step_by(CHUNK) {
-        let terms = (first..count.min(first + CHUNK))
-            .into_par_iter()
-            .map(&term)
-            .collect::<Vec<_>>();
+        // Keep the original bounded term buffer. Limit simultaneous tasks,
+        // rather than introducing one parallel barrier per worker-sized slice.
+        let terms =
+            arithmetic::preparation_map(count.min(first + CHUNK) - first, workers, |offset| {
+                term(first + offset)
+            });
         for value in terms {
             sum = sum.add(&value);
         }
@@ -174,6 +637,7 @@ fn ordered_sum(
 fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<EnergyAllowance> {
     use xc_numerics::mpfr_interval::MpfrInterval as I;
     let _stage = super::capture_runtime::Stage::new("finite matrix block bounds");
+    let workers = arithmetic::preparation_workers()?;
     // Interval terms are formed on workers; every sum and elimination keeps
     // its serial order, so each bound is the serial bound bit for bit.
     xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
@@ -193,30 +657,26 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
     let mut notes = Vec::new();
     let mut lower = |indices: &[usize]| -> Result<Float> {
         let size = indices.len();
-        let mut block = (0..size * size)
-            .into_par_iter()
-            .map(|t| a(indices[t / size], indices[t % size]))
-            .collect::<Vec<_>>();
-        let gersh = (0..size)
-            .into_par_iter()
-            .map(|i| {
-                let mut v = block[i * size + i].clone();
-                for j in 0..size {
-                    if i != j {
-                        let radius = block[i * size + j]
-                            .lower()
-                            .clone()
-                            .abs()
-                            .max(&block[i * size + j].upper().clone().abs());
-                        v = v.sub(&I::point(radius));
-                    }
+        let mut block = arithmetic::preparation_map(size * size, workers, |t| {
+            a(indices[t / size], indices[t % size])
+        });
+        let gersh = arithmetic::preparation_map(size, workers, |i| {
+            let mut v = block[i * size + i].clone();
+            for j in 0..size {
+                if i != j {
+                    let radius = block[i * size + j]
+                        .lower()
+                        .clone()
+                        .abs()
+                        .max(&block[i * size + j].upper().clone().abs());
+                    v = v.sub(&I::point(radius));
                 }
-                v.lower().clone()
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .min_by(Float::total_cmp)
-            .unwrap();
+            }
+            v.lower().clone()
+        })
+        .into_iter()
+        .min_by(Float::total_cmp)
+        .unwrap();
         let point = block
             .iter()
             .map(|a| a.midpoint_point().lower().clone())
@@ -249,18 +709,22 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
                     );
                     // Column i of the Schur update reads only column j, which
                     // this step leaves unchanged; columns update independently.
-                    let columns = (j + 1..size)
-                        .into_par_iter()
-                        .map(|i| -> Result<Vec<I>> {
-                            let factor = block[i * size + j].div(&pivot)?;
-                            Ok((i..size)
-                                .map(|k| block[k * size + i].sub(&block[k * size + j].mul(&factor)))
-                                .collect())
-                        })
-                        .collect::<Vec<_>>();
-                    for (i, column) in (j + 1..size).zip(columns) {
-                        for (k, value) in (i..size).zip(column?) {
-                            block[k * size + i] = value;
+                    for first in (j + 1..size).step_by(workers) {
+                        let columns = (first..size.min(first + workers))
+                            .into_par_iter()
+                            .map(|i| -> Result<Vec<I>> {
+                                let factor = block[i * size + j].div(&pivot)?;
+                                Ok((i..size)
+                                    .map(|k| {
+                                        block[k * size + i].sub(&block[k * size + j].mul(&factor))
+                                    })
+                                    .collect())
+                            })
+                            .collect::<Vec<_>>();
+                        for (i, column) in (first..size).zip(columns) {
+                            for (k, value) in (i..size).zip(column?) {
+                                block[k * size + i] = value;
+                            }
                         }
                     }
                 }
@@ -275,7 +739,7 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
     };
     let b = lower(&low)?;
     let mu = lower(&high)?;
-    let cross = ordered_sum(I::from_i64(0, p), low.len() * high.len(), |t| {
+    let cross = ordered_sum(I::from_i64(0, p), low.len() * high.len(), workers, |t| {
         a(low[t / high.len()], high[t % high.len()]).square()
     });
     // Use the raw dyadic state and divide by its interval norm. No assumption
@@ -288,7 +752,7 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
     let norm = v
         .iter()
         .fold(I::from_i64(0, p), |sum, x| sum.add(&x.square()));
-    let energy = ordered_sum(I::from_i64(0, p), d * d, |t| {
+    let energy = ordered_sum(I::from_i64(0, p), d * d, workers, |t| {
         a(t / d, t % d).mul(&v[t / d]).mul(&v[t % d])
     });
     let trial = energy.div(&norm)?;
@@ -307,6 +771,417 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_extension_fixture() -> (Vec<String>, xc_zeta::zeros::ReferenceZeroDatasetIdentity)
+    {
+        let mut records = xc_zeta::zeros::bundled_first_n_strings(1000).unwrap();
+        // Synthetic finite input, not an assertion about the 1001st zero.
+        records.push(format!("2000.{}", "0".repeat(2496)));
+        let identity = xc_zeta::zeros::ReferenceZeroDatasetIdentity {
+            schema_version: 1,
+            resource_id: "test/explicit-reference-extension".into(),
+            content_sha256: ContentDigest::sha256(&serde_json::to_vec(&records).unwrap()).0,
+            record_count: records.len(),
+            decimal_digits: 2500,
+        };
+        (records, identity)
+    }
+
+    #[test]
+    fn explicit_reference_extension_authenticates_all_bytes_and_preserves_prefix() {
+        let (records, identity) = reference_extension_fixture();
+        let bytes = serde_json::to_vec(&records).unwrap();
+        let loaded = load_reference_extension(ArithmeticReferenceDataset {
+            identity: &identity,
+            json: &bytes,
+        })
+        .unwrap();
+        assert_eq!(loaded, records);
+        let mut changed = bytes.clone();
+        changed.push(b' ');
+        assert!(load_reference_extension(ArithmeticReferenceDataset {
+            identity: &identity,
+            json: &changed
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("digest mismatch"));
+        let mut changed = records;
+        let replacement = if changed[0].as_bytes()[2499] == b'0' {
+            "1"
+        } else {
+            "0"
+        };
+        changed[0].replace_range(2499..2500, replacement);
+        let bytes = serde_json::to_vec(&changed).unwrap();
+        let identity = xc_zeta::zeros::ReferenceZeroDatasetIdentity {
+            content_sha256: ContentDigest::sha256(&bytes).0,
+            ..identity
+        };
+        assert!(load_reference_extension(ArithmeticReferenceDataset {
+            identity: &identity,
+            json: &bytes
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("bundled prefix"));
+    }
+
+    #[test]
+    fn explicit_reference_extension_refuses_bad_identity_count_precision_and_json() {
+        let (records, identity) = reference_extension_fixture();
+        let bytes = serde_json::to_vec(&records).unwrap();
+        for bad in [
+            xc_zeta::zeros::ReferenceZeroDatasetIdentity {
+                schema_version: 2,
+                ..identity.clone()
+            },
+            xc_zeta::zeros::ReferenceZeroDatasetIdentity {
+                record_count: 1002,
+                ..identity.clone()
+            },
+            xc_zeta::zeros::ReferenceZeroDatasetIdentity {
+                record_count: 1000,
+                ..identity.clone()
+            },
+            xc_zeta::zeros::ReferenceZeroDatasetIdentity {
+                decimal_digits: 2499,
+                ..identity.clone()
+            },
+            xc_zeta::zeros::ReferenceZeroDatasetIdentity {
+                resource_id: xc_zeta::zeros::BUNDLED_ZETA_ZEROS_RESOURCE.into(),
+                ..identity.clone()
+            },
+        ] {
+            assert!(load_reference_extension(ArithmeticReferenceDataset {
+                identity: &bad,
+                json: &bytes
+            })
+            .is_err());
+        }
+        let bad = b"[null]";
+        let identity = xc_zeta::zeros::ReferenceZeroDatasetIdentity {
+            content_sha256: ContentDigest::sha256(bad).0,
+            ..identity
+        };
+        assert!(load_reference_extension(ArithmeticReferenceDataset {
+            identity: &identity,
+            json: bad
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("JSON"));
+    }
+
+    #[test]
+    fn explicit_reference_decimal_validation_is_exact_and_rejects_ambiguous_inputs() {
+        let identity = xc_zeta::zeros::ReferenceZeroDatasetIdentity {
+            schema_version: 1,
+            resource_id: "test".into(),
+            content_sha256: "0".repeat(64),
+            record_count: 3,
+            decimal_digits: 3,
+        };
+        assert!(validate_reference_records(
+            &["0.00100".into(), "0.0100".into(), "10.1".into()],
+            &identity
+        )
+        .is_ok());
+        for bad in [
+            "0.000", "-1.00", "+1.00", "1e2", "01.0", "1.0", "1.000", "NaN", "inf", "1.00 ",
+            "1.0.0",
+        ] {
+            assert!(reference_decimal_parts(bad, 3).is_err(), "{bad}");
+        }
+        for values in [["1.00", "1.00", "2.00"], ["1.00", "0.900", "2.00"]] {
+            assert!(validate_reference_records(&values.map(str::to_owned), &identity).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_reference_extension_resource_admission_precedes_parsing_and_releases() {
+        let p = 64;
+        let state = RetainedState {
+            manifest: manifest("ccm_weil_eigenpair", b"reference admission state"),
+            cutoff: "13".into(),
+            modes: 1,
+            precision: p,
+            coefficients: [0, 1, 0].map(|x| Float::with_val(p, x)).to_vec(),
+            eigenvalue: "1".into(),
+            selection_policy: None,
+        };
+        let entries = [1, 0, 0, 0, 1, 0, 0, 0, 1].map(|x| Float::with_val(p, x));
+        let matrix = RetainedMatrix::from_admitted_runtime(
+            manifest("ccm_tau_matrix", b"reference admission matrix"),
+            state.cutoff.clone(),
+            1,
+            p,
+            &entries,
+        )
+        .unwrap();
+        let (_, identity) = reference_extension_fixture();
+        let bad = b"not JSON";
+        let limit = reference_dataset_workspace(bad.len()).unwrap();
+        let resources = xc_core::RunResources::new(limit).unwrap();
+        let retained = resources.try_reserve_retained(1).unwrap();
+        let error = prepare_arithmetic_inputs_with_reference_dataset_and_resources(
+            &state,
+            &matrix,
+            &resources,
+            ArithmeticReferenceDataset {
+                identity: &identity,
+                json: bad,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("remaining working budget"));
+        assert_eq!(resources.usage().working_bytes, 0);
+        assert_eq!(resources.usage().retained_bytes, retained.bytes());
+        drop(retained);
+        let error = prepare_arithmetic_inputs_with_reference_dataset_and_resources(
+            &state,
+            &matrix,
+            &resources,
+            ArithmeticReferenceDataset {
+                identity: &identity,
+                json: bad,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("digest mismatch"));
+        assert_eq!(resources.usage().working_bytes, 0);
+        assert!(xc_core::RunResources::current().is_none());
+    }
+
+    #[test]
+    fn explicit_reference_extension_keeps_numeric_prefix_and_separates_output_identity() {
+        let p = 64;
+        let state = RetainedState {
+            manifest: manifest("ccm_weil_eigenpair", b"reference numeric state"),
+            cutoff: "13".into(),
+            modes: 1,
+            precision: p,
+            coefficients: [0, 1, 0].map(|x| Float::with_val(p, x)).to_vec(),
+            eigenvalue: "1".into(),
+            selection_policy: None,
+        };
+        let entries = [1, 0, 0, 0, 1, 0, 0, 0, 1].map(|x| Float::with_val(p, x));
+        let matrix = RetainedMatrix::from_admitted_runtime(
+            manifest("ccm_tau_matrix", b"reference numeric matrix"),
+            state.cutoff.clone(),
+            1,
+            p,
+            &entries,
+        )
+        .unwrap();
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let (records, identity) = reference_extension_fixture();
+        let bytes = serde_json::to_vec(&records).unwrap();
+        let default =
+            prepare_arithmetic_inputs_with_resources(&state, &matrix, &resources).unwrap();
+        let extended = prepare_arithmetic_inputs_with_reference_dataset_and_resources(
+            &state,
+            &matrix,
+            &resources,
+            ArithmeticReferenceDataset {
+                identity: &identity,
+                json: &bytes,
+            },
+        )
+        .unwrap();
+        assert_ne!(default.definition_digest, extended.definition_digest);
+        assert_eq!(extended.atoms.len(), default.atoms.len() + 1);
+        for (old, new) in default.atoms[..1000].iter().zip(&extended.atoms[..1000]) {
+            assert_eq!(
+                (&old.ordinal, &old.coordinate, &old.weight, &old.family),
+                (&new.ordinal, &new.coordinate, &new.weight, &new.family)
+            );
+            assert_eq!(old.partition, "bundled_decimal_head");
+            assert_eq!(new.partition, "explicit_reference_decimal_head");
+        }
+        assert_eq!(
+            serde_json::to_value(&default.energy_allowance).unwrap(),
+            serde_json::to_value(&extended.energy_allowance).unwrap()
+        );
+        assert!(extended
+            .approximation_scope
+            .contains(&identity.content_sha256));
+        assert!(extended.approximation_scope.contains(&identity.resource_id));
+        assert_eq!(default.convention_id, extended.convention_id);
+        assert_eq!(resources.usage().working_bytes, 0);
+        let again = prepare_arithmetic_inputs_with_resources(&state, &matrix, &resources).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&default).unwrap(),
+            serde_json::to_vec(&again).unwrap()
+        );
+    }
+    #[test]
+    fn ordered_interval_sum_keeps_large_batches_ordered_and_workers_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use xc_numerics::mpfr_interval::MpfrInterval as I;
+        let count = 8193;
+        let term = |index: usize| {
+            I::point(Float::with_val(64, (index % 31) as i64 - 15) >> ((index * 17) % 193) as u32)
+        };
+        let expected = (0..count).fold(I::from_i64(0, 64), |sum, index| sum.add(&term(index)));
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let calls = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let actual = pool.install(|| {
+            ordered_sum(I::from_i64(0, 64), count, 3, |index| {
+                let live = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(live, Ordering::SeqCst);
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::yield_now();
+                let value = term(index);
+                active.fetch_sub(1, Ordering::SeqCst);
+                value
+            })
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), count);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!((1..=3).contains(&peak.load(Ordering::SeqCst)));
+        assert_eq!(actual.lower().as_ord(), expected.lower().as_ord());
+        assert_eq!(actual.upper().as_ord(), expected.upper().as_ord());
+    }
+
+    #[test]
+    fn arithmetic_keeps_worker_admission_for_the_unthrottled_eigensolver() {
+        let p = 64;
+        let state = RetainedState {
+            manifest: manifest("ccm_weil_eigenpair", b"worker admission state"),
+            cutoff: "13".into(),
+            modes: 1,
+            precision: p,
+            coefficients: [0, 1, 0].map(|value| Float::with_val(p, value)).to_vec(),
+            eigenvalue: "1".into(),
+            selection_policy: None,
+        };
+        let entries = [1, 0, 0, 0, 1, 0, 0, 0, 1].map(|value| Float::with_val(p, value));
+        let matrix = RetainedMatrix::from_admitted_runtime(
+            manifest("ccm_tau_matrix", b"worker admission matrix"),
+            state.cutoff.clone(),
+            1,
+            p,
+            &entries,
+        )
+        .unwrap();
+        let resources = xc_core::RunResources::with_worker_limit(1 << 20, 1).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let error = pool
+            .install(|| prepare_arithmetic_inputs_with_resources(&state, &matrix, &resources))
+            .unwrap_err();
+        assert!(error.to_string().contains("worker"));
+        assert_eq!(resources.usage().working_bytes, 0);
+        assert!(xc_core::RunResources::current().is_none());
+    }
+
+    #[test]
+    fn arithmetic_stage_reservations_do_not_hold_future_dense_blocks() {
+        for (modes, source_precision) in [(120, 3386), (800, 6708), (970, 6708)] {
+            let shape = PreparationShape::new(modes, 1000).unwrap();
+            let p = source_precision + 128;
+            let working = preparation_working_bytes(shape, source_precision, p, 16).unwrap();
+            let output = preparation_output_bytes(shape, p).unwrap();
+            let blocks = preparation_block_bytes(shape, p).unwrap();
+            assert!(blocks > 0 && working > blocks + output);
+            let early = working - blocks;
+            let resources = xc_core::RunResources::new(working).unwrap();
+            let output_owner = resources.try_reserve_working(output).unwrap();
+            let early_owner = resources.try_reserve_working(early - output).unwrap();
+            assert_eq!(resources.usage().working_bytes, early);
+            drop(early_owner);
+            let late_owner = resources.try_reserve_working(working - output).unwrap();
+            assert_eq!(resources.usage().working_bytes, working);
+            drop((late_owner, output_owner));
+            assert_eq!(resources.usage().working_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn arithmetic_admission_uses_resources_and_keeps_the_full_ordinate_prefix() {
+        let table = xc_zeta::zeros::bundled_dataset_identity().unwrap();
+        let shape = PreparationShape::new(800, table.record_count).unwrap();
+        assert_eq!(
+            (shape.dimension, shape.prefix, shape.basis_dimension),
+            (1601, 736, 65)
+        );
+        assert_eq!(shape.ordinates, table.record_count);
+        assert!(PreparationShape::new(table.record_count + 64, table.record_count).is_ok());
+        let error = PreparationShape::new(table.record_count + 65, table.record_count).unwrap_err();
+        assert!(error.to_string().contains("no atoms were omitted"));
+        assert!(PreparationShape::new(usize::MAX, table.record_count).is_err());
+
+        let source_precision = 3386;
+        let p = source_precision + 128;
+        let working = preparation_working_bytes(shape, source_precision, p, 128).unwrap();
+        let coordinates = [Float::with_val(p, 1), Float::with_val(p, 4)];
+        let rational =
+            preparation_rational_bytes(shape, &coordinates, &Float::with_val(p, 3), 128).unwrap();
+        let matrix = u64::try_from(
+            (shape.dimension as u128).pow(2) * preparation_float_bytes(source_precision) + 4096,
+        )
+        .unwrap();
+        // A conservative exponent-span fixture for the separate exact-form
+        // reservation; no N=800 matrix or numerical calculation is allocated.
+        let exact_form = u64::try_from(
+            ((shape.dimension as u128).pow(2) * u128::from(source_precision + 8192 + 2)
+                + shape.dimension as u128
+                    * shape.basis_dimension as u128
+                    * u128::from(p + 16_384 + 2))
+                * (shape.basis_dimension as u128 + 4)
+                / 8,
+        )
+        .unwrap();
+        let resources = xc_core::RunResources::with_worker_limit(512 << 30, 128).unwrap();
+        let _matrix = resources.try_reserve_retained(matrix).unwrap();
+        let _working = resources.try_reserve_working(working).unwrap();
+        let _rational = resources.try_reserve_working(rational).unwrap();
+        let _exact_form = resources.try_reserve_working(exact_form).unwrap();
+        assert!(resources.usage().peak_bytes < 512 << 30);
+        let small = xc_core::RunResources::new(working - 1).unwrap();
+        assert!(small.try_reserve_working(working).is_err());
+        assert_eq!(small.usage().working_bytes, 0);
+    }
+
+    #[test]
+    fn arithmetic_low_remaining_budget_refuses_before_stage_allocation() {
+        let p = 64;
+        let state = RetainedState {
+            manifest: manifest("ccm_weil_eigenpair", b"bounded arithmetic state"),
+            cutoff: "13".into(),
+            modes: 1,
+            precision: p,
+            coefficients: [0, 1, 0].map(|value| Float::with_val(p, value)).to_vec(),
+            eigenvalue: "1".into(),
+            selection_policy: None,
+        };
+        let entries = [1, 0, 0, 0, 1, 0, 0, 0, 1].map(|value| Float::with_val(p, value));
+        let matrix = RetainedMatrix::from_admitted_runtime(
+            manifest("ccm_tau_matrix", b"bounded arithmetic matrix"),
+            state.cutoff.clone(),
+            1,
+            p,
+            &entries,
+        )
+        .unwrap();
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let retained = resources.try_reserve_retained((1 << 20) - 1).unwrap();
+        let error =
+            prepare_arithmetic_inputs_with_resources(&state, &matrix, &resources).unwrap_err();
+        assert!(error.to_string().contains("workspace requires"));
+        assert_eq!(resources.usage().working_bytes, 0);
+        assert_eq!(resources.usage().retained_bytes, retained.bytes());
+        assert!(xc_core::RunResources::current().is_none());
+    }
+
     #[test]
     fn parallel_block_allowance_is_bit_identical_to_serial_reference_at_any_thread_count() {
         let p = 256;

@@ -54,7 +54,7 @@ pub struct CcmCheckpointSpectra {
 
 fn digits(value: &Float, round: Round) -> String {
     let digits = xc_numerics::reduction::roundtrip_decimal_digits(value.prec());
-    value.to_string_radix_round(10, Some(digits), round)
+    xc_numerics::fmt::decimal_string_round(value, Some(digits), round)
 }
 
 fn row(entries: &[Float], full: usize, k: usize, p: u32, count: usize) -> CcmCheckpointSpectrumRow {

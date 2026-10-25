@@ -862,6 +862,64 @@ fn stage_family_document(
     Ok(())
 }
 
+fn select_publication_commit_parts(
+    remote: &dyn crate::RemoteGitStore,
+    repository: &str,
+    revision: &str,
+    family: &str,
+    parts: Vec<TransportPart>,
+    cancellation: &xc_core::CancellationToken,
+) -> Result<(Vec<TransportPart>, u64), CacheError> {
+    let paths = parts
+        .iter()
+        .map(|part| crate::RemotePathPrefetch {
+            repository_path: part.repository_path.clone(),
+            maximum_bytes: crate::GITHUB_HARD_FILE_BOUNDARY_BYTES - 1,
+        })
+        .collect::<Vec<_>>();
+    for paths in paths.chunks(256) {
+        if let Err(error) =
+            remote.prefetch_present_committed_paths(repository, revision, paths, cancellation)
+        {
+            if matches!(error, CacheError::Cancelled(_)) {
+                return Err(error);
+            }
+            xc_core::progress_message!(
+                "publication family {family}: batched file check prefetch skipped: {error}",
+            );
+            break;
+        }
+    }
+    cancellation
+        .check()
+        .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+    let mut commit_parts = Vec::with_capacity(parts.len() + 1);
+    let mut reused_bytes = 0u64;
+    for part in parts {
+        cancellation
+            .check()
+            .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+        match remote.immutable_path_digest(repository, revision, &part.repository_path)? {
+            Some(existing) if existing == part.content_digest => {
+                reused_bytes += part.size_bytes;
+                continue;
+            }
+            Some(existing) if part.repository_path.starts_with("objects/") => {
+                return Err(CacheError::DigestMismatch {
+                    expected: part.content_digest.to_string(),
+                    actual: existing.to_string(),
+                });
+            }
+            Some(_) | None => {}
+        }
+        commit_parts.push(part);
+    }
+    cancellation
+        .check()
+        .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+    Ok((commit_parts, reused_bytes))
+}
+
 fn prepare_family_candidates<'a>(
     pending_drafts: &[&'a CanonicalProductionDraft],
     destination: PublicationDestination,
@@ -941,24 +999,8 @@ fn prepare_family_candidates<'a>(
             )?;
         }
         for part in &bundle.encoding.ordered_parts {
-            let source = part
-                .repository_path
-                .split('/')
-                .fold(draft.staged_parts_root.to_path_buf(), |path, component| {
-                    path.join(component)
-                });
-            let target = part
-                .repository_path
-                .split('/')
-                .fold(staging_root.to_path_buf(), |path, component| {
-                    path.join(component)
-                });
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            if !target.exists() {
-                std::fs::copy(&source, &target)?;
-            }
+            // The run-owned transport reads the authenticated original part
+            // roots. Only small generated metadata belongs in family staging.
             files
                 .entry(part.repository_path.clone())
                 .or_insert_with(|| part.clone());
@@ -1018,23 +1060,117 @@ fn refresh_github_write_session(
     )
 }
 
-struct RemoteSessionCleanup<'a> {
-    remote: &'a crate::GitCliRemoteStore,
-    repository: &'a str,
+struct PublicationRunTransports {
+    stores: BTreeMap<(PublicationDestination, String), crate::GitCliRemoteStore>,
+    principal: String,
     finished: bool,
 }
 
-impl<'a> RemoteSessionCleanup<'a> {
-    fn new(remote: &'a crate::GitCliRemoteStore, repository: &'a str) -> Self {
-        Self {
-            remote,
-            repository,
+impl PublicationRunTransports {
+    fn new(
+        groups: &[PublicationGroup],
+        topologies: &BTreeMap<
+            (PublicationDestination, String),
+            crate::bootstrap_topology::BootstrapFamilyTopology,
+        >,
+        principal: &str,
+        journal_root: &Path,
+        resources: &xc_core::ResourcePolicy,
+    ) -> Result<Self, CacheError> {
+        let mut result = Self {
+            stores: BTreeMap::new(),
+            principal: principal.to_owned(),
             finished: false,
+        };
+        let temporary_root = journal_root.join("git-transport").join("family-batch");
+        for (target, drafts, _) in groups {
+            let first = drafts.first().ok_or_else(|| {
+                CacheError::InvalidTransition("empty publication family group".to_owned())
+            })?;
+            for destination in destinations(*target)? {
+                let topology = topologies
+                    .get(&(destination, first.family.clone()))
+                    .ok_or_else(|| {
+                        CacheError::NoWritableShard(
+                            "publication transport has no family topology".to_owned(),
+                        )
+                    })?;
+                let key = (
+                    destination,
+                    topology.current_writable.repository_url.clone(),
+                );
+                // The executor groups by destination, then family. Registry
+                // validation binds each shard URL to that visibility/family,
+                // so a duplicate here would violate its validated grouping.
+                if result.stores.contains_key(&key) {
+                    return Err(CacheError::InvalidTransition(
+                        "multiple publication family groups share one destination shard".to_owned(),
+                    ));
+                }
+                let staging_root = journal_root
+                    .join("family-batches")
+                    .join(&first.family)
+                    .join(visibility_name(destination));
+                let mut remote = crate::GitCliRemoteStore::new(
+                    temporary_root
+                        .join(&first.family)
+                        .join(visibility_name(destination)),
+                    staging_root,
+                    publication_author_name(principal),
+                    publication_author_email(principal),
+                )?
+                .with_additional_staged_parts_roots(
+                    drafts.iter().map(|draft| draft.staged_parts_root.clone()),
+                )?
+                .with_exact_staged_part_sources(drafts.iter().flat_map(|draft| {
+                    draft
+                        .encoding
+                        .ordered_parts
+                        .iter()
+                        .cloned()
+                        .map(|part| (draft.staged_parts_root.clone(), part))
+                }))?
+                .with_resource_policy(resources.clone());
+                remote = remote
+                    .with_publication_disk_budget(&temporary_root, result.stores.values().next())?;
+                result.stores.insert(key, remote);
+            }
         }
+        Ok(result)
+    }
+
+    fn get(
+        &self,
+        destination: PublicationDestination,
+        repository: &str,
+        principal: &str,
+    ) -> Result<&crate::GitCliRemoteStore, CacheError> {
+        if principal != self.principal {
+            return Err(CacheError::Authentication(
+                "publication principal changed between dependency waves".to_owned(),
+            ));
+        }
+        self.stores
+            .get(&(destination, repository.to_owned()))
+            .ok_or_else(|| {
+                CacheError::InvalidTransition(
+                    "publication shard changed between dependency waves".to_owned(),
+                )
+            })
+    }
+
+    fn cleanup(&self) -> Result<(), CacheError> {
+        let mut first_error = None;
+        for store in self.stores.values() {
+            if let Err(error) = store.cleanup_all_sessions() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn finish<T>(mut self, result: Result<T, CacheError>) -> Result<T, CacheError> {
-        let cleanup = self.remote.cleanup_session(self.repository);
+        let cleanup = self.cleanup();
         self.finished = true;
         match (result, cleanup) {
             (Ok(value), Ok(())) => Ok(value),
@@ -1042,7 +1178,7 @@ impl<'a> RemoteSessionCleanup<'a> {
             (Err(error), Ok(())) => Err(error),
             (Err(error), Err(cleanup_error)) => {
                 xc_core::progress_message!(
-                    "family publication failed and its Git transport cleanup also failed: \
+                    "publication failed and its run transport cleanup also failed: \
                      {cleanup_error}"
                 );
                 Err(error)
@@ -1051,14 +1187,11 @@ impl<'a> RemoteSessionCleanup<'a> {
     }
 }
 
-impl Drop for RemoteSessionCleanup<'_> {
+impl Drop for PublicationRunTransports {
     fn drop(&mut self) {
         if !self.finished {
-            if let Err(error) = self.remote.cleanup_session(self.repository) {
-                xc_core::progress_message!(
-                    "family publication Git transport cleanup failed for {}: {error}",
-                    self.repository
-                );
+            if let Err(error) = self.cleanup() {
+                xc_core::progress_message!("publication run transport cleanup failed: {error}");
             }
         }
     }
@@ -1108,6 +1241,56 @@ fn execute_family_batch_publication(
     event_unix_seconds: u64,
     target: &crate::bootstrap_topology::BootstrapShard,
     required_dependencies: &BTreeSet<ExactDependencyIdentity>,
+    remote: &crate::GitCliRemoteStore,
+) -> Result<Vec<ManagedPublicationExecutionReport>, CacheError> {
+    let first = drafts.first().ok_or_else(|| {
+        CacheError::InvalidTransition("family batch publication received no drafts".to_owned())
+    })?;
+    let staging_root = journal_root
+        .join("family-batches")
+        .join(&first.family)
+        .join(visibility_name(destination));
+    remote.enable_publication_metrics(&staging_root.join("publication-metrics"));
+    let started = std::time::Instant::now();
+    let result = execute_family_batch_publication_inner(
+        drafts,
+        destination,
+        owner,
+        principal,
+        sessions,
+        journal_root,
+        resources,
+        replace_existing_semantic,
+        event_unix_seconds,
+        target,
+        required_dependencies,
+        remote,
+    );
+    // Covers early preflight/preparation/lease failures and an all-present
+    // no-op as well as committed work. Closing a handle is never an outcome.
+    remote.publication_event(
+        "attempt_outcome",
+        started.elapsed(),
+        serde_json::json!({"success":result.is_ok(),"duration_scope":"whole family attempt"}),
+    );
+    remote.close_publication_metrics();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_family_batch_publication_inner(
+    drafts: &[&CanonicalProductionDraft],
+    destination: PublicationDestination,
+    owner: &str,
+    principal: &str,
+    sessions: &BTreeMap<PublicationDestination, AuthenticatedGitHubSession>,
+    journal_root: &Path,
+    resources: &xc_core::ResourcePolicy,
+    replace_existing_semantic: bool,
+    event_unix_seconds: u64,
+    target: &crate::bootstrap_topology::BootstrapShard,
+    required_dependencies: &BTreeSet<ExactDependencyIdentity>,
+    remote: &crate::GitCliRemoteStore,
 ) -> Result<Vec<ManagedPublicationExecutionReport>, CacheError> {
     let first = drafts.first().ok_or_else(|| {
         CacheError::InvalidTransition("family batch publication received no drafts".to_owned())
@@ -1121,19 +1304,6 @@ fn execute_family_batch_publication(
         .join(&first.family)
         .join(visibility_name(destination));
     std::fs::create_dir_all(&staging_root)?;
-    let remote = crate::GitCliRemoteStore::new(
-        journal_root
-            .join("git-transport")
-            .join("family-batch")
-            .join(&first.family)
-            .join(visibility_name(destination)),
-        staging_root.clone(),
-        publication_author_name(principal),
-        publication_author_email(principal),
-    )?
-    .with_resource_policy(resources.clone());
-    remote.enable_publication_metrics(&staging_root.join("publication-metrics"));
-    let session_cleanup = RemoteSessionCleanup::new(&remote, &repository_url);
     let session = sessions.get(&destination).ok_or_else(|| {
         CacheError::Authentication("family batch is missing its write session".to_owned())
     })?;
@@ -1143,7 +1313,7 @@ fn execute_family_batch_publication(
     let mut active_session = session.clone();
     refresh_github_write_session(&mut active_session, principal, &authorized)?;
     verify_bootstrap_registry_route(
-        &remote,
+        remote,
         owner,
         &first.family,
         destination,
@@ -1159,7 +1329,7 @@ fn execute_family_batch_publication(
     order_family_publication_drafts(&mut pending_drafts);
     if !replace_existing_semantic {
         let selection = select_missing_destination_drafts(
-            &remote,
+            remote,
             &repository_url,
             &observed_head,
             &first.family,
@@ -1168,6 +1338,11 @@ fn execute_family_batch_publication(
             required_dependencies,
             &cancellation,
         )?;
+        remote.publication_event(
+            "candidate_selection",
+            std::time::Duration::ZERO,
+            serde_json::json!({"already_present":selection.already_present,"pending":selection.pending.len()}),
+        );
         if selection.already_present > 0 {
             xc_core::progress_message!(
                 "publication destination {} family {}: {} already present, {} pending",
@@ -1192,14 +1367,14 @@ fn execute_family_batch_publication(
         )?
         .is_some()
     {
-        read_capacity_ledger(&remote, &repository_url, &observed_head, &cancellation)?
+        read_capacity_ledger(remote, &repository_url, &observed_head, &cancellation)?
     } else {
         // Derive the same conservative ledger that shard initialization will
         // commit later, but do so read-only. This lets all immutable artifact
         // preparation and Git object hashing finish before the one private
         // publication lease is acquired, even for a brand-new shard.
         reconciled_capacity_ledger(
-            &remote,
+            remote,
             &repository_url,
             &observed_head,
             &shard,
@@ -1214,7 +1389,7 @@ fn execute_family_batch_publication(
     if replace_existing_semantic {
         for draft in &pending_drafts {
             preflight_producer_monotonicity(
-                &remote,
+                remote,
                 &repository_url,
                 &observed_head,
                 &first.family,
@@ -1270,14 +1445,17 @@ fn execute_family_batch_publication(
         serde_json::json!({}),
     );
     let lock_started = std::time::Instant::now();
-    let mut private_lease = if destination == PublicationDestination::Private {
+    let private_lease_result = (|| {
+        if destination != PublicationDestination::Private {
+            return Ok(None);
+        }
         let lease_owner = crate::PrivatePublicationLeaseOwner::for_current_process(
             &repository_url,
             principal,
             event_unix_seconds,
         )?;
-        Some(crate::acquire_private_publication_lease(
-            &remote,
+        crate::acquire_private_publication_lease(
+            remote,
             &repository_url,
             "main",
             &lease_owner,
@@ -1285,15 +1463,15 @@ fn execute_family_batch_publication(
             &staging_root,
             &cancellation,
             &private_lease_policy,
-        )?)
-    } else {
-        None
-    };
+        )
+        .map(Some)
+    })();
     remote.publication_event(
         "lock_wait",
         lock_started.elapsed(),
-        serde_json::json!({"lease_required":private_lease.is_some()}),
+        serde_json::json!({"lease_required":destination == PublicationDestination::Private,"success":private_lease_result.is_ok()}),
     );
+    let mut private_lease = private_lease_result?;
     let hold_started = std::time::Instant::now();
     let publication_result = (|| -> Result<Vec<ManagedPublicationExecutionReport>, CacheError> {
         refresh_github_write_session(&mut active_session, principal, &authorized)?;
@@ -1306,7 +1484,7 @@ fn execute_family_batch_publication(
             first.family
         );
         let (head, mut ledger) = ensure_managed_shard_sidecars(
-            &remote,
+            remote,
             &active_session,
             &repository_url,
             &authorized,
@@ -1322,7 +1500,7 @@ fn execute_family_batch_publication(
         )?;
         if !replace_existing_semantic && head != observed_head {
             let selection = select_missing_destination_drafts(
-                &remote,
+                remote,
                 &repository_url,
                 &head,
                 &first.family,
@@ -1355,7 +1533,7 @@ fn execute_family_batch_publication(
         }
         if let Some(lease) = private_lease.as_mut() {
             crate::renew_private_publication_lease(
-                &remote,
+                remote,
                 lease,
                 &head,
                 &staging_root,
@@ -1365,7 +1543,7 @@ fn execute_family_batch_publication(
         if replace_existing_semantic {
             for draft in &pending_drafts {
                 preflight_producer_monotonicity(
-                    &remote,
+                    remote,
                     &repository_url,
                     &head,
                     &first.family,
@@ -1443,7 +1621,7 @@ fn execute_family_batch_publication(
         if let Some(lease) = private_lease.as_mut() {
             lease.set_transaction_id(batch.batch_id.0.clone());
         }
-        match crate::RemoteShardReader::new(&remote, 16 * 1024 * 1024)?
+        match crate::RemoteShardReader::new(remote, 16 * 1024 * 1024)?
             .read_json::<crate::RepositoryPublicationBatch>(
             &repository_url,
             &head,
@@ -1500,7 +1678,7 @@ fn execute_family_batch_publication(
             .collect::<BTreeSet<_>>();
         for prefix in semantic_prefixes {
             let path = format!("indexes/{}/{prefix}.json", first.family);
-            let mut entries = match crate::RemoteShardReader::new(&remote, 16 * 1024 * 1024)?
+            let mut entries = match crate::RemoteShardReader::new(remote, 16 * 1024 * 1024)?
                 .read_json::<crate::ShardIndexPartition>(
                 &repository_url,
                 &head,
@@ -1605,7 +1783,7 @@ fn execute_family_batch_publication(
                 .push(entry);
         }
         for (path, (query, additions)) in continuation_updates {
-            let mut entries = match crate::RemoteShardReader::new(&remote, 16 * 1024 * 1024)?
+            let mut entries = match crate::RemoteShardReader::new(remote, 16 * 1024 * 1024)?
                 .read_json::<crate::CcmEigenpairContinuationIndex>(
                 &repository_url,
                 &head,
@@ -1685,7 +1863,6 @@ fn execute_family_batch_publication(
         for batch_plan in batches {
             let batch_started = std::time::Instant::now();
             let batch_number = batch_plan.sequence + 1;
-            let mut reused_bytes = 0u64;
             xc_core::progress_message!(
                 "publication family {}: batch {}/{} checking {} file(s)",
                 first.family,
@@ -1693,29 +1870,17 @@ fn execute_family_batch_publication(
                 total_batches,
                 batch_plan.parts.len()
             );
-            let mut commit_parts = Vec::with_capacity(batch_plan.parts.len() + 1);
-            for part in batch_plan.parts {
-                match remote.immutable_path_digest(
-                    &repository_url,
-                    &current_head,
-                    &part.repository_path,
-                )? {
-                    Some(existing) if existing == part.content_digest => {
-                        // An earlier transaction or an interrupted retry
-                        // already committed these exact bytes.
-                        reused_bytes += part.size_bytes;
-                        continue;
-                    }
-                    Some(existing) if part.repository_path.starts_with("objects/") => {
-                        return Err(CacheError::DigestMismatch {
-                            expected: part.content_digest.to_string(),
-                            actual: existing.to_string(),
-                        });
-                    }
-                    Some(_) | None => {}
-                }
-                commit_parts.push(part);
-            }
+            // Resolve new as well as present paths in bounded Git listings.
+            // Absence is reusable only at this exact immutable commit; the
+            // ordinary loop below still checks every present blob's digest.
+            let (mut commit_parts, reused_bytes) = select_publication_commit_parts(
+                remote,
+                &repository_url,
+                &current_head,
+                &first.family,
+                batch_plan.parts,
+                &cancellation,
+            )?;
             xc_core::progress_message!(
                 "publication family {}: batch {}/{} checked in {:.3}s; {} existing bytes reused, {} new or updated bytes",
                 first.family,
@@ -1767,7 +1932,7 @@ fn execute_family_batch_publication(
             };
             if let Some(lease) = private_lease.as_mut() {
                 current_head = crate::commit_private_batch_atomically(
-                    &remote,
+                    remote,
                     lease,
                     request,
                     &staging_root,
@@ -1807,7 +1972,7 @@ fn execute_family_batch_publication(
     })();
     let completed = publication_result.is_ok();
     let release_result = private_lease.as_ref().map(|lease| {
-        crate::release_private_publication_lease(&remote, lease, &staging_root, completed)
+        crate::release_private_publication_lease(remote, lease, &staging_root, completed)
     });
     let result = match (publication_result, release_result) {
         (Ok(report), None | Some(Ok(()))) => Ok(report),
@@ -1821,7 +1986,7 @@ fn execute_family_batch_publication(
         }
     };
     remote.publication_event("attempt_finished",hold_started.elapsed(),serde_json::json!({"success":result.is_ok(),"duration_scope":"since lease acquisition including release","lease_required":private_lease.is_some()}));
-    session_cleanup.finish(result)
+    result
 }
 
 fn bounded_prefix_bytes(
@@ -3510,9 +3675,64 @@ fn publication_group_label(group: &PublicationGroup) -> String {
         .map_or_else(|| "empty".to_owned(), |draft| draft.family.clone())
 }
 
-/// Destination family groups published concurrently. Each group writes only
-/// its own repository; four bounds Git transport and GitHub API concurrency.
+/// Default destination family groups published concurrently. Each group writes
+/// only its own repository; the override limits families, not Git's own threads.
 const MANAGED_PUBLICATION_FAMILY_WORKERS: usize = 4;
+const MANAGED_PUBLICATION_FAMILY_WORKERS_ENV: &str = "XC_PUBLICATION_FAMILY_WORKERS";
+
+fn publication_family_workers(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<std::num::NonZeroUsize, CacheError> {
+    let invalid = || {
+        CacheError::InvalidManifest(format!(
+            "{MANAGED_PUBLICATION_FAMILY_WORKERS_ENV} must be a positive decimal integer that fits usize"
+        ))
+    };
+    let Some(value) = value else {
+        return Ok(std::num::NonZeroUsize::new(MANAGED_PUBLICATION_FAMILY_WORKERS).unwrap());
+    };
+    let text = value.to_str().ok_or_else(invalid)?;
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let workers = text.parse::<usize>().map_err(|_| invalid())?;
+    std::num::NonZeroUsize::new(workers).ok_or_else(invalid)
+}
+
+/// Retain result order independently of completion order. The caller supplies
+/// an already validated limit before publication can perform remote mutations.
+fn run_publication_wave<T: Send>(
+    count: usize,
+    worker_limit: std::num::NonZeroUsize,
+    run: impl Fn(usize) -> T + Sync,
+) -> Vec<Option<T>> {
+    let workers = count.min(worker_limit.get());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots = (0..count)
+        .map(|_| std::sync::Mutex::new(None))
+        .collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let position = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if position >= count {
+                    break;
+                }
+                let result = run(position);
+                *slots[position]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
+        .collect()
+}
 
 #[allow(
     unreachable_code,
@@ -3529,6 +3749,7 @@ fn execute_managed_family_drafts_on_github(
     replace_existing_semantic: bool,
     targets: &BTreeMap<PublicationDestination, crate::bootstrap_topology::BootstrapShard>,
     required_dependencies: &BTreeSet<ExactDependencyIdentity>,
+    transports: &PublicationRunTransports,
 ) -> Result<ManagedRunPublicationReport, CacheError> {
     let destinations = destinations(target)?;
     if targets.keys().copied().collect::<Vec<_>>() != destinations {
@@ -3585,6 +3806,11 @@ fn execute_managed_family_drafts_on_github(
     // the obsolete per-artifact receipt/commit transaction.
     let mut batch_reports = Vec::new();
     for destination in destinations.iter().copied() {
+        let remote = transports.get(
+            destination,
+            &targets[&destination].repository_url,
+            &principal,
+        )?;
         batch_reports.extend(execute_family_batch_publication(
             drafts,
             destination,
@@ -3597,6 +3823,7 @@ fn execute_managed_family_drafts_on_github(
             event_unix_seconds,
             &targets[&destination],
             required_dependencies,
+            remote,
         )?);
     }
     return Ok(ManagedRunPublicationReport {
@@ -3940,6 +4167,11 @@ fn transport_tree_size_bytes(path: &Path) -> Result<u64, CacheError> {
     Ok(total)
 }
 
+/// Publish independent destination families concurrently. The optional
+/// `XC_PUBLICATION_FAMILY_WORKERS` environment variable is a positive decimal
+/// integer (default four), capped at each wave's runnable family count. It
+/// controls family workers; Git subprocesses and transport readers have their
+/// own threads. Invalid settings are rejected before workspace or remote I/O.
 pub fn execute_managed_drafts_on_github(
     drafts: &[CanonicalProductionDraft],
     target: PublicationTarget,
@@ -3948,6 +4180,11 @@ pub fn execute_managed_drafts_on_github(
     resources: &xc_core::ResourcePolicy,
     replace_existing_semantic: bool,
 ) -> Result<ManagedRunPublicationReport, CacheError> {
+    let invocation_started = std::time::Instant::now();
+    // Validate once, before creating a workspace or performing any remote I/O.
+    let family_workers = publication_family_workers(
+        std::env::var_os(MANAGED_PUBLICATION_FAMILY_WORKERS_ENV).as_deref(),
+    )?;
     let mut workspace = ManagedTransportWorkspace::acquire(journal_root)?;
     let result = execute_managed_drafts_on_github_inner(
         drafts,
@@ -3956,9 +4193,10 @@ pub fn execute_managed_drafts_on_github(
         journal_root,
         resources,
         replace_existing_semantic,
+        family_workers,
     );
     let cleanup = workspace.finish();
-    match (result, cleanup) {
+    let result = match (result, cleanup) {
         (Ok(report), Ok(())) => Ok(report),
         (Ok(_), Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
@@ -3968,7 +4206,19 @@ pub fn execute_managed_drafts_on_github(
             );
             Err(error)
         }
+    };
+    if crate::publication_metrics::write_operational_summary(
+        journal_root,
+        invocation_started.elapsed(),
+        result.as_ref().is_ok_and(|report| report.all_completed),
+    )
+    .is_err()
+    {
+        xc_core::progress_message!(
+            "publication operational summary unavailable; canonical publication result is unchanged"
+        );
     }
+    result
 }
 
 /// The exact destination existence checks of one publication preflight, with
@@ -4146,6 +4396,7 @@ fn execute_managed_drafts_on_github_inner(
     journal_root: &Path,
     resources: &xc_core::ResourcePolicy,
     replace_existing_semantic: bool,
+    family_workers: std::num::NonZeroUsize,
 ) -> Result<ManagedRunPublicationReport, CacheError> {
     let requested_destinations = destinations(target)?;
     let mut groups = Vec::new();
@@ -4281,6 +4532,13 @@ fn execute_managed_drafts_on_github_inner(
     }
 
     let started = std::time::Instant::now();
+    let transports = PublicationRunTransports::new(
+        &groups,
+        &family_topologies,
+        principals.iter().next().expect("one principal was checked"),
+        journal_root,
+        resources,
+    )?;
     let run_group = |(group_target, family_drafts, required_dependencies): &PublicationGroup,
                      members: &[usize]| {
         let family = family_drafts
@@ -4314,6 +4572,7 @@ fn execute_managed_drafts_on_github_inner(
             replace_existing_semantic,
             &targets,
             required_dependencies,
+            &transports,
         )?;
         xc_core::progress_message!(
             "publication family {family}: evaluated {} staged candidate(s) in {:.3}s",
@@ -4376,36 +4635,16 @@ fn execute_managed_drafts_on_github_inner(
                 runnable.push((group, gate.runs));
             }
         }
-        let workers = runnable.len().clamp(1, MANAGED_PUBLICATION_FAMILY_WORKERS);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let slots = runnable
-            .iter()
-            .map(|_| std::sync::Mutex::new(None))
-            .collect::<Vec<_>>();
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let position = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let Some((group, members)) = runnable.get(position) else {
-                        break;
-                    };
-                    let result: Result<ManagedRunPublicationReport, CacheError> =
-                        run_group(&groups[*group], members);
-                    *slots[position]
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
-                });
-            }
+        let slots = run_publication_wave(runnable.len(), family_workers, |position| {
+            let (group, members) = &runnable[position];
+            run_group(&groups[*group], members)
         });
         for ((group, members), slot) in runnable.iter().zip(slots) {
-            let result = slot
-                .into_inner()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .unwrap_or_else(|| {
-                    Err(CacheError::InvalidTransition(
-                        "managed publication group did not run".to_owned(),
-                    ))
-                });
+            let result = slot.unwrap_or_else(|| {
+                Err(CacheError::InvalidTransition(
+                    "managed publication group did not run".to_owned(),
+                ))
+            });
             for &member in members {
                 published[*group][member] = Some(result.is_ok());
             }
@@ -4467,12 +4706,12 @@ fn execute_managed_drafts_on_github_inner(
         reports.len(),
         started.elapsed().as_secs_f64()
     );
-    Ok(ManagedRunPublicationReport {
+    transports.finish(Ok(ManagedRunPublicationReport {
         schema_version: 1,
         all_completed: reports.iter().all(|report| report.all_completed),
         transactions,
         current_tree_paths_removed,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -4480,6 +4719,111 @@ mod tests {
     mod alias_tests {
         use super::*;
         include!("managed_publication_alias_tests.rs");
+    }
+
+    #[test]
+    fn publication_family_worker_setting_defaults_and_validates_before_use() {
+        use std::ffi::OsStr;
+
+        assert_eq!(publication_family_workers(None).unwrap().get(), 4);
+        for workers in [1usize, 2, 4, 64, usize::MAX] {
+            let text = workers.to_string();
+            assert_eq!(
+                publication_family_workers(Some(OsStr::new(&text)))
+                    .unwrap()
+                    .get(),
+                workers
+            );
+        }
+        for text in ["", "0", "-1", "+1", " 1", "1 ", "1.0", "1e2", "workers"] {
+            let error = publication_family_workers(Some(OsStr::new(text))).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(MANAGED_PUBLICATION_FAMILY_WORKERS_ENV));
+            assert!(error.to_string().contains("positive decimal integer"));
+        }
+        let overflow = format!("{}0", usize::MAX);
+        assert!(publication_family_workers(Some(OsStr::new(&overflow))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_family_worker_setting_rejects_non_unicode() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(publication_family_workers(Some(std::ffi::OsStr::from_bytes(&[0xff]))).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_family_worker_setting_rejects_non_unicode() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let invalid = std::ffi::OsString::from_wide(&[0xd800]);
+        assert!(publication_family_workers(Some(&invalid)).is_err());
+    }
+
+    #[test]
+    fn publication_wave_workers_bound_concurrency_and_preserve_result_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        const JOBS: usize = 9;
+        for workers in [1, 2, 4] {
+            let limit = std::num::NonZeroUsize::new(workers).unwrap();
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let first_batch = Barrier::new(workers);
+            let calls = (0..JOBS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+            let results = run_publication_wave(JOBS, limit, |position| {
+                calls[position].fetch_add(1, Ordering::SeqCst);
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                if position < workers {
+                    // Force the selected workers to overlap without sleeps or
+                    // any Git/network operation. This is the production scheduler.
+                    first_batch.wait();
+                }
+                let result = if position == 2 {
+                    Err("fixture publication failure")
+                } else {
+                    Ok(position)
+                };
+                active.fetch_sub(1, Ordering::SeqCst);
+                result
+            });
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+            assert_eq!(peak.load(Ordering::SeqCst), workers);
+            for (position, (call, result)) in calls.iter().zip(results).enumerate() {
+                assert_eq!(call.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    result,
+                    Some(if position == 2 {
+                        Err("fixture publication failure")
+                    } else {
+                        Ok(position)
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn publication_wave_workers_clamp_to_runnable_families() {
+        use std::sync::Barrier;
+
+        let limit = std::num::NonZeroUsize::new(usize::MAX).unwrap();
+        let simultaneous = Barrier::new(2);
+        assert_eq!(
+            run_publication_wave(2, limit, |position| {
+                simultaneous.wait();
+                position
+            }),
+            vec![Some(0), Some(1)]
+        );
+        let empty: Vec<Option<()>> =
+            run_publication_wave(0, limit, |_| panic!("empty wave must not run"));
+        assert!(empty.is_empty());
     }
 
     fn publication_wave_fixture() -> (crate::test_support::TestDir, Vec<PublicationGroup>) {
@@ -5223,8 +5567,148 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidates.len(), 1);
+        for part in &draft.encoding.ordered_parts {
+            assert!(draft
+                .staged_parts_root
+                .join(&part.repository_path)
+                .is_file());
+            assert!(
+                !prepared.join(&part.repository_path).exists(),
+                "family preparation copied an immutable payload part"
+            );
+            assert!(candidates[0].immutable_files.contains(part));
+        }
         active.require_write_for("test-owner", &authorized).unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publication_run_retains_transport_across_waves_and_cleans_on_error() {
+        if !std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let root = crate::test_support::temporary_root("publication-run-transports");
+        let draft = fixture_draft(&root.join("source"));
+        let destination = PublicationDestination::Private;
+        let mut shard = legacy_bootstrap_shard("example-org", &draft.family, destination);
+        shard.repository_url = root.join("remote.git").to_string_lossy().into_owned();
+        let topology = crate::bootstrap_topology::BootstrapFamilyTopology {
+            family: draft.family.clone(),
+            visibility: CacheVisibility::Private,
+            current_writable: shard.clone(),
+            readable_shards: vec![shard.clone()],
+        };
+        let groups = vec![(
+            PublicationTarget::Private,
+            vec![draft.clone()],
+            BTreeSet::new(),
+        )];
+        let topologies = BTreeMap::from([((destination, draft.family.clone()), topology)]);
+        let journal = root.join("journal");
+        let transports = PublicationRunTransports::new(
+            &groups,
+            &topologies,
+            "test-owner",
+            &journal,
+            &ResourcePolicy::default(),
+        )
+        .unwrap();
+        let first = transports
+            .get(destination, &shard.repository_url, "test-owner")
+            .unwrap();
+        first
+            .prepare_staged_parts(&shard.repository_url, &draft.encoding.ordered_parts)
+            .unwrap();
+        let part = &draft.encoding.ordered_parts[0];
+        fs::remove_file(draft.staged_parts_root.join(&part.repository_path)).unwrap();
+        let second = transports
+            .get(destination, &shard.repository_url, "test-owner")
+            .unwrap();
+        assert!(std::ptr::eq(first, second));
+        // A later wave uses the already authenticated Git object, not the
+        // removed source payload. No remote repository exists in this test.
+        second
+            .prepare_staged_parts(&shard.repository_url, &draft.encoding.ordered_parts)
+            .unwrap();
+        assert!(transports
+            .get(destination, &shard.repository_url, "different-owner")
+            .is_err());
+        assert!(transports
+            .get(destination, "different-shard", "test-owner")
+            .is_err());
+        let owned = journal
+            .join("git-transport")
+            .join("family-batch")
+            .join(&draft.family)
+            .join("private");
+        assert!(owned.exists());
+        let result: Result<(), CacheError> = transports.finish(Err(CacheError::InvalidTransition(
+            "fixture failure".to_owned(),
+        )));
+        assert!(result.unwrap_err().to_string().contains("fixture failure"));
+        assert!(!owned.exists());
+        assert!(draft.staged_parts_root.exists());
+    }
+
+    #[test]
+    fn publication_run_transports_keep_public_and_private_family_groups_separate() {
+        let root = crate::test_support::temporary_root("publication-mixed-transports");
+        let draft = fixture_draft(&root.join("source"));
+        let groups = vec![
+            (
+                PublicationTarget::Public,
+                vec![draft.clone()],
+                BTreeSet::new(),
+            ),
+            (
+                PublicationTarget::Private,
+                vec![draft.clone()],
+                BTreeSet::new(),
+            ),
+        ];
+        let topologies = [
+            PublicationDestination::Public,
+            PublicationDestination::Private,
+        ]
+        .into_iter()
+        .map(|destination| {
+            let shard = legacy_bootstrap_shard("example-org", &draft.family, destination);
+            (
+                (destination, draft.family.clone()),
+                crate::bootstrap_topology::BootstrapFamilyTopology {
+                    family: draft.family.clone(),
+                    visibility: visibility(destination),
+                    current_writable: shard.clone(),
+                    readable_shards: vec![shard],
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+        let transports = PublicationRunTransports::new(
+            &groups,
+            &topologies,
+            "test-owner",
+            &root.join("journal"),
+            &ResourcePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(transports.stores.len(), 2);
+        for ((destination, family), topology) in &topologies {
+            assert_eq!(family, &draft.family);
+            assert!(transports
+                .get(
+                    *destination,
+                    &topology.current_writable.repository_url,
+                    "test-owner"
+                )
+                .is_ok());
+        }
+        transports.finish(Ok(())).unwrap();
     }
 
     struct RepositoryState {
@@ -6047,6 +6531,8 @@ mod tests {
     struct PrefetchRecorder {
         inner: FilesystemMemoryRemote,
         prefetches: Mutex<Vec<(String, String, Vec<String>)>>,
+        prefetch_cancellation: Option<bool>,
+        digest_checks: std::sync::atomic::AtomicUsize,
     }
 
     impl RemoteGitStore for PrefetchRecorder {
@@ -6059,6 +6545,8 @@ mod tests {
             revision: &str,
             path: &str,
         ) -> Result<Option<ContentDigest>, CacheError> {
+            self.digest_checks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.immutable_path_digest(repository, revision, path)
         }
         fn read_committed_path(
@@ -6084,7 +6572,7 @@ mod tests {
             repository: &str,
             revision: &str,
             paths: &[crate::RemotePathPrefetch],
-            _cancellation: &CancellationToken,
+            cancellation: &CancellationToken,
         ) -> Result<(), CacheError> {
             self.prefetches.lock().unwrap().push((
                 repository.to_owned(),
@@ -6094,6 +6582,12 @@ mod tests {
                     .map(|path| path.repository_path.clone())
                     .collect(),
             ));
+            if let Some(report_error) = self.prefetch_cancellation {
+                if report_error {
+                    return Err(CacheError::Cancelled("prefetch was cancelled".to_owned()));
+                }
+                cancellation.cancel(xc_core::CancellationReason::UserRequested);
+            }
             Ok(())
         }
         fn compare_and_swap_commit(
@@ -6131,6 +6625,90 @@ mod tests {
     }
 
     #[test]
+    fn publication_batch_prefetch_cancellation_prevents_file_checks_and_mutation() {
+        for report_error in [true, false] {
+            let root = crate::test_support::temporary_root("publication-prefetch-cancel");
+            let remote = PrefetchRecorder {
+                inner: FilesystemMemoryRemote::new(root.to_path_buf()),
+                prefetches: Mutex::new(Vec::new()),
+                prefetch_cancellation: Some(report_error),
+                digest_checks: std::sync::atomic::AtomicUsize::new(0),
+            };
+            remote.inner.insert_repository(
+                "repository".into(),
+                "unchanged-head".into(),
+                BTreeMap::new(),
+            );
+            let result = select_publication_commit_parts(
+                &remote,
+                "repository",
+                "unchanged-head",
+                "family",
+                vec![TransportPart {
+                    sequence: 0,
+                    repository_path: "metadata.json".into(),
+                    size_bytes: 1,
+                    content_digest: ContentDigest::sha256(b"x"),
+                }],
+                &CancellationToken::new(),
+            );
+            assert!(matches!(result, Err(CacheError::Cancelled(_))));
+            assert_eq!(remote.prefetches.lock().unwrap().len(), 1);
+            assert_eq!(
+                remote
+                    .digest_checks
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+            let repositories = remote.inner.repositories.lock().unwrap();
+            assert_eq!(repositories["repository"].head, "unchanged-head");
+            assert_eq!(repositories["repository"].sequence, 0);
+            drop(repositories);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn publication_batch_prefetch_keeps_present_digest_checks_and_missing_parts() {
+        let root = crate::test_support::temporary_root("publication-prefetch-present");
+        let remote = PrefetchRecorder {
+            inner: FilesystemMemoryRemote::new(root.to_path_buf()),
+            prefetches: Mutex::new(Vec::new()),
+            prefetch_cancellation: None,
+            digest_checks: std::sync::atomic::AtomicUsize::new(0),
+        };
+        remote.inner.insert_repository(
+            "repository".into(),
+            "head".into(),
+            BTreeMap::from([("existing.json".to_owned(), b"payload".to_vec())]),
+        );
+        let part = |path: &str| TransportPart {
+            sequence: 0,
+            repository_path: path.into(),
+            size_bytes: 7,
+            content_digest: ContentDigest::sha256(b"payload"),
+        };
+        let (pending, reused) = select_publication_commit_parts(
+            &remote,
+            "repository",
+            "head",
+            "family",
+            vec![part("existing.json"), part("missing.json")],
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(pending, vec![part("missing.json")]);
+        assert_eq!(reused, 7);
+        assert_eq!(
+            remote
+                .digest_checks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn preflight_hydrates_each_shard_once_and_answers_exactly_as_unbatched_checks() {
         let root = crate::test_support::temporary_root("managed-batched-destination-dependency");
         let staging = root.join("staging");
@@ -6163,6 +6741,8 @@ mod tests {
         let remote = PrefetchRecorder {
             inner: FilesystemMemoryRemote::new(staging),
             prefetches: Mutex::new(Vec::new()),
+            prefetch_cancellation: None,
+            digest_checks: std::sync::atomic::AtomicUsize::new(0),
         };
         remote.inner.insert_repository(
             historical.repository_url.clone(),

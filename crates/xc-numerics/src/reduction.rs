@@ -48,7 +48,11 @@ pub fn roundtrip_decimal_digits(precision_bits: u32) -> usize {
 }
 
 fn encode(value: &Float, precision_bits: u32) -> String {
-    value.to_string_radix(10, Some(roundtrip_decimal_digits(precision_bits)))
+    crate::fmt::decimal_string_round(
+        value,
+        Some(roundtrip_decimal_digits(precision_bits)),
+        Round::Nearest,
+    )
 }
 
 fn parse(value: &str, precision_bits: u32, name: &str) -> Result<Float> {
@@ -320,6 +324,16 @@ pub fn deterministic_parallel_sum_hp(
         .num_threads(fingerprint.thread_policy.thread_count)
         .build()
         .context("build deterministic HP reduction thread pool")?;
+    let caller_range = (rug::float::exp_min(), rug::float::exp_max());
+    if pool
+        .broadcast(|_| (rug::float::exp_min(), rug::float::exp_max()))
+        .iter()
+        .any(|r| *r != caller_range)
+    {
+        return Err(anyhow!(
+            "parallel reduction workers do not share the caller exponent range"
+        ));
+    }
     let level: Vec<Float> = pool.install(|| {
         values
             .par_chunks(policy.chunk_elements)

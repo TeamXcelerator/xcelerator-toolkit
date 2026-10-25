@@ -66,6 +66,7 @@ pub struct ShiftInvertKrylovBoundaryClusterHp {
 /// A successful separated request requires a complete count at its boundary;
 /// unavailable or mismatched counts retain candidates with an unresolved status.
 pub struct ShiftInvertKrylovReportHp {
+    pub operator_error: super::OperatorErrorEvidenceHp,
     /// A source-bound count established the number of eigenvalues on the requested side.
     pub global_target_ordering_established: bool,
     pub boundary_count_evidence: super::BoundaryCountEvidenceHp,
@@ -768,6 +769,7 @@ impl ShiftInvertKrylovSolverHp {
             let converged = candidate_converged;
             if converged || restart == config.maximum_restarts {
                 return build_report(
+                    operator,
                     config,
                     descriptor,
                     states,
@@ -788,6 +790,7 @@ impl ShiftInvertKrylovSolverHp {
 
 #[allow(clippy::too_many_arguments)]
 fn build_report(
+    operator: &dyn SymmetricOperator<Float>,
     config: &ShiftInvertKrylovConfigHp,
     descriptor: ShiftInvertFactorizationDescriptorHp,
     states: Vec<RitzState>,
@@ -875,7 +878,7 @@ fn build_report(
     }
     let (orthogonality_errors, maximum_orthogonality_error) =
         orthogonality_errors(&states, config.precision_bits);
-    let retained_eigenpairs = states
+    let retained_eigenpairs: Vec<ShiftInvertKrylovEigenpairHp> = states
         .iter()
         .enumerate()
         .map(|(position, state)| ShiftInvertKrylovEigenpairHp {
@@ -934,6 +937,14 @@ fn build_report(
     let mut provenance = SolverProvenance::current_package("rug_mpfr");
     provenance.precision_bits = Some(config.precision_bits);
     Ok(ShiftInvertKrylovReportHp {
+        operator_error: super::OperatorErrorEvidenceHp::for_residuals(
+            operator,
+            None,
+            retained_eigenpairs
+                .iter()
+                .map(|p: &ShiftInvertKrylovEigenpairHp| (&p.eigenvalue, &p.residual_norm)),
+            config.precision_bits,
+        )?,
         global_target_ordering_established: boundary_count_evidence.establishes_requested_count(),
         boundary_count_evidence,
         algorithm: super::HP_KRYLOV_COUNT_SEMANTICS.into(),

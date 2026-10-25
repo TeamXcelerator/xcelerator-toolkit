@@ -5,7 +5,8 @@ mod app {
     use serde::{Deserialize, Serialize};
     use serde_json::{json, Value};
     use std::{
-        io::Write,
+        cell::RefCell,
+        io::{BufReader, Read, Write},
         path::{Path, PathBuf},
     };
     use xc_cache::*;
@@ -90,24 +91,115 @@ mod app {
         cache_root: PathBuf,
         jobs: Vec<Job>,
     }
-    fn read(base: &Path, files: &Files) -> Result<(ArtifactManifest, Vec<u8>)> {
-        if std::fs::metadata(base.join(&files.manifest))?.len() > 1024 * 1024 {
-            bail!("manifest exceeds byte budget");
-        }
-        let manifest: ArtifactManifest =
-            serde_json::from_slice(&std::fs::read(base.join(&files.manifest))?)?;
-        let limit = files.maximum_payload_bytes.unwrap_or(512 * 1024 * 1024);
-        if manifest.size_bytes > limit
-            || std::fs::metadata(base.join(&files.payload))?.len() > limit
-        {
-            bail!("source payload exceeds declared byte budget");
-        }
-        let bytes = std::fs::read(base.join(&files.payload))?;
-        Ok((manifest, bytes))
+    // Keep conservative ownership allowances through the whole job, including
+    // decoded states, roots and input objects after their JSON buffers drop.
+    struct Sources<'a> {
+        base: &'a Path,
+        resources: &'a xc_core::RunResources,
+        reservations: RefCell<Vec<xc_core::MemoryReservation>>,
     }
-    fn state(base: &Path, f: &Files, approved: &[ContentDigest]) -> Result<RetainedState> {
-        let (m, b) = read(base, f)?;
-        RetainedState::from_payload(&m, &b, approved)
+    impl Sources<'_> {
+        fn manifest(&self, files: &Files) -> Result<ArtifactManifest> {
+            let path = self.base.join(&files.manifest);
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)?
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 1024 * 1024 {
+                bail!("manifest exceeds byte budget");
+            }
+            let manifest: ArtifactManifest = serde_json::from_slice(&bytes)?;
+            manifest.validate()?;
+            if files
+                .maximum_payload_bytes
+                .is_some_and(|limit| manifest.size_bytes > limit)
+            {
+                bail!("source payload exceeds declared byte budget");
+            }
+            Ok(manifest)
+        }
+        fn reserve_json(&self, size: u64) -> Result<()> {
+            // Match capture_runtime's conservative retained-JSON allowance.
+            let owned = size
+                .checked_mul(64)
+                .and_then(|n| n.checked_add(4096))
+                .context("retained JSON ownership estimate overflow")?;
+            let reservation = self.resources.try_reserve_retained(owned)?;
+            self.reservations.borrow_mut().push(reservation);
+            Ok(())
+        }
+        fn read_bytes(&self, path: &Path, expected: u64) -> Result<Vec<u8>> {
+            let mut file = std::fs::File::open(path)?;
+            if file.metadata()?.len() != expected {
+                bail!("source payload length differs from declared size");
+            }
+            self.reserve_json(expected)?;
+            let length =
+                usize::try_from(expected).context("source payload exceeds address space")?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length)
+                .context("source payload allocation failed")?;
+            bytes.resize(length, 0);
+            file.read_exact(&mut bytes)?;
+            if file.read(&mut [0u8; 1])? != 0 {
+                bail!("source payload grew beyond declared size");
+            }
+            Ok(bytes)
+        }
+        fn read(&self, files: &Files) -> Result<(ArtifactManifest, Vec<u8>)> {
+            let manifest = self.manifest(files)?;
+            let bytes = self.read_bytes(&self.base.join(&files.payload), manifest.size_bytes)?;
+            Ok((manifest, bytes))
+        }
+        fn state(&self, files: &Files, approved: &[ContentDigest]) -> Result<RetainedState> {
+            let (manifest, bytes) = self.read(files)?;
+            #[derive(Deserialize)]
+            struct Shape {
+                n_modes: usize,
+                precision_bits: u32,
+            }
+            let shape: Shape = serde_json::from_slice(&bytes)?;
+            if shape.n_modes > 8192 || !(64..=1_000_000).contains(&shape.precision_bits) {
+                bail!("unsupported retained state shape or precision");
+            }
+            // Short decimal strings can expand into high-precision Float
+            // allocations; account for those independently of JSON storage.
+            let numeric_bytes = (2 * shape.n_modes as u64 + 1)
+                .checked_mul(u64::from(shape.precision_bits).div_ceil(8) + 96)
+                .context("retained state ownership estimate overflow")?;
+            self.reservations
+                .borrow_mut()
+                .push(self.resources.try_reserve_retained(numeric_bytes)?);
+            RetainedState::from_payload(&manifest, &bytes, approved)
+        }
+        fn matrix(
+            &self,
+            files: &Files,
+            approved: &[ContentDigest],
+        ) -> Result<RetainedMatrix<'static>> {
+            let manifest = self.manifest(files)?;
+            let file = std::fs::File::open(self.base.join(&files.payload))?;
+            if file.metadata()?.len() != manifest.size_bytes {
+                bail!("source payload length differs from declared size");
+            }
+            let mut reader = BufReader::new(file);
+            RetainedMatrix::from_reader_with_resources(
+                &manifest,
+                &mut reader,
+                approved,
+                self.resources,
+            )
+        }
+        fn external_bytes(&self, path: &Path) -> Result<Vec<u8>> {
+            let size = std::fs::metadata(path)?.len();
+            // This is the input schema's independent domain guard. The job's
+            // configured working budget controls ownership below that guard.
+            if size > xc_spectral::ccm::capture_runtime::RESEARCH_INPUT_MAXIMUM_BYTES {
+                bail!("external input exceeds supported input domain");
+            }
+            self.read_bytes(path, size)
+        }
     }
     fn packet<T: Serialize>(r: ArtifactExecutionCacheResult<T>) -> Result<Value> {
         let m = r
@@ -121,7 +213,13 @@ mod app {
         base: &Path,
         approved: &[ContentDigest],
         cache: &ArtifactCacheContext<'_>,
+        resources: &xc_core::RunResources,
     ) -> Result<Value> {
+        let sources = Sources {
+            base,
+            resources,
+            reservations: RefCell::new(Vec::new()),
+        };
         match &job.task {
             Task::ExtendedResearch {
                 diagnostic,
@@ -135,18 +233,15 @@ mod app {
                 options,
             } => {
                 use xc_spectral::ccm::extended_research::*;
-                let s = state(base, f, approved)?;
+                let s = sources.state(f, approved)?;
                 let m = matrix
                     .as_ref()
-                    .map(|f| {
-                        let (m, b) = read(base, f)?;
-                        RetainedMatrix::from_payload(&m, &b, approved)
-                    })
+                    .map(|f| sources.matrix(f, approved))
                     .transpose()?;
                 let roots = match (roots, secular) {
                     (Some(r), Some(sec)) => {
-                        let (r, b) = read(base, r)?;
-                        let (m, mb) = read(base, sec)?;
+                        let (r, b) = sources.read(r)?;
+                        let (m, mb) = sources.read(sec)?;
                         Some(RetainedRoots::from_payload(&r, &b, &m, &mb, &s, approved)?)
                     }
                     (None, None) => None,
@@ -159,15 +254,8 @@ mod app {
                     .as_ref()
                     .zip(input_sha256.as_ref())
                     .map(|(path, expected)| -> Result<_> {
-                        use std::io::Read;
                         let path = base.join(path);
-                        let mut bytes = Vec::new();
-                        std::fs::File::open(&path)?
-                            .take(64 * 1024 * 1024 + 1)
-                            .read_to_end(&mut bytes)?;
-                        if bytes.len() > 64 * 1024 * 1024 {
-                            bail!("external input exceeds byte budget");
-                        }
+                        let bytes = sources.external_bytes(&path)?;
                         if ContentDigest::sha256(&bytes) != *expected {
                             bail!("external input does not match frozen batch digest");
                         }
@@ -235,7 +323,7 @@ mod app {
                 )?)
             }
             Task::StateGeometry { state: f, options } => {
-                let s = state(base, f, approved)?;
+                let s = sources.state(f, approved)?;
                 packet(analyze_state_geometry_via_cache(
                     &s,
                     &options
@@ -249,9 +337,8 @@ mod app {
                 matrix,
                 parent_manifests,
             } => {
-                let s = state(base, f, approved)?;
-                let (m, b) = read(base, matrix)?;
-                let m = RetainedMatrix::from_payload(&m, &b, approved)?;
+                let s = sources.state(f, approved)?;
+                let m = sources.matrix(matrix, approved)?;
                 if parent_manifests.len() > 64 {
                     bail!("ancestry manifest budget exceeded");
                 }
@@ -280,9 +367,9 @@ mod app {
                 secular,
                 options,
             } => {
-                let s = state(base, f, approved)?;
-                let (r, b) = read(base, roots)?;
-                let (m, mb) = read(base, secular)?;
+                let s = sources.state(f, approved)?;
+                let (r, b) = sources.read(roots)?;
+                let (m, mb) = sources.read(secular)?;
                 let r = RetainedRoots::from_payload(&r, &b, &m, &mb, &s, approved)?;
                 packet(capture_transforms_at_roots(
                     &s,
@@ -298,8 +385,8 @@ mod app {
                 dataset,
                 options,
             } => {
-                let s = state(base, f, approved)?;
-                let (m, b) = read(base, dataset)?;
+                let s = sources.state(f, approved)?;
+                let (m, b) = sources.read(dataset)?;
                 let d = RetainedDataset::from_payload(&m, &b, approved)?;
                 packet(capture_transforms_at_dataset(
                     &s,
@@ -315,16 +402,16 @@ mod app {
                 roots,
                 secular,
             } => {
-                let s = state(base, f, approved)?;
-                let (r, b) = read(base, roots)?;
-                let (m, mb) = read(base, secular)?;
+                let s = sources.state(f, approved)?;
+                let (r, b) = sources.read(roots)?;
+                let (m, mb) = sources.read(secular)?;
                 let r = RetainedRoots::from_payload(&r, &b, &m, &mb, &s, approved)?;
                 packet(capture_root_window(&r, cache)?)
             }
             Task::ReferenceSource { spec } => packet(capture_reference(spec, cache)?),
             Task::ReferenceDataset { spec } => packet(capture_dataset(spec, cache)?),
             Task::ReferenceProjection { state: f, inputs } => {
-                let s = state(base, f, approved)?;
+                let s = sources.state(f, approved)?;
                 let r = capture_configured_projection(&s, inputs, cache)?;
                 if r.sources.len() != 1 {
                     bail!("projection manifest unavailable");
@@ -337,7 +424,7 @@ mod app {
             Task::Stabilization { states, options } => {
                 let s = states
                     .iter()
-                    .map(|f| state(base, f, approved))
+                    .map(|f| sources.state(f, approved))
                     .collect::<Result<Vec<_>>>()?;
                 packet(capture_stabilization(&s, options, cache)?)
             }
@@ -432,11 +519,31 @@ mod app {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
+        let resource_policy =
+            xc_spectral::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?;
+        let resources = xc_core::RunResources::current().map_or_else(
+            || {
+                xc_core::RunResources::with_worker_limit(
+                    resource_policy.maximum_working_bytes,
+                    rayon::current_num_threads(),
+                )
+            },
+            Ok,
+        )?;
+        let _resource_scope = resources.enter();
         let mut outcomes = Vec::new();
         let mut failures = 0;
         for job in &batch.jobs {
             let result = xc_numerics::hp_runtime::run_hp(|| {
-                execute(job, base, &batch.approved_payload_digests, &cache)
+                // Keep the batch owner explicit at the HP callback boundary.
+                let _job_resource_scope = resources.enter();
+                execute(
+                    job,
+                    base,
+                    &batch.approved_payload_digests,
+                    &cache,
+                    &resources,
+                )
             })
             .and_then(|value| {
                 let path = output.join(format!("{}.json", job.id));
@@ -494,6 +601,154 @@ mod app {
             bail!("{failures} jobs incomplete; successful children preserved; rerun the same frozen batch to retry");
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn sources<'a>(base: &'a Path, resources: &'a xc_core::RunResources) -> Sources<'a> {
+            Sources {
+                base,
+                resources,
+                reservations: RefCell::new(Vec::new()),
+            }
+        }
+        fn fixture(root: &Path) -> Files {
+            let store = FilesystemCacheStore::new(
+                "fixture",
+                root.join("cache"),
+                true,
+                CacheVisibility::Local,
+            );
+            let version = ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap();
+            let draft = ArtifactDraft {
+                schema_version: 1,
+                key: ArtifactKey::new("fixture", "backfill", b"exact").unwrap(),
+                producer_toolkit_version: version.clone(),
+                minimum_reader_version: version,
+                maximum_reader_version: None,
+                quality: CacheQuality::Validated,
+                visibility: CacheVisibility::Local,
+                immutable: true,
+                dependencies: Vec::new(),
+                tags: Default::default(),
+                provenance_digest: None,
+            };
+            let bytes = b"{\"value\":1}";
+            let manifest = store.put(&draft, bytes).unwrap();
+            std::fs::write(
+                root.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(root.join("payload.json"), bytes).unwrap();
+            Files {
+                manifest: "manifest.json".into(),
+                payload: "payload.json".into(),
+                maximum_payload_bytes: None,
+            }
+        }
+        #[test]
+        fn backfill_source_budget_refuses_retries_and_retains_job_charge() {
+            let root = xc_core::test_support::TestDir::new("backfill-budget");
+            let files = fixture(&root);
+            let small = xc_core::RunResources::new(4096).unwrap();
+            assert!(sources(&root, &small).read(&files).is_err());
+            assert_eq!(small.usage().retained_bytes, 0);
+            let large = xc_core::RunResources::new(16_384).unwrap();
+            let owner = sources(&root, &large);
+            let (manifest, bytes) = owner.read(&files).unwrap();
+            assert_eq!(ContentDigest::sha256(&bytes), manifest.content_digest);
+            drop(bytes);
+            assert!(large.usage().retained_bytes > 0);
+            drop(owner);
+            assert_eq!(large.usage().retained_bytes, 0);
+        }
+        #[test]
+        fn backfill_source_explicit_limit_and_exact_length_remain_enforced() {
+            let root = xc_core::test_support::TestDir::new("backfill-limits");
+            let mut files = fixture(&root);
+            let resources = xc_core::RunResources::new(16_384).unwrap();
+            files.maximum_payload_bytes = Some(1);
+            assert!(sources(&root, &resources).read(&files).is_err());
+            assert_eq!(resources.usage().retained_bytes, 0);
+            files.maximum_payload_bytes = None;
+            std::fs::write(root.join("payload.json"), b"truncated").unwrap();
+            assert!(sources(&root, &resources).read(&files).is_err());
+            assert_eq!(resources.usage().retained_bytes, 0);
+        }
+        #[test]
+        fn backfill_source_unspecified_limit_has_no_fixed_payload_ceiling() {
+            let root = xc_core::test_support::TestDir::new("backfill-large-plan");
+            let mut files = fixture(&root);
+            let path = root.join(&files.manifest);
+            let mut manifest: ArtifactManifest =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            manifest.size_bytes = 20u64 << 30;
+            manifest.objects[0].size_bytes = manifest.size_bytes;
+            std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let resources = xc_core::RunResources::new(128u64 << 30).unwrap();
+            let owner = sources(&root, &resources);
+            assert_eq!(owner.manifest(&files).unwrap().size_bytes, 20u64 << 30);
+            files.maximum_payload_bytes = Some(1u64 << 30);
+            assert!(owner.manifest(&files).is_err());
+            // Only metadata was consulted: no large file or reservation exists.
+            assert_eq!(resources.usage().peak_bytes, 0);
+        }
+        #[test]
+        fn backfill_source_matrix_streaming_retains_charge_and_authenticates() {
+            let root = xc_core::test_support::TestDir::new("backfill-matrix");
+            let files = fixture(&root);
+            let path = root.join(&files.manifest);
+            let mut manifest: ArtifactManifest =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let bytes = br#"{"schema_version":2,"lambda_squared":"9","n_modes":0,"precision_bits":128,"entries":["1"]}"#;
+            manifest.key = ArtifactKey::new("ccm_tau_matrix", "backfill-matrix", b"exact").unwrap();
+            manifest.size_bytes = bytes.len() as u64;
+            manifest.content_digest = ContentDigest::sha256(bytes);
+            manifest.objects = vec![CacheObjectRef {
+                content_digest: manifest.content_digest.clone(),
+                size_bytes: manifest.size_bytes,
+            }];
+            std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            std::fs::write(root.join(&files.payload), bytes).unwrap();
+            let approved = std::slice::from_ref(&manifest.content_digest);
+            let small = xc_core::RunResources::new(1).unwrap();
+            assert!(sources(&root, &small).matrix(&files, approved).is_err());
+            assert_eq!(
+                small.usage().retained_bytes + small.usage().working_bytes,
+                0
+            );
+            let resources = xc_core::RunResources::new(4 << 20).unwrap();
+            let matrix = sources(&root, &resources).matrix(&files, approved).unwrap();
+            assert!(resources.usage().retained_bytes > 0);
+            drop(matrix);
+            assert_eq!(
+                resources.usage().retained_bytes + resources.usage().working_bytes,
+                0
+            );
+            let mut corrupt = bytes.to_vec();
+            let index = corrupt.iter().rposition(|b| *b == b'1').unwrap();
+            corrupt[index] = b'2';
+            std::fs::write(root.join(&files.payload), corrupt).unwrap();
+            assert!(sources(&root, &resources).matrix(&files, approved).is_err());
+            assert_eq!(
+                resources.usage().retained_bytes + resources.usage().working_bytes,
+                0
+            );
+        }
+        #[test]
+        fn backfill_source_external_input_uses_working_budget_and_exact_bytes() {
+            let root = xc_core::test_support::TestDir::new("backfill-input");
+            let path = root.join("input.json");
+            std::fs::write(&path, b"{\"value\":1}").unwrap();
+            let small = xc_core::RunResources::new(4096).unwrap();
+            assert!(sources(&root, &small).external_bytes(&path).is_err());
+            let large = xc_core::RunResources::new(16_384).unwrap();
+            let owner = sources(&root, &large);
+            assert_eq!(owner.external_bytes(&path).unwrap(), b"{\"value\":1}");
+            assert!(large.usage().retained_bytes > 0);
+        }
     }
 }
 #[cfg(feature = "hp")]

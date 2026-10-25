@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApproximationKind {
+    OperatorApplication,
     Banding,
     Compression,
     RandomizedSketch,
@@ -501,6 +502,7 @@ mod tests {
     #[test]
     fn every_decisive_approximation_kind_requires_a_rigorous_bound_for_certified() {
         for kind in [
+            ApproximationKind::OperatorApplication,
             ApproximationKind::Banding,
             ApproximationKind::Compression,
             ApproximationKind::RandomizedSketch,

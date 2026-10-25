@@ -270,6 +270,85 @@ pub struct TailFormRecipe {
     pub hypotheses: Vec<String>,
 }
 impl ReferencePreparation {
+    /// Reconstruct only the finite projection retained by the runtime target
+    /// preparation route. The caller authenticates the original journal and
+    /// target specification; no target provider is opened or evaluated here.
+    pub(super) fn from_retained_runtime_projection(
+        original: &ExternalResearchInputs,
+        state: &RetainedState,
+        expected_target_definition: &ContentDigest,
+    ) -> Result<Option<Self>> {
+        original.matches(state)?;
+        if original.convention_id != "runtime-target-samples-and-fourier-v1" {
+            return Ok(None);
+        }
+        let sample = original.target.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("retained runtime finite projection has no sampled reference")
+        })?;
+        let coefficients = sample.trial_coefficients.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("retained runtime finite projection coefficients are missing")
+        })?;
+        let source_precision = state.precision.checked_add(64).ok_or_else(|| {
+            anyhow::anyhow!("retained runtime finite projection precision overflow")
+        })?;
+        let scope_prefix = format!(
+            "supplied runtime target sampled on {} uniform log-coordinate intervals; finite even Fourier projection through mode {}; composite trapezoid; maximum coefficient change on half grid=",
+            sample.intervals, state.modes
+        );
+        anyhow::ensure!(
+            original.precision_bits == source_precision
+                && original.definition_digest == *expected_target_definition
+                && sample.definition_digest == original.definition_digest
+                && sample.approximation_scope == original.approximation_scope
+                && original.approximation_scope.starts_with(&scope_prefix)
+                && original.approximation_scope.ends_with("; this measured refinement is not a quadrature, source-error, or infinite-tail certificate")
+                && sample.evaluation_policy == "configured target evaluator; uniform x=log(u) nodes; normalized at u=1"
+                && sample.basis_values.is_empty()
+                && sample.fixed_second_component.is_none()
+                && sample.raw_normalizer == "1"
+                && coefficients.len() == 2 * state.modes + 1,
+            "retained runtime finite projection authority mismatch"
+        );
+        let reference = ResearchInputs {
+            schema_version: 1,
+            reference: ReferenceSpec {
+                schema_version: 1,
+                definition: format!(
+                    "finite Fourier projection of runtime target {}",
+                    original.definition_digest.0
+                ),
+                lambda_squared: original.lambda_squared.clone(),
+                precision_bits: source_precision,
+                coefficients: coefficients.clone(),
+                approximation_scope: original.approximation_scope.clone(),
+            },
+            basis: vec![],
+            projection: ProjectionOptions {
+                working_precision_bits: source_precision.checked_add(64).ok_or_else(|| {
+                    anyhow::anyhow!("retained projection working precision overflow")
+                })?,
+                normalization: "center_one".into(),
+                fixed_second_component: None,
+            },
+        };
+        reference.validate()?;
+        Ok(Some(Self {
+            schema_version: 1,
+            finite_reference: Some(reference),
+            sampled_reference: original.target.clone(),
+            lambda_squared: original.lambda_squared.clone(),
+            precision_bits: original.precision_bits,
+            definition_digest: original.definition_digest.clone(),
+            approximation_scope: format!("{}; signed jets refer to this explicitly finite Fourier projection, extended by zero outside the run window", original.approximation_scope),
+            weighted_atoms: vec![],
+            atom_coordinate: None,
+            atom_coverage: None,
+            tail_form: None,
+            tail_recipe: None,
+            completion: None,
+        }))
+    }
+
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
         if std::fs::metadata(path)?.len() > 64 * 1024 * 1024 {
             bail!("reference preparation file exceeds 64 MiB");
@@ -449,51 +528,63 @@ impl ReferencePreparation {
                 // Roots are independent: their jets are formed on workers and
                 // appended, with the first error, in root order as before.
                 xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
+                let resources = xc_core::RunResources::current();
+                let workers = rayon::current_num_threads()
+                    .min(
+                        resources
+                            .as_ref()
+                            .map_or(usize::MAX, xc_core::RunResources::worker_limit),
+                    )
+                    .max(1);
+                let chunk_length = roots.dataset.points.len().div_ceil(workers).max(1);
+                let jet = |point: &EvaluationPoint| -> Result<Option<ReferenceJet>> {
+                    let Some(t) = &point.value else {
+                        return Ok(None);
+                    };
+                    let t_value = Float::with_val(p, scalar(t, roots.dataset.precision_bits)?);
+                    let (value, derivative, _, _) = transform_terms(&reference_state, &t_value, p)?;
+                    let norm = normalized
+                        .iter()
+                        .fold(Float::with_val(p, 0), |n, x| n.hypot(x));
+                    let scale = norm * l.clone().sqrt();
+                    if !scale.is_finite() || scale <= 0 {
+                        bail!("finite reference transform scale exceeds supported exponent range");
+                    }
+                    let jet = Jet {
+                        value: dec(&(value * &scale)),
+                        derivative: dec(&(derivative * &scale)),
+                    };
+                    Ok(Some(ReferenceJet {
+                        matched_root_ordinal: None,
+                        ordinal: point.ordinal,
+                        t: dec(&t_value),
+                        reference_window: jet.clone(),
+                        reference_full: jet,
+                        exterior_tail: Jet {
+                            value: "0".into(),
+                            derivative: "0".into(),
+                        },
+                        endpoint_tail_part: None,
+                        fitted_interior_parts: vec![],
+                        error_normalization: None,
+                        source_value_error: None,
+                        tail_value_error: None,
+                        source_derivative_error: None,
+                        root_separation_radius: None,
+                    }))
+                };
+                // At most `workers` numerical producers, even if the installed
+                // Rayon pool is larger than this run owner's allowance.
                 let jets = roots
                     .dataset
                     .points
-                    .par_iter()
-                    .map(|point| -> Result<Option<ReferenceJet>> {
-                        let Some(t) = &point.value else {
-                            return Ok(None);
-                        };
-                        let t_value = Float::with_val(p, scalar(t, roots.dataset.precision_bits)?);
-                        let (value, derivative, _, _) =
-                            transform_terms(&reference_state, &t_value, p)?;
-                        let norm = normalized
-                            .iter()
-                            .fold(Float::with_val(p, 0), |n, x| n.hypot(x));
-                        let scale = norm * l.clone().sqrt();
-                        if !scale.is_finite() || scale <= 0 {
-                            bail!(
-                                "finite reference transform scale exceeds supported exponent range"
-                            );
-                        }
-                        let jet = Jet {
-                            value: dec(&(value * &scale)),
-                            derivative: dec(&(derivative * &scale)),
-                        };
-                        Ok(Some(ReferenceJet {
-                            matched_root_ordinal: None,
-                            ordinal: point.ordinal,
-                            t: dec(&t_value),
-                            reference_window: jet.clone(),
-                            reference_full: jet,
-                            exterior_tail: Jet {
-                                value: "0".into(),
-                                derivative: "0".into(),
-                            },
-                            endpoint_tail_part: None,
-                            fitted_interior_parts: vec![],
-                            error_normalization: None,
-                            source_value_error: None,
-                            tail_value_error: None,
-                            source_derivative_error: None,
-                            root_separation_radius: None,
-                        }))
+                    .par_chunks(chunk_length)
+                    .map(|points| {
+                        let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+                        points.iter().map(&jet).collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>();
-                for jet in jets {
+                for jet in jets.into_iter().flatten() {
                     if let Some(jet) = jet? {
                         input.reference_jets.push(jet);
                     }
@@ -1298,13 +1389,11 @@ fn polynomial_root_row(
     let digits = Some((u64::from(root.precision()) * 30103 / 100000 + 10) as usize);
     r.values.insert(
         "rounded_polynomial_root_lower".into(),
-        root.lower()
-            .to_string_radix_round(10, digits, rug::float::Round::Down),
+        xc_numerics::fmt::decimal_string_round(root.lower(), digits, rug::float::Round::Down),
     );
     r.values.insert(
         "rounded_polynomial_root_upper".into(),
-        root.upper()
-            .to_string_radix_round(10, digits, rug::float::Round::Up),
+        xc_numerics::fmt::decimal_string_round(root.upper(), digits, rug::float::Round::Up),
     );
     Ok(r)
 }

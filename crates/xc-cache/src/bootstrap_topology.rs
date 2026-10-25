@@ -98,23 +98,39 @@ fn visibility_name(visibility: CacheVisibility) -> Result<&'static str, CacheErr
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(
-    remote: &dyn RemoteGitStore,
-    repository: &str,
-    revision: &str,
-    path: &str,
-    cancellation: &CancellationToken,
-) -> Result<T, CacheError> {
-    let mut bytes = Vec::new();
-    remote.read_committed_path(
-        repository,
-        revision,
-        path,
-        4 * 1024 * 1024,
-        cancellation,
-        &mut bytes,
-    )?;
-    Ok(serde_json::from_slice(&bytes)?)
+/// Supplies exact-revision document bytes without replacing topology validation.
+/// The generic method preserves the same serde duplicate/unknown-field checks.
+pub(crate) trait BootstrapDocumentReader {
+    fn read_topology_json<T: serde::de::DeserializeOwned>(
+        &self,
+        repository: &str,
+        revision: &str,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<T, CacheError>;
+}
+
+struct UncachedBootstrapReader<'a>(&'a dyn RemoteGitStore);
+
+impl BootstrapDocumentReader for UncachedBootstrapReader<'_> {
+    fn read_topology_json<T: serde::de::DeserializeOwned>(
+        &self,
+        repository: &str,
+        revision: &str,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<T, CacheError> {
+        let mut bytes = Vec::new();
+        self.0.read_committed_path(
+            repository,
+            revision,
+            path,
+            4 * 1024 * 1024,
+            cancellation,
+            &mut bytes,
+        )?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
 }
 
 pub(crate) fn read_bootstrap_family_topology(
@@ -123,6 +139,24 @@ pub(crate) fn read_bootstrap_family_topology(
     visibility: CacheVisibility,
     family: &str,
     cancellation: &CancellationToken,
+) -> Result<BootstrapFamilyTopology, CacheError> {
+    read_bootstrap_family_topology_with_reader(
+        remote,
+        owner,
+        visibility,
+        family,
+        cancellation,
+        &UncachedBootstrapReader(remote),
+    )
+}
+
+pub(crate) fn read_bootstrap_family_topology_with_reader<R: BootstrapDocumentReader>(
+    remote: &dyn RemoteGitStore,
+    owner: &str,
+    visibility: CacheVisibility,
+    family: &str,
+    cancellation: &CancellationToken,
+    documents: &R,
 ) -> Result<BootstrapFamilyTopology, CacheError> {
     let visibility_name = visibility_name(visibility)?;
     if owner.trim().is_empty()
@@ -137,8 +171,7 @@ pub(crate) fn read_bootstrap_family_topology(
     let registry_id = format!("{owner}/xcelerator-cache-{visibility_name}-registry");
     let registry_repository = format!("https://github.com/{registry_id}.git");
     let registry_revision = remote.read_ref(&registry_repository, "main")?;
-    let registry: BootstrapRegistry = read_json(
-        remote,
+    let registry: BootstrapRegistry = documents.read_topology_json(
         &registry_repository,
         &registry_revision,
         "registry.json",
@@ -184,8 +217,7 @@ pub(crate) fn read_bootstrap_family_topology(
                 "{visibility_name} registry has no route for family {family:?}"
             ))
         })?;
-    let family_document: BootstrapFamilyDocument = read_json(
-        remote,
+    let family_document: BootstrapFamilyDocument = documents.read_topology_json(
         &registry_repository,
         &registry_revision,
         &route.metadata,
@@ -240,8 +272,7 @@ pub(crate) fn read_bootstrap_family_topology(
                 "{visibility_name} family {family:?} repeats shard metadata {path:?}"
             )));
         }
-        let descriptor: BootstrapShardDocument = read_json(
-            remote,
+        let descriptor: BootstrapShardDocument = documents.read_topology_json(
             &registry_repository,
             &registry_revision,
             path,

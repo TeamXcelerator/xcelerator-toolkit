@@ -53,6 +53,24 @@ precision too low to represent distinct starting points return explicit
 errors. A source can have fewer positive real roots than its polynomial
 degree. Missing roots are not supplied from a reference dataset.
 
+## Construction and resource admission
+
+The complete route uses the shared exact integer product tree. In `s=t^2`,
+the source has poles `0, a_1^2, ..., a_N^2` and residues
+`w_0, 2*w_1, ..., 2*w_N`. Squaring the retained pole points at twice their
+precision is exact. The resulting canonical rational coefficients match
+the sequential construction, including removal of zero residues and zero
+factors. Root isolation, starting-point rounding, and artifact identities
+are unchanged.
+
+Numerator construction and isolation share a run-owned reservation derived
+from dyadic denominator and coefficient bounds. They use the active run's
+working-byte allowance, or `XC_RESEARCH_WORKING_BYTES` when no run scope is
+active. The reservation remains held while the coefficients are retained.
+Insufficient capacity is reported with the required and configured byte
+counts. This is cooperative admission, not an operating-system memory cap.
+Stage messages distinguish numerator construction from root isolation.
+
 ## Retention and migration
 
 Complete-range roots use mathematical semantics `ccm-root-range-v0.15.0-v10`

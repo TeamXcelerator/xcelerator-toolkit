@@ -5,6 +5,38 @@ versioned semantic identities. An upgrade does not rewrite stored artifacts or
 establish the accuracy of an earlier experiment. The changes below apply to
 the library; applications must update their dependencies and rebuild to use them.
 
+## v0.17.0 retained-artifact compatibility
+
+Compatible 0.16.x artifacts remain reusable; this release does not require a
+general cache reset. Default `LegacyNewton` quadrature, matrix, and sector-gap
+identities retain their 0.16.0 managed floors.
+
+Default primary LU changes for every factorization dimension greater than one,
+including small claims and `Require`-policy eigenpairs. Its exact blocked Schur
+updates have the explicit identity
+`dense_lu_partial_pivot_dimension_panel512_exact_schur_v1`, bound before factor
+and eigenpair lookup and in standalone cache filenames and payloads. Those
+artifacts require reader 0.17.0 and do not reuse unstamped historical primary
+records. Descendant identities follow their source graph. The stored-resolution
+record format remains unchanged; its numerical values need not be identical
+after the solver arithmetic changes. CPU, one-GPU, and multi-GPU execution use
+the same new arithmetic identity. Standalone evenness also uses this LU route.
+Prime-power and u-flow response envelopes independently bind the bordered
+`N + 2` LU arithmetic before lookup and require reader 0.17.0, including when
+the retained primary state has unchanged bytes. See
+[HP CCM execution](HIGH_PRECISION_PRODUCTS.md).
+
+Opt-in certified Arb quadrature has separate identities before dependent
+lookups and requires reader 0.17.0. Automatic finite diagnostics above dimension
+512 have new identities for those formerly blocked shapes; smaller requests
+retain their identities. The `RecordOutcome` stored-state resolution policy
+and native operator cross-check v3 also have explicit identity changes; see
+[release notes](RELEASE_NOTES.md) for recomputation scope and API migration.
+
+No performance change upgrades a point measurement into a certificate. Arb
+certifies rounding of nodes and weights, not quadrature truncation or operator
+error. New producer versions remain subject to publication monotonicity.
+
 ## v0.16.0 clean slate
 
 Toolkit 0.16.0 does not reuse any artifact produced by an earlier release.

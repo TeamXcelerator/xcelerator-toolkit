@@ -31,6 +31,113 @@ const char *xc_arb_flint_version(void)
     return FLINT_VERSION;
 }
 
+/* Exact secular numerator only. A node stores integer polynomials A,B with
+ * D=A/2^d and N=B/2^(d+e), where e is the common residue denominator exponent.
+ * A balanced merge is (A1*A2, B1*A2+A1*B2). Native integer multiplication
+ * avoids a rational normalization for every scalar product and every pole. */
+static int xc_exact_secular_tree(fmpz_poly_t denominator, fmpz_poly_t numerator,
+    slong *denominator_bits, mpfr_srcptr const *poles,
+    mpfr_srcptr const *weights, slong count, slong weight_bits, slong total_bits,
+    int need_denominator)
+{
+    if (count == 1) {
+        mpq_t pole, weight;
+        fmpz_t coefficient;
+        mpq_init(pole); mpq_init(weight); fmpz_init(coefficient);
+        mpfr_get_q(pole, poles[0]);
+        mpfr_get_q(weight, weights[0]);
+        slong pole_bits = (slong)mpz_sizeinbase(mpq_denref(pole), 2) - 1;
+        slong residue_bits = (slong)mpz_sizeinbase(mpq_denref(weight), 2) - 1;
+        int status = 0;
+        if (pole_bits > total_bits || residue_bits > weight_bits ||
+            pole_bits > total_bits - weight_bits) {
+            status = 3;
+        } else {
+            if (need_denominator) {
+                fmpz_set_mpz(coefficient, mpq_numref(pole));
+                fmpz_neg(coefficient, coefficient);
+                fmpz_poly_set_coeff_fmpz(denominator, 0, coefficient);
+                fmpz_set_mpz(coefficient, mpq_denref(pole));
+                fmpz_poly_set_coeff_fmpz(denominator, 1, coefficient);
+            }
+            fmpz_set_mpz(coefficient, mpq_numref(weight));
+            fmpz_mul_2exp(coefficient, coefficient,
+                (ulong)(pole_bits + weight_bits - residue_bits));
+            fmpz_poly_set_coeff_fmpz(numerator, 0, coefficient);
+            *denominator_bits = pole_bits;
+        }
+        fmpz_clear(coefficient); mpq_clear(weight); mpq_clear(pole);
+        return status;
+    }
+    fmpz_poly_t left_d, left_n, right_d, right_n, other;
+    fmpz_poly_init(left_d); fmpz_poly_init(left_n);
+    fmpz_poly_init(right_d); fmpz_poly_init(right_n); fmpz_poly_init(other);
+    slong left_bits = 0, right_bits = 0;
+    slong middle = count / 2;
+    int status = xc_exact_secular_tree(left_d, left_n, &left_bits,
+        poles, weights, middle, weight_bits, total_bits, 1);
+    if (status == 0)
+        status = xc_exact_secular_tree(right_d, right_n, &right_bits,
+            poles + middle, weights + middle, count - middle, weight_bits, total_bits, 1);
+    if (status == 0 && left_bits > total_bits - weight_bits - right_bits)
+        status = 3;
+    if (status == 0) {
+        if (need_denominator)
+            fmpz_poly_mul(denominator, left_d, right_d);
+        fmpz_poly_mul(numerator, left_n, right_d);
+        fmpz_poly_mul(other, left_d, right_n);
+        fmpz_poly_add(numerator, numerator, other);
+        *denominator_bits = left_bits + right_bits;
+    }
+    fmpz_poly_clear(other); fmpz_poly_clear(right_n); fmpz_poly_clear(right_d);
+    fmpz_poly_clear(left_n); fmpz_poly_clear(left_d);
+    return status;
+}
+
+int xc_flint_exact_secular_numerator(mpq_ptr *out_coefficients, slong output_capacity,
+    mpfr_srcptr const *poles, mpfr_srcptr const *weights, slong count,
+    slong weight_bits, slong total_bits)
+{
+    if (out_coefficients == NULL || poles == NULL || weights == NULL ||
+        count < 1 || output_capacity != count || weight_bits < 0 || total_bits < weight_bits)
+        return 1;
+    for (slong k = 0; k < count; ++k) {
+        if (out_coefficients[k] == NULL || poles[k] == NULL || weights[k] == NULL ||
+            !mpfr_number_p(poles[k]) || !mpfr_number_p(weights[k]) || mpfr_zero_p(weights[k]))
+            return 1;
+    }
+    fmpz_poly_t denominator, numerator;
+    fmpz_t coefficient;
+    fmpz_poly_init(denominator); fmpz_poly_init(numerator); fmpz_init(coefficient);
+    slong denominator_bits = 0;
+    int status = xc_exact_secular_tree(denominator, numerator, &denominator_bits,
+        poles, weights, count, weight_bits, total_bits, 0);
+    if (status == 0 && denominator_bits != total_bits - weight_bits)
+        status = 3;
+    if (status == 0) {
+        for (slong k = 0; k < count; ++k) {
+            fmpz_poly_get_coeff_fmpz(coefficient, numerator, k);
+            if (fmpz_is_zero(coefficient)) {
+                mpq_set_ui(out_coefficients[k], 0, 1);
+                continue;
+            }
+            fmpz_get_mpz(mpq_numref(out_coefficients[k]), coefficient);
+            /* The denominator is a power of two. Remove its common factors
+             * directly, producing canonical GMP rationals without a GCD or
+             * a large denominator allocation for an exactly zero coefficient. */
+            mp_bitcnt_t twos = mpz_scan1(mpq_numref(out_coefficients[k]), 0);
+            if (twos > (ulong)total_bits) twos = (ulong)total_bits;
+            mpz_tdiv_q_2exp(mpq_numref(out_coefficients[k]),
+                mpq_numref(out_coefficients[k]), twos);
+            mpz_set_ui(mpq_denref(out_coefficients[k]), 1);
+            mpz_mul_2exp(mpq_denref(out_coefficients[k]),
+                mpq_denref(out_coefficients[k]), (ulong)total_bits - twos);
+        }
+    }
+    fmpz_clear(coefficient); fmpz_poly_clear(numerator); fmpz_poly_clear(denominator);
+    return status;
+}
+
 int xc_flint_rational_polynomial_root_count(
     slong *out_count,
     int *out_square_free,
@@ -187,7 +294,7 @@ void xc_arb_complex_trigamma_interval(
  * Add that error BEFORE the odd q factor, preserving the removable limit
  * and relative accuracy even for tiny nonzero q. All operations are balls. */
 static void sinc_near_carrier(acb_ptr coefficients, const acb_t q,
-    const arb_t h, slong order, slong precision)
+    const arb_t h, slong order, slong precision, arb_srcptr powers)
 {
     acb_t q2, even, odd, term;
     arb_t factorial, error, tolerance, power;
@@ -216,9 +323,12 @@ static void sinc_near_carrier(acb_ptr coefficients, const acb_t q,
         acb_add_error_arb(coefficients + k, error);
         if (k % 2) acb_mul(coefficients + k, coefficients + k, q, precision);
         if ((k + 1) % 4 >= 2) acb_neg(coefficients + k, coefficients + k);
-        acb_mul_arb(coefficients + k, coefficients + k, power, precision);
-        arb_mul(power, power, h, precision);
-        arb_div_ui(power, power, k + 1, precision);
+        acb_mul_arb(coefficients + k, coefficients + k,
+            powers ? powers + k : power, precision);
+        if (!powers) {
+            arb_mul(power, power, h, precision);
+            arb_div_ui(power, power, k + 1, precision);
+        }
     }
     acb_clear(q2); acb_clear(even); acb_clear(odd); acb_clear(term);
     arb_clear(factorial); arb_clear(error); arb_clear(tolerance); arb_clear(power);
@@ -234,6 +344,83 @@ static int near_carrier(const acb_t q, slong precision)
     return near;
 }
 
+/* This object owns only immutable balls, never pointers into the Rust source.
+ * Every evaluation owns its mutable temporaries. Prepared entries are exactly
+ * the balls produced at the corresponding sites in the one-shot operation
+ * sequence; neither multiplication order nor accumulation order is changed. */
+typedef struct {
+    slong count, precision;
+    arb_t l, half, pi, root_l, factorial48, factorial47;
+    arb_ptr coefficients, slope_coefficients, offsets, powers;
+} xc_arb_finite_transform_context;
+
+void xc_arb_finite_transform_context_free(void *opaque)
+{
+    if (!opaque) return;
+    xc_arb_finite_transform_context *context = opaque;
+    _arb_vec_clear(context->coefficients, context->count);
+    _arb_vec_clear(context->slope_coefficients, context->count);
+    _arb_vec_clear(context->offsets, context->count);
+    _arb_vec_clear(context->powers, 48);
+    arb_clear(context->l); arb_clear(context->half); arb_clear(context->pi);
+    arb_clear(context->root_l); arb_clear(context->factorial48);
+    arb_clear(context->factorial47);
+    flint_free(context);
+}
+
+void *xc_arb_finite_transform_context_new(const char *cutoff,
+    mpfr_srcptr const *coefficients, slong count, slong precision)
+{
+    arb_t l, half, pi, norm, c, scale;
+    arb_init(l); arb_init(half); arb_init(pi); arb_init(norm);
+    arb_init(c); arb_init(scale);
+    xc_arb_finite_transform_context *context = NULL;
+    if (count <= 0 || count % 2 == 0 || arb_set_str(l, cutoff, precision) != 0
+        || !arb_is_finite(l)) goto cleanup;
+    arb_sub_ui(c, l, 1, precision); if (!arb_is_positive(c)) goto cleanup;
+    arb_log(l, l, precision); arb_mul_2exp_si(half, l, -1);
+    arb_const_pi(pi, precision); arb_zero(norm);
+    for (slong j = 0; j < count; j++) {
+        arb_set_interval_mpfr(c, coefficients[j], coefficients[j], precision);
+        arb_addmul(norm, c, c, precision);
+    }
+    if (!arb_is_finite(norm) || !arb_is_positive(norm)) goto cleanup;
+    arb_div(scale, l, norm, precision); arb_sqrt(scale, scale, precision);
+    context = flint_malloc(sizeof(xc_arb_finite_transform_context));
+    context->count = count; context->precision = precision;
+    arb_init(context->l); arb_init(context->half); arb_init(context->pi);
+    arb_init(context->root_l); arb_init(context->factorial48);
+    arb_init(context->factorial47);
+    arb_set(context->l, l); arb_set(context->half, half); arb_set(context->pi, pi);
+    arb_sqrt(context->root_l, l, precision);
+    arb_fac_ui(context->factorial48, 48, precision);
+    arb_fac_ui(context->factorial47, 47, precision);
+    context->coefficients = _arb_vec_init(count);
+    context->slope_coefficients = _arb_vec_init(count);
+    context->offsets = _arb_vec_init(count);
+    context->powers = _arb_vec_init(48);
+    for (slong j = 0; j < count; j++) {
+        slong mode = j - count / 2;
+        arb_mul_si(context->offsets + j, pi, mode, precision);
+        arb_set_interval_mpfr(c, coefficients[j], coefficients[j], precision);
+        arb_mul(c, c, scale, precision);
+        if (mode % 2) arb_neg(c, c);
+        arb_set(context->coefficients + j, c);
+        arb_mul(c, c, half, precision);
+        arb_set(context->slope_coefficients + j, c);
+    }
+    arb_one(c);
+    for (slong k = 0; k < 48; k++) {
+        arb_set(context->powers + k, c);
+        arb_mul(c, c, half, precision);
+        arb_div_ui(c, c, k + 1, precision);
+    }
+cleanup:
+    arb_clear(l); arb_clear(half); arb_clear(pi); arb_clear(norm);
+    arb_clear(c); arb_clear(scale);
+    return context;
+}
+
 /* Centered Taylor enclosure of a finite unit coefficient transform. Summing
  * Taylor coefficients before evaluating the rectangle preserves cancellation
  * between Fourier carriers. The integral remainder uses ||f||_1 <= sqrt(L),
@@ -241,7 +428,8 @@ static int near_carrier(const acb_t q, slong precision)
  * and derivative, including all omitted Taylor terms, with Arb arithmetic. */
 static int finite_transform_taylor(acb_t value, acb_t slope, const acb_t z,
     const arb_t l, const arb_t half, const arb_t pi, const arb_t scale,
-    mpfr_srcptr const *coefficients, slong count, slong precision)
+    mpfr_srcptr const *coefficients, slong count, slong precision,
+    const xc_arb_finite_transform_context *context)
 {
     const slong order = 48;
     acb_poly_t q, carrier;
@@ -259,12 +447,14 @@ static int finite_transform_taylor(acb_t value, acb_t slope, const acb_t z,
     for (slong j = 0; j < count; j++) {
         slong mode = j - count / 2;
         acb_mul_arb(q0, mid, half, precision);
-        arb_mul_si(c, pi, mode, precision);
+        if (context) arb_set(c, context->offsets + j);
+        else arb_mul_si(c, pi, mode, precision);
         arb_add(acb_realref(q0), acb_realref(q0), c, precision);
         int near = near_carrier(q0, precision);
         int removable = acb_contains_zero(q0);
         if (near) {
-            sinc_near_carrier(near_coefficients, q0, half, order, precision);
+            sinc_near_carrier(near_coefficients, q0, half, order, precision,
+                context ? context->powers : NULL);
         } else if (removable) {
             acb_poly_set_coeff_acb(q, 0, q0);
             acb_set_arb(term, half);
@@ -275,9 +465,12 @@ static int finite_transform_taylor(acb_t value, acb_t slope, const acb_t z,
              * polynomial transcendental-series implementation. */
             acb_sin_cos(sine, cosine, q0, precision);
         }
-        arb_set_interval_mpfr(c, coefficients[j], coefficients[j], precision);
-        arb_mul(c, c, scale, precision);
-        if (mode % 2) arb_neg(c, c);
+        if (context) arb_set(c, context->coefficients + j);
+        else {
+            arb_set_interval_mpfr(c, coefficients[j], coefficients[j], precision);
+            arb_mul(c, c, scale, precision);
+            if (mode % 2) arb_neg(c, c);
+        }
         arb_one(power);
         acb_zero(previous);
         for (slong k = 0; k < order; k++) {
@@ -288,7 +481,8 @@ static int finite_transform_taylor(acb_t value, acb_t slope, const acb_t z,
             } else {
                 acb_set(term, k % 2 ? cosine : sine);
                 if (k % 4 >= 2) acb_neg(term, term);
-                acb_mul_arb(term, term, power, precision);
+                acb_mul_arb(term, term,
+                    context ? context->powers + k : power, precision);
                 acb_mul_arb(coefficient, previous, half, precision);
                 acb_sub(coefficient, term, coefficient, precision);
                 acb_div(coefficient, coefficient, q0, precision);
@@ -296,8 +490,10 @@ static int finite_transform_taylor(acb_t value, acb_t slope, const acb_t z,
             }
             acb_mul_arb(term, coefficient, c, precision);
             acb_add(sum + k, sum + k, term, precision);
-            arb_mul(power, power, half, precision);
-            arb_div_ui(power, power, k + 1, precision);
+            if (!context) {
+                arb_mul(power, power, half, precision);
+                arb_div_ui(power, power, k + 1, precision);
+            }
         }
     }
     acb_set(value, sum + order - 1);
@@ -314,16 +510,19 @@ static int finite_transform_taylor(acb_t value, acb_t slope, const acb_t z,
     arb_add(extent, extent, radius, precision);
     arb_mul(extent, extent, half, precision);
     arb_exp(envelope, extent, precision);
-    arb_sqrt(c, l, precision);
+    if (context) arb_set(c, context->root_l);
+    else arb_sqrt(c, l, precision);
     arb_mul(envelope, envelope, c, precision);
     arb_mul(radius, radius, half, precision);
     arb_pow_ui(error, radius, order, precision);
-    arb_fac_ui(factorial, order, precision);
+    if (context) arb_set(factorial, context->factorial48);
+    else arb_fac_ui(factorial, order, precision);
     arb_div(error, error, factorial, precision);
     arb_mul(error, error, envelope, precision);
     acb_add_error_arb(value, error);
     arb_pow_ui(error, radius, order - 1, precision);
-    arb_fac_ui(factorial, order - 1, precision);
+    if (context) arb_set(factorial, context->factorial47);
+    else arb_fac_ui(factorial, order - 1, precision);
     arb_div(error, error, factorial, precision);
     arb_mul(error, error, envelope, precision);
     arb_mul(error, error, half, precision);
@@ -364,7 +563,7 @@ int xc_arb_finite_transform(mpfr_ptr re_lo, mpfr_ptr re_hi, mpfr_ptr im_lo, mpfr
     arb_set_interval_mpfr(acb_imagref(z),zil,zih,precision);
     if (mpfr_cmp(zrl, zrh) != 0 || mpfr_cmp(zil, zih) != 0) {
         if (!finite_transform_taylor(value, slope, z, l, half, pi, scale,
-                coefficients, count, precision)) goto cleanup;
+                coefficients, count, precision, NULL)) goto cleanup;
         goto output;
     }
     acb_zero(value);acb_zero(slope);
@@ -393,6 +592,61 @@ output:
 cleanup:
     acb_clear(z);acb_clear(q);acb_clear(sinc);acb_clear(derivative);acb_clear(term);acb_clear(value);acb_clear(slope);acb_clear(tmp);acb_clear(b);
     arb_clear(l);arb_clear(half);arb_clear(pi);arb_clear(norm);arb_clear(c);arb_clear(scale);
+    return ok;
+}
+
+int xc_arb_finite_transform_prepared(mpfr_ptr re_lo, mpfr_ptr re_hi,
+    mpfr_ptr im_lo, mpfr_ptr im_hi, mpfr_ptr dr_lo, mpfr_ptr dr_hi,
+    mpfr_ptr di_lo, mpfr_ptr di_hi, mpfr_srcptr zrl, mpfr_srcptr zrh,
+    mpfr_srcptr zil, mpfr_srcptr zih, const void *opaque)
+{
+    const xc_arb_finite_transform_context *context = opaque;
+    const slong precision = context->precision;
+    acb_t z, q, sinc, derivative, term, value, slope, tmp, b;
+    acb_init(z); acb_init(q); acb_init(sinc); acb_init(derivative);
+    acb_init(term); acb_init(value); acb_init(slope); acb_init(tmp); acb_init(b);
+    int ok = 0;
+    arb_set_interval_mpfr(acb_realref(z), zrl, zrh, precision);
+    arb_set_interval_mpfr(acb_imagref(z), zil, zih, precision);
+    if (mpfr_cmp(zrl, zrh) != 0 || mpfr_cmp(zil, zih) != 0) {
+        /* scale and source pointers are unused on the prepared path. */
+        if (!finite_transform_taylor(value, slope, z, context->l,
+                context->half, context->pi, context->half, NULL,
+                context->count, precision, context)) goto cleanup;
+        goto output;
+    }
+    acb_zero(value); acb_zero(slope);
+    for (slong j = 0; j < context->count; j++) {
+        acb_mul_arb(q, z, context->half, precision);
+        arb_add(acb_realref(q), acb_realref(q), context->offsets + j, precision);
+        acb_sinc(sinc, q, precision);
+        if (acb_contains_zero(q) || near_carrier(q, precision)) {
+            acb_mul(tmp, q, q, precision); acb_mul_2exp_si(tmp, tmp, -2);
+            acb_neg(tmp, tmp); acb_set_si(b, 5); acb_mul_2exp_si(b, b, -1);
+            acb_hypgeom_0f1(derivative, b, tmp, 0, precision);
+            acb_mul(derivative, derivative, q, precision);
+            acb_div_ui(derivative, derivative, 3, precision);
+            acb_neg(derivative, derivative);
+        } else {
+            acb_cos(derivative, q, precision);
+            acb_sub(derivative, derivative, sinc, precision);
+            acb_div(derivative, derivative, q, precision);
+        }
+        acb_mul_arb(term, sinc, context->coefficients + j, precision);
+        acb_add(value, value, term, precision);
+        acb_mul_arb(term, derivative, context->slope_coefficients + j, precision);
+        acb_add(slope, slope, term, precision);
+    }
+output:
+    if (!acb_is_finite(value) || !acb_is_finite(slope)) goto cleanup;
+    ok = 1;
+    arb_get_interval_mpfr(re_lo, re_hi, acb_realref(value));
+    arb_get_interval_mpfr(im_lo, im_hi, acb_imagref(value));
+    arb_get_interval_mpfr(dr_lo, dr_hi, acb_realref(slope));
+    arb_get_interval_mpfr(di_lo, di_hi, acb_imagref(slope));
+cleanup:
+    acb_clear(z); acb_clear(q); acb_clear(sinc); acb_clear(derivative);
+    acb_clear(term); acb_clear(value); acb_clear(slope); acb_clear(tmp); acb_clear(b);
     return ok;
 }
 void xc_arb_argument(mpfr_ptr lo,mpfr_ptr hi,mpfr_srcptr rl,mpfr_srcptr rh,mpfr_srcptr il,mpfr_srcptr ih,slong precision){

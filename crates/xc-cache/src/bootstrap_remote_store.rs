@@ -14,10 +14,90 @@ type HistoricalBatchInventory = Vec<(RepositoryPublicationBatch, RemoteReadRepor
 type HistoricalBatchCache = HashMap<(String, String), HistoricalBatchInventory>;
 type MetadataDocumentKey = (String, String, String);
 
+#[cfg(test)]
+#[path = "bootstrap_metadata_reuse_tests.rs"]
+mod metadata_reuse_tests;
+
 #[derive(Default)]
 struct MetadataDocumentCache {
     retained_bytes: u64,
     documents: HashMap<MetadataDocumentKey, (Arc<[u8]>, RemoteReadReport)>,
+}
+
+fn metadata_retention_limit(resources: &ResourcePolicy) -> u64 {
+    const MAXIMUM_RETAINED_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+    resources
+        .maximum_memory_bytes
+        .map_or(MAXIMUM_RETAINED_METADATA_BYTES, |limit| {
+            limit.min(MAXIMUM_RETAINED_METADATA_BYTES)
+        })
+}
+
+/// Reuse only bytes read from the exact repository/revision/path tuple. A hit
+/// still passes caller limits, cancellation, and the requested serde decoder.
+fn read_cached_metadata_json<T: serde::de::DeserializeOwned>(
+    remote: &dyn RemoteGitStore,
+    documents: &Mutex<MetadataDocumentCache>,
+    resources: &ResourcePolicy,
+    repository: &str,
+    revision: &str,
+    path: &str,
+    maximum_bytes: u64,
+    cancellation: &CancellationToken,
+) -> Result<(T, RemoteReadReport), CacheError> {
+    cancellation
+        .check()
+        .map_err(|e| CacheError::Cancelled(e.to_string()))?;
+    let effective_maximum = resources
+        .maximum_transfer_bytes
+        .map_or(maximum_bytes, |limit| maximum_bytes.min(limit));
+    if effective_maximum == 0 || resources.maximum_memory_bytes == Some(0) {
+        return Err(CacheError::ResourceLimit(
+            "metadata read has no admitted buffer or transfer bytes".into(),
+        ));
+    }
+    let cache_key = (repository.to_owned(), revision.to_owned(), path.to_owned());
+    let cached = documents
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .documents
+        .get(&cache_key)
+        .cloned();
+    if let Some((bytes, report)) = cached {
+        if bytes.len() as u64 > effective_maximum {
+            return Err(CacheError::ResourceLimit(format!(
+                "metadata path {path:?} exceeds its {effective_maximum}-byte limit"
+            )));
+        }
+        return Ok((serde_json::from_slice(bytes.as_ref())?, report));
+    }
+    let mut bytes = Vec::new();
+    let report = remote.read_committed_path(
+        repository,
+        revision,
+        path,
+        effective_maximum,
+        cancellation,
+        &mut bytes,
+    )?;
+    if bytes.len() as u64 > effective_maximum {
+        return Err(CacheError::ResourceLimit(
+            "metadata transport exceeded its admitted output bound".into(),
+        ));
+    }
+    let value = serde_json::from_slice(&bytes)?;
+    let retained_bytes = bytes.len() as u64;
+    let retained_limit = metadata_retention_limit(resources);
+    let mut cache = documents.lock().unwrap_or_else(|p| p.into_inner());
+    if !cache.documents.contains_key(&cache_key)
+        && cache.retained_bytes.saturating_add(retained_bytes) <= retained_limit
+    {
+        cache.retained_bytes = cache.retained_bytes.saturating_add(retained_bytes);
+        cache
+            .documents
+            .insert(cache_key, (Arc::from(bytes), report.clone()));
+    }
+    Ok((value, report))
 }
 
 fn regular_file_has_exact_size(
@@ -117,6 +197,28 @@ impl Drop for GitHubBootstrapCacheStore {
         if let Err(error) = self.cleanup_session() {
             xc_core::progress_message!("cache reader session cleanup failed: {error}");
         }
+    }
+}
+
+impl crate::bootstrap_topology::BootstrapDocumentReader for GitHubBootstrapCacheStore {
+    fn read_topology_json<T: serde::de::DeserializeOwned>(
+        &self,
+        repository: &str,
+        revision: &str,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<T, CacheError> {
+        read_cached_metadata_json(
+            &self.remote,
+            &self.metadata_documents,
+            &self.resources,
+            repository,
+            revision,
+            path,
+            4 * 1024 * 1024,
+            cancellation,
+        )
+        .map(|(value, _)| value)
     }
 }
 
@@ -269,6 +371,16 @@ impl GitHubBootstrapCacheStore {
 
     /// Apply the same resource limits to transport and payload materialization.
     pub fn with_resource_policy(mut self, resources: ResourcePolicy) -> Self {
+        // This owned builder may be called after reads. Release retained raw
+        // documents if the new allowance is smaller; decoded topology and
+        // acceptance/revocation state keep their existing semantics.
+        let documents = self
+            .metadata_documents
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if documents.retained_bytes > metadata_retention_limit(&resources) {
+            *documents = MetadataDocumentCache::default();
+        }
         self.remote.set_resource_policy(resources.clone());
         self.cancellation = CancellationToken::for_policy(&resources);
         self.resources = resources;
@@ -358,12 +470,13 @@ impl GitHubBootstrapCacheStore {
         {
             return Ok(topology);
         }
-        let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
+        let topology = crate::bootstrap_topology::read_bootstrap_family_topology_with_reader(
             &self.remote,
             &self.owner,
             self.visibility,
             family,
             &self.cancellation,
+            self,
         )?;
         self.family_topologies
             .lock()
@@ -378,43 +491,16 @@ impl GitHubBootstrapCacheStore {
         revision: &str,
         path: &str,
     ) -> Result<(T, RemoteReadReport), CacheError> {
-        const MAXIMUM_RETAINED_METADATA_BYTES: u64 = 64 * 1024 * 1024;
-        let cache_key = (repository.to_owned(), revision.to_owned(), path.to_owned());
-        let cached = {
-            let cache = self
-                .metadata_documents
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.documents.get(&cache_key).cloned()
-        };
-        if let Some((bytes, report)) = cached {
-            return Ok((serde_json::from_slice(bytes.as_ref())?, report));
-        }
-        let mut bytes = Vec::new();
-        let report = self.remote.read_committed_path(
+        read_cached_metadata_json(
+            &self.remote,
+            &self.metadata_documents,
+            &self.resources,
             repository,
             revision,
             path,
             16 * 1024 * 1024,
             &self.cancellation,
-            &mut bytes,
-        )?;
-        let value = serde_json::from_slice(&bytes)?;
-        let retained_bytes = bytes.len() as u64;
-        let mut cache = self
-            .metadata_documents
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !cache.documents.contains_key(&cache_key)
-            && cache.retained_bytes.saturating_add(retained_bytes)
-                <= MAXIMUM_RETAINED_METADATA_BYTES
-        {
-            cache.retained_bytes = cache.retained_bytes.saturating_add(retained_bytes);
-            cache
-                .documents
-                .insert(cache_key, (Arc::from(bytes), report.clone()));
-        }
-        Ok((value, report))
+        )
     }
 
     /// Read and validate the immutable publication-batch inventory once for a

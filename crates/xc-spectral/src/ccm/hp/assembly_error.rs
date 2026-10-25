@@ -124,23 +124,23 @@ fn mul_up(left: &Float, right: &Float) -> Float {
 }
 
 fn decimal_up(value: &Float) -> String {
-    value.to_string_radix_round(10, Some(20), Round::Up)
+    xc_numerics::fmt::decimal_string_round(value, Some(20), Round::Up)
 }
 
 fn decimal_down(value: &Float) -> String {
-    value.to_string_radix_round(10, Some(20), Round::Down)
+    xc_numerics::fmt::decimal_string_round(value, Some(20), Round::Down)
 }
 
 /// Endpoint rounded outward with enough digits to keep the enclosure that the
 /// binary endpoint carries.
 fn endpoint_down(value: &Float) -> String {
     let digits = xc_numerics::reduction::roundtrip_decimal_digits(value.prec());
-    value.to_string_radix_round(10, Some(digits), Round::Down)
+    xc_numerics::fmt::decimal_string_round(value, Some(digits), Round::Down)
 }
 
 fn endpoint_up(value: &Float) -> String {
     let digits = xc_numerics::reduction::roundtrip_decimal_digits(value.prec());
-    value.to_string_radix_round(10, Some(digits), Round::Up)
+    xc_numerics::fmt::decimal_string_round(value, Some(digits), Round::Up)
 }
 
 /// Lower bound on the resolved decimal digits, -log10(width / scale), of the
@@ -669,11 +669,9 @@ fn enclose_root(
             let lower = Float::with_val_round(q, value - &radius, Round::Down).0;
             let upper = Float::with_val_round(q, value + &radius, Round::Up).0;
             let options = xc_root::IntervalNewtonOptions {
-                width_tolerance: xc_core::DecimalLiteral::new(radius.to_string_radix_round(
-                    10,
-                    Some(20),
-                    Round::Down,
-                ))?,
+                width_tolerance: xc_core::DecimalLiteral::new(
+                    xc_numerics::fmt::decimal_string_round(&radius, Some(20), Round::Down),
+                )?,
                 maximum_iterations: 64,
             };
             if let Ok(certificate) = source.isolate(&MpfrInterval::new(lower, upper)?, &options) {

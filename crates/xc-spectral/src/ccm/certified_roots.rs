@@ -7,6 +7,10 @@
 //! of exactly one root in every open interval between adjacent poles.
 
 pub(in crate::ccm) mod boundary;
+#[cfg(feature = "arb")]
+mod complete_positive;
+#[cfg(feature = "arb")]
+pub use complete_positive::certify_production_complete_positive_ccm_roots_at_cutoff;
 
 use anyhow::{bail, Context, Result};
 #[cfg(feature = "arb")]
@@ -735,7 +739,7 @@ impl CertifiedSecularFunction {
                     let requested = options.validate(work)?;
                     if fine_width < requested {
                         refined_options.width_tolerance = xc_core::DecimalLiteral::new(
-                            fine_width.to_string_radix_round(10, None, Round::Down))?;
+                            xc_numerics::fmt::decimal_string_round(&fine_width, None, Round::Down))?;
                     }
                 }
                 let root = promoted.isolate(&MpfrInterval::new(lower, upper)?, &refined_options)?;
@@ -827,6 +831,19 @@ const FLINT_DISCOVERY_METHOD: &str =
     "exact_cumulative_finite_source_counts_then_flint_arb_isolation_and_interval_newton";
 const FLINT_COUNT_METHOD: &str =
     "flint_arb_complete_complex_root_isolation_with_real_window_classification";
+const TIGHT_FLINT_DISCOVERY_METHOD: &str =
+    "exact_cumulative_finite_source_counts_then_flint_arb_tight_boxes_and_interval_newton_v1";
+const COMPLETE_POSITIVE_DISCOVERY_METHOD: &str =
+    "exact_cauchy_bound_complete_positive_numerator_then_flint_arb_and_interval_newton";
+const COMPLETE_POSITIVE_COUNT_METHOD: &str =
+    "exact_cauchy_bound_and_flint_arb_all_positive_movable_root_count";
+
+pub(super) fn is_complete_positive_route(discovery: &str, count: &str) -> bool {
+    discovery == COMPLETE_POSITIVE_DISCOVERY_METHOD && count == COMPLETE_POSITIVE_COUNT_METHOD
+}
+pub(super) fn is_tight_root_route(discovery: &str, count: &str) -> bool {
+    discovery == TIGHT_FLINT_DISCOVERY_METHOD && count == FLINT_COUNT_METHOD
+}
 const POLE_GAP_DISCOVERY_METHOD: &str =
     "exact_cumulative_pole_gap_census_counts_then_interval_newton";
 const POLE_GAP_CERTIFICATE_COUNT_METHOD: &str =
@@ -853,6 +870,7 @@ type WindowBracket = (usize, u32, (Float, Float));
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CountRoute {
     ExactFlint,
+    ExactFlintTight,
     PoleGap,
 }
 
@@ -878,11 +896,12 @@ impl CountRoute {
     fn methods(self) -> (&'static str, &'static str) {
         match self {
             Self::ExactFlint => (FLINT_DISCOVERY_METHOD, FLINT_COUNT_METHOD),
+            Self::ExactFlintTight => (TIGHT_FLINT_DISCOVERY_METHOD, FLINT_COUNT_METHOD),
             Self::PoleGap => (POLE_GAP_DISCOVERY_METHOD, POLE_GAP_CERTIFICATE_COUNT_METHOD),
         }
     }
     fn from_methods(discovery: &str, count: &str) -> Result<Self> {
-        [Self::ExactFlint, Self::PoleGap]
+        [Self::ExactFlint, Self::ExactFlintTight, Self::PoleGap]
             .into_iter()
             .find(|route| route.methods() == (discovery, count))
             .ok_or_else(|| anyhow::anyhow!("unknown independent CCM certificate route"))
@@ -1187,7 +1206,7 @@ impl CertifiedSecularFunction {
                 // or a value within arithmetic error of zero near this point.
                 return Ok(GapSubdivision::Stalled(format!(
                     "G stays within arithmetic error of zero near {}",
-                    lower.to_string_radix(10, Some(24))
+                    xc_numerics::fmt::decimal_string_round(&lower, Some(24), Round::Nearest)
                 )));
             };
             pending.push((middle.clone(), upper));
@@ -1814,8 +1833,12 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
         || certificate.source_weights_digest != weights_digest(&certificate.source_weights)?
         || certificate.source_certification_scope
             != FiniteSourceCertificationScope::ExactStoredPointSource
-        || CountRoute::from_methods(&certificate.discovery_method, &certificate.count_method)
+        || (CountRoute::from_methods(&certificate.discovery_method, &certificate.count_method)
             .is_err()
+            && !is_complete_positive_route(
+                &certificate.discovery_method,
+                &certificate.count_method,
+            ))
         || certificate.selected_root_count == 0
         || !certificate.window.reconciliation.complete
         || certificate.window.count.certified_root_count != certificate.window.roots.len()
@@ -1860,6 +1883,11 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
     }
     let lower_bound = boundary::rational_text(&certificate.lower_bound)?;
     let upper_bound = boundary::rational_text(&certificate.upper_bound)?;
+    if is_complete_positive_route(&certificate.discovery_method, &certificate.count_method)
+        && (lower_bound != 0 || certificate.positive_roots_before_window != 0)
+    {
+        bail!("complete-positive CCM certificate must count from zero");
+    }
     let expected_indices = match &certificate.target {
         IndependentCcmRootTarget::Prefix { count } => {
             if *count != certificate.selected_root_count {
@@ -2053,7 +2081,7 @@ fn serialize_float(value: &Float, precision_bits: u32) -> String {
         .ceil()
         .max(32.0) as usize
         + 2;
-    value.to_string_radix(10, Some(digits))
+    xc_numerics::fmt::decimal_string_round(value, Some(digits), Round::Nearest)
 }
 
 fn parse_source_weights(certificate: &FirstPositiveCcmRootCertificate) -> Result<Vec<Float>> {
@@ -2526,6 +2554,34 @@ pub fn certify_production_independent_ccm_roots_at_cutoff(
     )
 }
 
+/// Explicit narrow-box proof policy with the historical exact pole-window
+/// ordinal count. Only the requested counted window receives Newton witnesses;
+/// roots outside the positive pole span still require the complete-positive API.
+#[cfg(feature = "arb")]
+#[allow(clippy::too_many_arguments)]
+pub fn certify_production_independent_ccm_roots_tight_at_cutoff(
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    target: &IndependentCcmRootTarget,
+    precision_bits: u32,
+    isolation_bits: u32,
+    interval_newton: &IntervalNewtonOptions,
+) -> Result<ProductionIndependentCcmRootCertificate> {
+    let source = independent_source(weights, cutoff, modes, precision_bits, isolation_bits)?;
+    certify_independent_with_source(
+        &source,
+        weights,
+        cutoff,
+        modes,
+        target,
+        precision_bits,
+        isolation_bits,
+        interval_newton,
+        CountRoute::ExactFlintTight,
+    )
+}
+
 /// Integer floor of an exact decimal cutoff greater than one: the prime cutoff.
 fn cutoff_floor(cutoff: &str) -> Result<u64> {
     let value = boundary::decimal(cutoff)?;
@@ -2600,7 +2656,7 @@ pub fn certify_production_independent_ccm_roots_partially(
     };
     let route = CountRoute::for_source(&source);
     let (available, beyond) = match route {
-        CountRoute::ExactFlint => {
+        CountRoute::ExactFlint | CountRoute::ExactFlintTight => {
             match cumulative_positive_count(&source, modes, 2 * modes) {
                 Ok(count) => {
                     result.available_positive_roots = Some(count);
@@ -2717,7 +2773,9 @@ fn certify_independent_with_source(
     route: CountRoute,
 ) -> Result<ProductionIndependentCcmRootCertificate> {
     let poles = match route {
-        CountRoute::ExactFlint => source.exact_numerator_data()?.0.clone(),
+        CountRoute::ExactFlint | CountRoute::ExactFlintTight => {
+            source.exact_numerator_data()?.0.clone()
+        }
         CountRoute::PoleGap => source.point_poles()?,
     };
     let zero_pole = modes;
@@ -2754,7 +2812,7 @@ fn certify_independent_with_source(
                     bail!("independent CCM positive indices require 1 <= first <= last");
                 }
                 let (first_boundary, last_boundary, before) = match route {
-                    CountRoute::ExactFlint => {
+                    CountRoute::ExactFlint | CountRoute::ExactFlintTight => {
                         let available = cumulative_positive_count(source, zero_pole, maximum_pole)?;
                         if *last > available {
                             bail!(
@@ -2841,7 +2899,7 @@ fn certify_independent_with_source(
                 }
                 let count_in = |a: &Rational, b: &Rational| -> Result<usize> {
                     Ok(match route {
-                        CountRoute::ExactFlint => {
+                        CountRoute::ExactFlint | CountRoute::ExactFlintTight => {
                             source
                                 .exact_flint_numerator_count_in_window(a, b)?
                                 .certified_root_count
@@ -2859,6 +2917,13 @@ fn certify_independent_with_source(
         };
 
     let window = match route {
+        CountRoute::ExactFlintTight => complete_positive::certify_tight_window(
+            source,
+            &lower_bound,
+            &upper_bound,
+            isolation_bits,
+            interval_newton,
+        )?,
         CountRoute::ExactFlint => source.certify_flint_numerator_rational_window(
             &lower_bound,
             &upper_bound,
@@ -2936,7 +3001,6 @@ pub fn verify_production_independent_ccm_root_certificate(
     {
         bail!("production independent CCM certificate identity is invalid");
     }
-    let route = CountRoute::from_methods(&certificate.discovery_method, &certificate.count_method)?;
     let weights = certificate
         .source_weights
         .iter()
@@ -2949,17 +3013,33 @@ pub fn verify_production_independent_ccm_root_certificate(
         certificate.precision_bits,
         certificate.isolation_bits,
     )?;
-    let mut replay = certify_independent_with_source(
-        &source,
-        &weights,
-        &certificate.cutoff_text(),
-        certificate.modes,
-        &certificate.target,
-        certificate.precision_bits,
-        certificate.isolation_bits,
-        &certificate.interval_newton,
-        route,
-    )?;
+    let mut replay =
+        if is_complete_positive_route(&certificate.discovery_method, &certificate.count_method) {
+            complete_positive::certify_with_source(
+                &source,
+                &weights,
+                &certificate.cutoff_text(),
+                certificate.modes,
+                &certificate.target,
+                certificate.precision_bits,
+                certificate.isolation_bits,
+                &certificate.interval_newton,
+            )?
+        } else {
+            let route =
+                CountRoute::from_methods(&certificate.discovery_method, &certificate.count_method)?;
+            certify_independent_with_source(
+                &source,
+                &weights,
+                &certificate.cutoff_text(),
+                certificate.modes,
+                &certificate.target,
+                certificate.precision_bits,
+                certificate.isolation_bits,
+                &certificate.interval_newton,
+                route,
+            )?
+        };
     replay.window.roots.clone_from(&certificate.window.roots);
     // Schema 2 always retained a following span; numerical replay is unchanged.
     replay.schema_version = certificate.schema_version;

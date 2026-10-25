@@ -119,6 +119,7 @@ pub struct GeneralizedBoundaryClusterHp {
 /// Convergence concerns retained Ritz residuals and stability. The projected
 /// boundary cannot exclude an unvisited eigenspace or establish multiplicity.
 pub struct BlockGeneralizedEigenReportHp {
+    pub operator_error: super::OperatorErrorEvidenceHp,
     /// True only after a full-space projection; false means global target
     /// selection and completeness remain unverified, even when Converged.
     pub global_target_ordering_established: bool,
@@ -779,7 +780,7 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                 let cluster_range = boundary_cluster.as_ref().map(|cluster| {
                     cluster.first_retained_position..=cluster.last_retained_position
                 });
-                let retained_eigenpairs = states
+                let retained_eigenpairs: Vec<BlockGeneralizedEigenpairHp> = states
                     .into_iter()
                     .zip(eigenvalues)
                     .zip(residual_norms)
@@ -831,6 +832,16 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                 let mut provenance = SolverProvenance::current_package("rug_mpfr");
                 provenance.precision_bits = Some(config.precision_bits);
                 return Ok(BlockGeneralizedEigenReportHp {
+                    operator_error: super::OperatorErrorEvidenceHp::for_residuals(
+                        problem.operator,
+                        Some(problem.metric),
+                        retained_eigenpairs
+                            .iter()
+                            .map(|p: &BlockGeneralizedEigenpairHp| {
+                                (&p.eigenvalue, &p.residual_norm)
+                            }),
+                        config.precision_bits,
+                    )?,
                     global_target_ordering_established: maximum_trial_dimension == dimension,
                     target: config.target.clone(),
                     requested_eigenpairs: config.requested_eigenpairs,

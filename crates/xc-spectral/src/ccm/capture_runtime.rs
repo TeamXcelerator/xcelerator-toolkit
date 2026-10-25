@@ -62,6 +62,12 @@ impl CaptureResourcePolicy {
         if p.root_block_rows == 0 || p.root_block_rows > 4096 {
             bail!("root block size must be 1..4096");
         }
+        // A supplied run owner is authoritative across every adapter. Falling
+        // back to the standalone environment here would silently clip a larger
+        // explicitly admitted run at nested capture/preparation boundaries.
+        if let Some(resources) = xc_core::RunResources::current() {
+            p.maximum_working_bytes = resources.maximum_bytes();
+        }
         Ok(p)
     }
 }
@@ -71,6 +77,7 @@ pub(crate) struct Stage {
     thread: Option<std::thread::JoinHandle<()>>,
     label: String,
     start: Instant,
+    resources: Option<xc_core::RunResources>,
 }
 impl Stage {
     pub(crate) fn new(label: impl Into<String>) -> Self {
@@ -99,6 +106,7 @@ impl Stage {
             thread: Some(thread),
             label,
             start: Instant::now(),
+            resources: xc_core::RunResources::current(),
         }
     }
 }
@@ -107,6 +115,21 @@ impl Drop for Stage {
         let _ = self.stop.send(());
         if let Some(h) = self.thread.take() {
             let _ = h.join();
+        }
+        if let Some(resources) = &self.resources {
+            let used = resources.usage();
+            let worker_cap = match resources.worker_limit() {
+                usize::MAX => "no additional cap".to_owned(),
+                limit => limit.to_string(),
+            };
+            xc_core::progress_message!(
+                "research stage {}: run memory reservations (not measured RSS) retained={} working={} peak={} bytes; numerical-worker admission cap={}",
+                self.label,
+                used.retained_bytes,
+                used.working_bytes,
+                used.peak_bytes,
+                worker_cap
+            );
         }
         xc_core::progress_message!(
             "research stage {}: ended after {:.3}s",
@@ -190,6 +213,16 @@ impl Checkpoints {
     }
     pub(crate) fn enabled(&self) -> bool {
         self.directory.is_some()
+    }
+    /// Tighten one caller's read/write admission without changing its identity.
+    /// Oversized existing checkpoints are rejected before deserialization.
+    pub(crate) fn limited_bytes(&self, maximum: u64) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            identity: self.identity.clone(),
+            max_bytes: self.max_bytes.min(maximum),
+            verbose: self.verbose,
+        }
     }
     pub(crate) fn local<T: Serialize>(identity: &T, directory: PathBuf) -> Result<Self> {
         Ok(Self {
@@ -401,7 +434,8 @@ type LookAheadOutcome<T> = std::thread::Result<(T, Vec<String>)>;
 enum LookAheadSlot<T> {
     Queued(LookAheadJob<T>),
     Running,
-    Done(LookAheadOutcome<T>),
+    Done(LookAheadOutcome<T>, Option<xc_core::MemoryReservation>),
+    DiscardRunning,
     /// Taken, released to its owner, or never runnable here.
     Closed,
 }
@@ -441,9 +475,11 @@ std::thread_local! {
 /// it claims that job.
 ///
 /// Jobs run in the configuration of their owner: on the global Rayon pool,
-/// or, for an owner inside another pool, on a private pool with the same
-/// number of workers (waiting on the lane never occupies a worker the lane
-/// needs); an active full-parallel HP policy is installed for them; and a job
+/// and decline prefetch inside a run-owned memory budget or another pool.
+/// Budgeted captures compute inline so optional inputs and completed results
+/// cannot displace required work. This trades cold overlap for coverage under
+/// the same total budget. At most one finished
+/// result is retained. An active full-parallel HP policy is installed; a job
 /// runs only where the MPFR exponent range equals the owner's. The lane does
 /// not start under a safe-capped policy. Arb/FLINT keep per-thread constant
 /// caches, so jobs must not reach Arb.
@@ -454,8 +490,17 @@ pub(crate) struct LookAhead<K, T> {
 }
 
 impl<K: Send + 'static, T: Send + 'static> LookAhead<K, T> {
+    #[cfg(test)]
     pub(crate) fn start(jobs: Vec<(String, K, LookAheadJob<T>)>) -> Option<Self> {
-        if jobs.is_empty() {
+        Self::start_reserved(jobs, None, |_| Some(std::mem::size_of::<T>() as u64))
+    }
+
+    pub(crate) fn start_reserved(
+        jobs: Vec<(String, K, LookAheadJob<T>)>,
+        inputs: Option<xc_core::MemoryReservation>,
+        retained_bytes: impl Fn(&T) -> Option<u64> + Send + 'static,
+    ) -> Option<Self> {
+        if jobs.is_empty() || xc_core::RunResources::current().is_some() {
             return None;
         }
         let policy = xc_numerics::hp_runtime::active_policy();
@@ -465,16 +510,18 @@ impl<K: Send + 'static, T: Send + 'static> LookAhead<K, T> {
         {
             return None;
         }
-        let pool = match rayon::current_thread_index() {
-            Some(_) => Some(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(rayon::current_num_threads())
-                    .thread_name(|i| format!("xc-capture-lookahead-{i}"))
-                    .build()
-                    .ok()?,
-            ),
-            None => None,
-        };
+        // A waiting owner must never occupy a worker required by this lane.
+        // Decline prefetch inside custom pools instead of multiplying workers.
+        if rayon::current_thread_index().is_some() {
+            return None;
+        }
+        let resources = xc_core::RunResources::current();
+        if resources
+            .as_ref()
+            .is_some_and(|r| rayon::current_num_threads() > r.worker_limit())
+        {
+            return None;
+        }
         let range = (rug::float::exp_min(), rug::float::exp_max());
         let shared = std::sync::Arc::new(LookAheadShared {
             state: std::sync::Mutex::new(LookAheadState {
@@ -491,6 +538,8 @@ impl<K: Send + 'static, T: Send + 'static> LookAhead<K, T> {
             .name("xc-capture-lookahead".into())
             .stack_size(64 << 20)
             .spawn(move || {
+                let _inputs = inputs;
+                let _resources = resources.as_ref().map(|r| r.enter());
                 // One job with held messages, under the owner's policy and
                 // exponent range; `None` releases it to the owner.
                 let execute = |job: LookAheadJob<T>, capture: &xc_core::MessageCapture| {
@@ -509,6 +558,17 @@ impl<K: Send + 'static, T: Send + 'static> LookAhead<K, T> {
                 loop {
                     let job = {
                         let mut state = worker.lock();
+                        while !state.stopped
+                            && state
+                                .slots
+                                .iter()
+                                .any(|(_, _, slot)| matches!(slot, LookAheadSlot::Done(..)))
+                        {
+                            state = worker
+                                .changed
+                                .wait(state)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        }
                         let runnable = !state.stopped;
                         let next = state
                             .slots
@@ -533,21 +593,44 @@ impl<K: Send + 'static, T: Send + 'static> LookAhead<K, T> {
                         }
                     };
                     let capture = xc_core::MessageCapture::default();
-                    let outcome =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &pool {
-                            Some(pool) => pool.install(|| execute(job, &capture)),
-                            None => execute(job, &capture),
-                        }));
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        execute(job, &capture)
+                    }));
+                    let mut reservation = None;
+                    let outcome = match outcome {
+                        Ok(Some(value)) => {
+                            let messages = capture.take();
+                            let bytes = retained_bytes(&value).and_then(|n| {
+                                messages
+                                    .iter()
+                                    .try_fold(n, |n, m| n.checked_add(m.capacity() as u64 + 32))
+                            });
+                            let admitted = bytes.and_then(|bytes| match &resources {
+                                Some(r) => r.try_reserve_retained(bytes).ok().map(Some),
+                                None => Some(None),
+                            });
+                            match admitted {
+                                Some(guard) => {
+                                    reservation = guard;
+                                    Some(Ok((value, messages)))
+                                }
+                                None => None, // Retry inline; never retain a budget stop.
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(panic) => Some(Err(panic)),
+                    };
                     let mut state = worker.lock();
-                    if let Some((_, _, slot)) = state
-                        .slots
-                        .iter_mut()
-                        .find(|(_, _, slot)| matches!(slot, LookAheadSlot::Running))
-                    {
-                        *slot = match outcome {
-                            Ok(Some(value)) => LookAheadSlot::Done(Ok((value, capture.take()))),
-                            Ok(None) => LookAheadSlot::Closed,
-                            Err(panic) => LookAheadSlot::Done(Err(panic)),
+                    if let Some((_, _, slot)) = state.slots.iter_mut().find(|(_, _, slot)| {
+                        matches!(slot, LookAheadSlot::Running | LookAheadSlot::DiscardRunning)
+                    }) {
+                        *slot = if matches!(slot, LookAheadSlot::DiscardRunning) {
+                            LookAheadSlot::Closed
+                        } else {
+                            match outcome {
+                                Some(value) => LookAheadSlot::Done(value, reservation),
+                                None => LookAheadSlot::Closed,
+                            }
                         };
                     }
                     worker.changed.notify_all();
@@ -582,9 +665,12 @@ impl<K: Send + 'static, T: Send + 'static> LookAhead<K, T> {
         let outcome = loop {
             let (_, _, slot) = state.slots.iter_mut().find(|(name, _, _)| name == id)?;
             if !accepted {
-                if matches!(slot, LookAheadSlot::Queued(_)) {
-                    *slot = LookAheadSlot::Closed;
-                }
+                *slot = if matches!(slot, LookAheadSlot::Running | LookAheadSlot::DiscardRunning) {
+                    LookAheadSlot::DiscardRunning
+                } else {
+                    LookAheadSlot::Closed
+                };
+                self.shared.changed.notify_all();
                 return None;
             }
             match std::mem::replace(slot, LookAheadSlot::Closed) {
@@ -596,10 +682,16 @@ impl<K: Send + 'static, T: Send + 'static> LookAhead<K, T> {
                         .wait(state)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                LookAheadSlot::Done(outcome) => break outcome,
-                LookAheadSlot::Queued(_) | LookAheadSlot::Closed => return None,
+                LookAheadSlot::Done(outcome, _reservation) => break outcome,
+                LookAheadSlot::Queued(_)
+                | LookAheadSlot::Closed
+                | LookAheadSlot::DiscardRunning => {
+                    self.shared.changed.notify_all();
+                    return None;
+                }
             }
         };
+        self.shared.changed.notify_all();
         drop(state);
         match outcome {
             Ok((value, messages)) => {
@@ -617,13 +709,16 @@ impl<K: Send + 'static, T: Send + 'static> LookAhead<K, T> {
 
 #[cfg(test)]
 impl<K, T> LookAhead<K, T> {
-    /// Wait until no job is queued or running (tests only).
+    /// Wait until the bounded lane has a result or has exhausted its jobs.
     pub(crate) fn wait_idle(&self) {
         let mut state = self.shared.lock();
-        while state
+        while !state
             .slots
             .iter()
-            .any(|(_, _, slot)| matches!(slot, LookAheadSlot::Queued(_) | LookAheadSlot::Running))
+            .any(|(_, _, slot)| matches!(slot, LookAheadSlot::Done(..)))
+            && state.slots.iter().any(|(_, _, slot)| {
+                matches!(slot, LookAheadSlot::Queued(_) | LookAheadSlot::Running)
+            })
         {
             state = self
                 .shared
@@ -637,6 +732,7 @@ impl<K, T> LookAhead<K, T> {
 impl<K, T> Drop for LookAhead<K, T> {
     fn drop(&mut self) {
         self.shared.lock().stopped = true;
+        self.shared.changed.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -649,10 +745,84 @@ pub(crate) fn lookahead_results_taken() -> usize {
     LOOKAHEAD_RESULTS_TAKEN.with(std::cell::Cell::get)
 }
 
+/// Conservative heap allowance from streamed JSON size; no materialized JSON tree.
+/// Includes a per-byte factor for Rust containers, scalar storage, and allocation slack.
+pub(crate) fn retained_json_bytes(value: &impl serde::Serialize) -> anyhow::Result<u64> {
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("retained size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Counter(0);
+    serde_json::to_writer(&mut count, value)?;
+    count
+        .0
+        .checked_mul(64)
+        .and_then(|n| n.checked_add(4096))
+        .ok_or_else(|| anyhow::anyhow!("retained size overflow"))
+}
+
+pub(crate) fn reserve_working(bytes: u128) -> anyhow::Result<Option<xc_core::MemoryReservation>> {
+    let bytes = u64::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("run memory budget exceeded: workspace size overflow"))?;
+    let Some(resources) = xc_core::RunResources::current() else {
+        return Ok(None);
+    };
+    match resources.reserve_working(bytes) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(first) => {
+            // Retention is optional; release memo-only allocations before
+            // reporting that required numerical work exceeds the run budget.
+            if let Some(memo) = xc_cache::ValidatedValueMemo::current() {
+                memo.clear();
+                Ok(Some(resources.reserve_working(bytes)?))
+            } else {
+                Err(first.into())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn capture_policy_uses_nested_owner_budget_and_restores_environment() {
+        let baseline = CaptureResourcePolicy::from_environment().unwrap();
+        let outer = xc_core::RunResources::new(128u64 << 30).unwrap();
+        {
+            let _scope = outer.enter();
+            let expected = CaptureResourcePolicy {
+                maximum_working_bytes: 128u64 << 30,
+                ..baseline.clone()
+            };
+            assert_eq!(CaptureResourcePolicy::from_environment().unwrap(), expected);
+            {
+                let nested = xc_core::RunResources::new(64 << 10).unwrap();
+                let _scope = nested.enter();
+                assert_eq!(
+                    CaptureResourcePolicy::from_environment().unwrap(),
+                    CaptureResourcePolicy {
+                        maximum_working_bytes: 64 << 10,
+                        ..baseline.clone()
+                    }
+                );
+            }
+            assert_eq!(CaptureResourcePolicy::from_environment().unwrap(), expected);
+        }
+        assert_eq!(CaptureResourcePolicy::from_environment().unwrap(), baseline);
+        assert_eq!(outer.usage().peak_bytes, 0);
+    }
 
     type Jobs<T> = Vec<(String, u32, LookAheadJob<T>)>;
 
@@ -758,7 +928,7 @@ mod tests {
                 .num_threads(threads)
                 .build()
                 .unwrap();
-            assert_eq!(pool.install(observe), Some((threads, None)));
+            assert_eq!(pool.install(observe), None);
         }
         let full = xc_numerics::hp_runtime::HpRuntimePolicy::default();
         let observed = xc_numerics::hp_runtime::run_hp_with_policy(&full, observe).unwrap();
@@ -770,6 +940,136 @@ mod tests {
             assert!(LookAhead::start(jobs).is_none());
         })
         .unwrap();
+    }
+
+    #[test]
+    fn lookahead_bounds_completed_results_and_releases_rejected_values() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Value {
+            bytes: Vec<u8>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for Value {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let ran = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let jobs: Jobs<Value> = (0..3)
+            .map(|i| {
+                let ran = ran.clone();
+                let dropped = dropped.clone();
+                (
+                    i.to_string(),
+                    i,
+                    Box::new(move || {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        Value {
+                            bytes: vec![0u8; 40],
+                            dropped,
+                        }
+                    }) as LookAheadJob<_>,
+                )
+            })
+            .collect();
+        let lane =
+            LookAhead::start_reserved(jobs, None, |v| Some(v.bytes.capacity() as u64)).unwrap();
+        lane.wait_idle();
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "only one completed result may wait"
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        assert!(lane.claim("0", |_| false).is_none());
+        lane.wait_idle();
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "rejecting a completed result unblocks the lane"
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let claimed = lane.claim("1", |_| true).unwrap();
+        assert_eq!(claimed.bytes.len(), 40);
+        drop(claimed);
+        lane.wait_idle();
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        drop(lane);
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        let jobs: Jobs<Vec<u8>> = vec![("unaccountable".into(), 0, Box::new(|| vec![0; 101]))];
+        let lane = LookAhead::start_reserved(jobs, None, |_| None).unwrap();
+        lane.wait_idle();
+        assert!(lane.claim("unaccountable", |_| true).is_none());
+    }
+
+    #[test]
+    fn budgeted_lookahead_declines_before_jobs_and_releases_optional_inputs_for_inline_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let resources = xc_core::RunResources::new(100).unwrap();
+        let _scope = resources.enter();
+        let retained = resources.try_reserve_retained(60).unwrap();
+        let optional_inputs = resources.try_reserve_retained(20).unwrap();
+        // The same required work fits without speculative inputs. Under the
+        // previous scheduling policy those inputs could block its admission.
+        assert!(resources.try_reserve_working(40).is_err());
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counted = ran.clone();
+        let jobs: Jobs<Vec<u8>> = vec![(
+            "optional".into(),
+            0,
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                vec![0; 20]
+            }),
+        )];
+        assert!(LookAhead::start_reserved(jobs, Some(optional_inputs), |v| {
+            Some(v.capacity() as u64)
+        })
+        .is_none());
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert_eq!(resources.usage().retained_bytes, 60);
+        let work = reserve_working(40).unwrap().unwrap();
+        assert_eq!(resources.usage().working_bytes, 40);
+        assert_eq!(resources.usage().peak_bytes, 100);
+        drop(work);
+        assert!(
+            reserve_working(41).is_err(),
+            "required work still obeys the total budget"
+        );
+        assert_eq!(resources.usage().working_bytes, 0);
+        drop(retained);
+        assert!(
+            reserve_working(101).is_err(),
+            "an impossible workspace remains refused"
+        );
+        assert_eq!(resources.usage().retained_bytes, 0);
+    }
+
+    #[test]
+    fn checkpoint_caller_limit_rejects_before_deserialization_and_keeps_identity() {
+        struct RefuseDeserialize;
+        impl<'de> serde::Deserialize<'de> for RefuseDeserialize {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                _: D,
+            ) -> std::result::Result<Self, D::Error> {
+                panic!("oversized checkpoint must be refused before decoding");
+            }
+        }
+        let root = xc_core::test_support::TestDir::new("checkpoint-caller-limit");
+        let store = Checkpoints::local(&"caller limit", root.to_path_buf()).unwrap();
+        store.save("value", &vec!["1", "2", "3"]).unwrap();
+        let limited = store.limited_bytes(1);
+        assert_eq!(limited.identity, store.identity);
+        assert!(limited
+            .load::<RefuseDeserialize>("value")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.load::<Vec<String>>("value").unwrap().unwrap(),
+            ["1", "2", "3"]
+        );
+        assert_eq!(store.limited_bytes(u64::MAX).max_bytes, store.max_bytes);
     }
 
     #[test]

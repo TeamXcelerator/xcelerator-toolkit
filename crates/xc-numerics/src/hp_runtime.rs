@@ -169,6 +169,14 @@ where
         HpRuntimeMode::SafeCapped => {
             let threads = policy.worker_threads.expect("validated safe policy");
             let stack = policy.stack_bytes.expect("validated safe policy");
+            let resources = xc_core::RunResources::current();
+            if let Some(resources) = &resources {
+                resources
+                    .check_workers(threads)
+                    .map_err(|error| HpRuntimeError {
+                        message: error.to_string(),
+                    })?;
+            }
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .stack_size(stack)
@@ -179,7 +187,12 @@ where
             std::thread::scope(|scope| {
                 std::thread::Builder::new()
                     .stack_size(stack)
-                    .spawn_scoped(scope, || pool.install(|| with_active_policy(policy, f)))
+                    .spawn_scoped(scope, || {
+                        pool.install(|| {
+                            let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+                            with_active_policy(policy, f)
+                        })
+                    })
                     .map_err(|error| HpRuntimeError {
                         message: format!("safe-mode HP outer thread spawn failed: {error}"),
                     })?
@@ -256,6 +269,135 @@ where
     f()
 }
 
+/// Run one admitted phase with fewer workers, preserving the caller's explicit
+/// scheduling policy and the SAME run ledger/cancellation owner. This does not
+/// grant a memory allowance or replace any numerical admission gate.
+#[cfg(feature = "hp")]
+pub fn with_admitted_worker_pool<F, R>(workers: usize, f: F) -> anyhow::Result<R>
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    anyhow::ensure!(
+        workers > 0 && workers <= rayon::current_num_threads(),
+        "admitted worker pool must be a nonempty subset of the caller pool"
+    );
+    let resources = xc_core::RunResources::current();
+    if let Some(resources) = &resources {
+        resources.check_workers(workers)?;
+        resources.check_cancelled()?;
+    }
+    crate::mpfr_interval::ensure_uniform_exponent_range()?;
+    if workers == rayon::current_num_threads() {
+        return Ok(f());
+    }
+    let policy = ACTIVE_POLICY.with(|active| active.borrow().clone());
+    let caller_range = (rug::float::exp_min(), rug::float::exp_max());
+    let mut builder = rayon::ThreadPoolBuilder::new().num_threads(workers);
+    if let Some(stack) = policy.as_ref().and_then(|policy| policy.stack_bytes) {
+        builder = builder.stack_size(stack);
+    }
+    builder.build_scoped(
+        |thread| {
+            let _resources = resources.as_ref().map(xc_core::RunResources::enter);
+            match policy.as_ref() {
+                Some(policy) => with_active_policy(policy, || thread.run()),
+                None => thread.run(),
+            }
+        },
+        |pool| {
+            // Do not silently adopt a new MPFR exponent environment. A custom
+            // caller environment must match every new worker before arithmetic.
+            anyhow::ensure!(
+                pool.broadcast(|_| (rug::float::exp_min(), rug::float::exp_max()))
+                    .into_iter()
+                    .all(|range| range == caller_range),
+                "parallel MPFR workers do not share the caller's exponent range"
+            );
+            Ok(pool.install(f))
+        },
+    )?
+}
+
+#[cfg(all(test, feature = "hp"))]
+mod admitted_pool_tests {
+    use super::*;
+    #[test]
+    fn admitted_pool_retains_ledger_policy_cancellation_and_bounds() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::with_worker_limit(1000, 4).unwrap();
+            let _scope = resources.enter();
+            let _retained = resources.try_reserve_retained(100).unwrap();
+            assert!(with_admitted_worker_pool(0, || ()).is_err());
+            assert!(with_admitted_worker_pool(5, || ()).is_err());
+            with_admitted_worker_pool(2, || {
+                assert_eq!(rayon::current_num_threads(), 2);
+                for usage in rayon::broadcast(|_| xc_core::RunResources::current().unwrap().usage())
+                {
+                    assert_eq!(usage.retained_bytes, 100);
+                }
+                let scoped = xc_core::RunResources::current().unwrap();
+                let _extra = scoped.try_reserve_working(900).unwrap();
+                assert!(resources.try_reserve_working(1).is_err());
+                scoped.cancel();
+            })
+            .unwrap();
+            assert_eq!(rayon::current_num_threads(), 4);
+            assert_eq!(resources.usage().working_bytes, 0);
+            assert!(resources.check_cancelled().is_err());
+            assert!(with_admitted_worker_pool(1, || ()).is_err());
+        });
+    }
+
+    #[test]
+    fn admitted_pool_preserves_explicit_policy_and_rejects_new_exponent_context() {
+        let policy = HpRuntimePolicy::safe_capped(4, 4 << 20, "bounded fixture").unwrap();
+        run_hp_with_policy(&policy, || {
+            with_admitted_worker_pool(2, || {
+                assert_eq!(
+                    plan_gl_precompute(&[32, 40], 128).label(),
+                    "table_serial_root_serial"
+                );
+                for active in
+                    rayon::broadcast(|_| ACTIVE_POLICY.with(|active| active.borrow().clone()))
+                {
+                    assert_eq!(active, Some(policy.clone()));
+                }
+            })
+            .unwrap();
+        })
+        .unwrap();
+        unsafe extern "C" {
+            fn mpfr_set_emin(value: std::os::raw::c_long) -> i32;
+        }
+        struct Restore(i32);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { mpfr_set_emin(self.0 as _) }, 0);
+            }
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let _restore = Restore(rug::float::exp_min());
+            assert_eq!(unsafe { mpfr_set_emin(-1000) }, 0);
+            let error = with_admitted_worker_pool(1, || {
+                panic!("no arithmetic may run with mixed MPFR bounds")
+            })
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("parallel MPFR workers do not share the caller's exponent range"));
+        });
+    }
+}
+
 /// Map precomputation tasks according to the active explicit policy. Calls
 /// outside [`run_hp_with_policy`] use the documented full-parallel default.
 pub fn map_gl_precompute<T, U, F>(items: &[T], f: F) -> Vec<U>
@@ -265,6 +407,11 @@ where
     F: Fn(&T) -> U + Sync + Send,
 {
     use rayon::prelude::*;
+    let resources = xc_core::RunResources::current();
+    let invoke = |item| {
+        let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+        f(item)
+    };
     let sequential = ACTIVE_POLICY.with(|active| {
         active
             .borrow()
@@ -272,9 +419,9 @@ where
             .is_some_and(|policy| policy.sequential_precompute)
     });
     if sequential {
-        items.iter().map(&f).collect()
+        items.iter().map(&invoke).collect()
     } else {
-        items.par_iter().map(f).collect()
+        items.par_iter().map(invoke).collect()
     }
 }
 
@@ -315,6 +462,8 @@ pub fn plan_gl_precompute(table_orders: &[usize], precision_bits: u32) -> GlPrec
 }
 
 /// Execute one planned GL batch without nesting table- and root-level Rayon.
+/// Each callback inherits the owner's cooperative memory budget. The scope
+/// restores any previous worker context when the callback returns or unwinds.
 pub fn map_gl_precompute_planned<U, F>(
     table_orders: &[usize],
     plan: GlPrecomputePlan,
@@ -325,14 +474,19 @@ where
     F: Fn(usize, GlRootSchedule) -> U + Sync + Send,
 {
     use rayon::prelude::*;
+    let resources = xc_core::RunResources::current();
+    let invoke = |order, schedule| {
+        let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+        f(order, schedule)
+    };
     match plan.kind {
         GlPrecomputeKind::ParallelTables => table_orders
             .par_iter()
-            .map(|&order| f(order, GlRootSchedule::serial()))
+            .map(|&order| invoke(order, GlRootSchedule::serial()))
             .collect(),
         GlPrecomputeKind::PlannedRoots { .. } | GlPrecomputeKind::Serial => table_orders
             .iter()
-            .map(|&order| f(order, plan.root_schedule(order)))
+            .map(|&order| invoke(order, plan.root_schedule(order)))
             .collect(),
     }
 }
@@ -369,6 +523,81 @@ pub fn safe_mode() -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn safe_worker_and_legacy_tables_preserve_owner_resources() {
+        let resources = xc_core::RunResources::with_worker_limit(100, 2).unwrap();
+        let policy = HpRuntimePolicy::safe_capped(2, 8 * 1024 * 1024, "test").unwrap();
+        {
+            let _scope = resources.enter();
+            run_hp_with_policy(&policy, || {
+                assert_eq!(
+                    xc_core::RunResources::current().unwrap().maximum_bytes(),
+                    100
+                );
+                for refused in map_gl_precompute(&[1, 2], |_| {
+                    xc_core::RunResources::current()
+                        .unwrap()
+                        .try_reserve_working(101)
+                        .is_err()
+                }) {
+                    assert!(refused);
+                }
+            })
+            .unwrap();
+        }
+        assert!(xc_core::RunResources::current().is_none());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let _scope = resources.enter();
+            assert!(map_gl_precompute(&[1, 2], |_| {
+                xc_core::RunResources::current()
+                    .unwrap()
+                    .try_reserve_working(101)
+                    .is_err()
+            })
+            .into_iter()
+            .all(|v| v));
+        });
+        pool.broadcast(|_| assert!(xc_core::RunResources::current().is_none()));
+    }
+
+    #[test]
+    fn planned_tables_share_owner_budget_and_restore_worker_scope() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let resources = xc_core::RunResources::with_worker_limit(100, 2).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        pool.install(|| {
+            let _scope = resources.enter();
+            let orders = [2, 3];
+            let plan = plan_gl_precompute(&orders, 128);
+            let admitted = map_gl_precompute_planned(&orders, plan, |_, _| {
+                let inherited = xc_core::RunResources::current();
+                let reservation = inherited.as_ref().map(|r| r.try_reserve_working(75));
+                // Hold the successful reservation until both workers attempted
+                // admission: exactly one can fit in the same 100-byte budget.
+                barrier.wait();
+                let admitted = reservation.as_ref().is_some_and(|r| r.is_ok());
+                let propagated = inherited.as_ref().is_some_and(|r| r.maximum_bytes() == 100);
+                drop(reservation);
+                (propagated, admitted)
+            });
+            assert!(
+                admitted.iter().all(|v| v.0),
+                "owner scope propagated to every worker"
+            );
+            assert_eq!(admitted.into_iter().filter(|v| v.1).count(), 1);
+            assert_eq!(resources.usage().working_bytes, 0);
+            assert_eq!(resources.usage().peak_bytes, 75);
+        });
+        pool.broadcast(|_| assert!(xc_core::RunResources::current().is_none()));
+    }
 
     #[test]
     fn explicit_safe_policy_changes_scheduling_not_mathematics() {

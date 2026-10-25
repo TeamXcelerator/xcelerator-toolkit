@@ -615,6 +615,7 @@ pub mod hp {
     /// Guard bits for internal evaluation above the requested precision.
     const GUARD_BITS: u32 = 64;
 
+    mod quadrature_provider;
     mod target_comparison;
     pub use target_comparison::{
         capture_target_comparison_via_cache, PortableCriticalLineMaximum, PortableTargetComparison,
@@ -2019,6 +2020,15 @@ pub mod hp {
                 parse_deviation_sample(u_text, &format!("profile abscissa {index}"), prec)
             })
             .collect::<Vec<_>>();
+        let _phase = crate::ccm::capture_runtime::Stage::new("deviation profile target samples");
+        let mut target_values = quadrature_provider::ProfileTargets::try_new(
+            target,
+            &parsed_us
+                .iter()
+                .map(|u| u.as_ref().ok())
+                .collect::<Vec<_>>(),
+            working,
+        )?;
         let auxiliary_values = {
             use rayon::prelude::*;
             let auxiliary = |u: &Result<Float>| u.as_ref().ok().map(|u| target.auxiliary_value(u));
@@ -2040,7 +2050,10 @@ pub mod hp {
             let u = u?;
             let f = parse_deviation_sample(f_text, &format!("profile value {index}"), prec)?;
             let mut d = Float::with_val(working, &f);
-            d -= target.try_value(&u)?;
+            d -= match target_values.as_mut() {
+                Some(values) => values.value(index, target, &u)?,
+                None => target.try_value(&u)?,
+            };
             reference.push(auxiliary.expect("parsed abscissae have auxiliary values")?);
             deviation.push(d);
             us.push(u);
@@ -2228,7 +2241,11 @@ pub mod hp {
     }
 
     fn retained_decimal(value: &Float, prec: u32) -> String {
-        Float::with_val(prec, value).to_string()
+        xc_numerics::fmt::decimal_string_round(
+            &Float::with_val(prec, value),
+            None,
+            rug::float::Round::Nearest,
+        )
     }
 
     pub(crate) fn decimal(value: &Float, prec: u32) -> String {
@@ -2881,14 +2898,8 @@ pub mod hp {
                 discarded_one_sided_l1: decimal(&one_sided_l1, precision_bits),
                 // Both accumulation and serialization round outward. Ordinary
                 // decimal formatting can make an upper bound too small.
-                discarded_cosine_pointwise_bound: Float::with_val_round(
-                    precision_bits,
-                    &pointwise_bound,
-                    Round::Up,
-                )
-                .0
-                .to_string_radix_round(
-                    10,
+                discarded_cosine_pointwise_bound: xc_numerics::fmt::decimal_string_round(
+                    &Float::with_val_round(precision_bits, &pointwise_bound, Round::Up).0,
                     Some(
                         2 + (f64::from(precision_bits) * std::f64::consts::LOG10_2).ceil() as usize,
                     ),
@@ -3147,6 +3158,202 @@ pub mod hp {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compute_distance_resolution_evidence_with_samples(
+        eigenfunction: &WeilEigenfunction,
+        lambda: &Float,
+        alpha: &Float,
+        rules: &[WeightedIntegrationRule],
+        evaluation_source: ResolutionEvidenceEvaluationSource<'_>,
+        target_definition_digest: &str,
+        lambda_squared: &str,
+        precision_bits: u32,
+    ) -> Result<PortableDistanceResolutionEvidence> {
+        if rules.len() != evaluation_source.base_distances.len() {
+            anyhow::bail!(
+                "resolution evidence needs one base distance per rule ({} rules, {} distances)",
+                rules.len(),
+                evaluation_source.base_distances.len()
+            );
+        }
+        if evaluation_source
+            .base_value_samples
+            .is_some_and(|samples| samples.len() != rules.len())
+        {
+            anyhow::bail!("resolution evidence has the wrong base-sample count");
+        }
+        let coefficients = eigenfunction
+            .normalized_coefficients()
+            .into_iter()
+            .map(|coefficient| Float::with_val(precision_bits, coefficient))
+            .collect::<Vec<_>>();
+        let n_modes = coefficients.len() - 1;
+        let coefficient_tail = coefficient_tail_evidence(&coefficients, precision_bits)?;
+
+        let mut refinements = Vec::new();
+        for (rule_index, (rule, base_distance)) in rules
+            .iter()
+            .zip(evaluation_source.base_distances)
+            .enumerate()
+        {
+            let WeightedIntegrationRule::UniformGrid {
+                scheme,
+                variable,
+                steps,
+            } = *rule
+            else {
+                continue;
+            };
+            let twice_resolution = steps
+                .checked_mul(RESOLUTION_EVIDENCE_REFINEMENT_FACTOR)
+                .ok_or_else(|| anyhow::anyhow!("2Q resolution overflows usize for Q = {steps}"))?;
+            let twice_rule = WeightedIntegrationRule::UniformGrid {
+                scheme,
+                variable,
+                steps: twice_resolution,
+            };
+            let samples = evaluation_source
+                .base_value_samples
+                .and_then(|all_samples| all_samples.get(rule_index))
+                .filter(|samples| !samples.is_empty());
+            // Build only 2Q. Extend the same exact-value table if 4Q is needed.
+            let mut exact_values = (scheme != UniformGridScheme::Midpoint).then(|| {
+                PrecomputedEigenfunctionValues::build(
+                    eigenfunction,
+                    samples.map(Vec::as_slice),
+                    &[(scheme, variable, twice_resolution)],
+                    lambda,
+                    precision_bits,
+                )
+            });
+            let twice_distance = quadrature_provider::ccm_distance(
+                eigenfunction,
+                exact_values.as_ref(),
+                None,
+                lambda,
+                alpha,
+                twice_rule,
+                precision_bits,
+                None,
+                Some(target_definition_digest),
+            )?;
+            let (q_to_2q_absolute, q_to_2q_relative) = absolute_and_relative_difference(
+                &base_distance.value,
+                &twice_distance.value,
+                precision_bits,
+            );
+            let q_to_2q_absolute_text = retained_decimal(&q_to_2q_absolute, precision_bits);
+            let q_to_2q_relative_text = retained_decimal(&q_to_2q_relative, precision_bits);
+
+            let (
+                four_times_resolution,
+                four_times_distance,
+                final_absolute,
+                final_relative,
+                final_resolution,
+                tolerance_met,
+            ) = if resolution_tolerance_met(
+                &base_distance.value,
+                &twice_distance.value,
+                precision_bits,
+            ) {
+                (
+                    None,
+                    None,
+                    q_to_2q_absolute,
+                    q_to_2q_relative,
+                    twice_resolution,
+                    true,
+                )
+            } else {
+                let four_resolution = steps
+                    .checked_mul(RESOLUTION_EVIDENCE_MAXIMUM_MULTIPLIER)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("4Q resolution overflows usize for Q = {steps}")
+                    })?;
+                let four_rule = WeightedIntegrationRule::UniformGrid {
+                    scheme,
+                    variable,
+                    steps: four_resolution,
+                };
+                if let Some(values) = exact_values.as_mut() {
+                    values.extend(
+                        &[(scheme, variable, four_resolution)],
+                        lambda,
+                        precision_bits,
+                    );
+                }
+                let four_distance = quadrature_provider::ccm_distance(
+                    eigenfunction,
+                    exact_values.as_ref(),
+                    None,
+                    lambda,
+                    alpha,
+                    four_rule,
+                    precision_bits,
+                    None,
+                    Some(target_definition_digest),
+                )?;
+                let (absolute, relative) = absolute_and_relative_difference(
+                    &twice_distance.value,
+                    &four_distance.value,
+                    precision_bits,
+                );
+                (
+                    Some(four_resolution),
+                    Some(retained_decimal(&four_distance.value, precision_bits)),
+                    absolute,
+                    relative,
+                    four_resolution,
+                    resolution_tolerance_met(
+                        &twice_distance.value,
+                        &four_distance.value,
+                        precision_bits,
+                    ),
+                )
+            };
+            refinements.push(PortableRuleResolutionEvidence {
+                rule_family: rule.family().to_owned(),
+                quadrature_rule: rule.rule().to_owned(),
+                grid_variable: variable.as_str().to_owned(),
+                base_resolution: steps,
+                base_distance: retained_decimal(&base_distance.value, precision_bits),
+                twice_resolution,
+                twice_distance: retained_decimal(&twice_distance.value, precision_bits),
+                q_to_2q_absolute_difference: q_to_2q_absolute_text,
+                q_to_2q_relative_difference: q_to_2q_relative_text,
+                four_times_resolution,
+                four_times_distance,
+                final_absolute_difference: retained_decimal(&final_absolute, precision_bits),
+                final_relative_difference: retained_decimal(&final_relative, precision_bits),
+                final_resolution,
+                tolerance_met,
+            });
+        }
+        if refinements.is_empty() {
+            anyhow::bail!("resolution evidence requires at least one uniform-grid rule");
+        }
+
+        Ok(PortableDistanceResolutionEvidence {
+            schema_version: 2,
+            target_definition_digest: target_definition_digest.to_owned(),
+            lambda_squared: lambda_squared.to_owned(),
+            n_modes,
+            precision_bits,
+            alpha: alpha_identity(alpha, precision_bits),
+            normalization: "f(1)=1".to_owned(),
+            coefficient_count: coefficients.len(),
+            coefficient_tail,
+            refinement_factor: RESOLUTION_EVIDENCE_REFINEMENT_FACTOR,
+            maximum_refinement_multiplier: RESOLUTION_EVIDENCE_MAXIMUM_MULTIPLIER,
+            relative_tolerance: RESOLUTION_EVIDENCE_RELATIVE_TOLERANCE.to_owned(),
+            relative_difference_denominator: "absolute_finer_distance".to_owned(),
+            zero_denominator_fallback: "absolute_difference".to_owned(),
+            refinements,
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn quadrature_serial_resolution(
         eigenfunction: &WeilEigenfunction,
         lambda: &Float,
         alpha: &Float,
@@ -3630,8 +3837,19 @@ pub mod hp {
         }
         let mut residuals = Vec::with_capacity(source.u_values.len());
         let mut sample_signs = Vec::with_capacity(source.u_values.len());
-        for (u, f_value) in source.u_values.iter().zip(source.f_values) {
-            let residual = Float::with_val(source.precision_bits, f_value - target.try_value(u)?);
+        let sample_phase =
+            crate::ccm::capture_runtime::Stage::new("target residual profile samples");
+        let mut target_values = quadrature_provider::ProfileTargets::try_new(
+            &target,
+            &source.u_values.iter().map(Some).collect::<Vec<_>>(),
+            working,
+        )?;
+        for (index, (u, f_value)) in source.u_values.iter().zip(source.f_values).enumerate() {
+            let value = match target_values.as_mut() {
+                Some(values) => values.value(index, &target, u)?,
+                None => target.try_value(u)?,
+            };
+            let residual = Float::with_val(source.precision_bits, f_value - value);
             sample_signs.push(if residual > 0u32 {
                 1
             } else if residual < 0u32 {
@@ -3641,6 +3859,8 @@ pub mod hp {
             });
             residuals.push(residual);
         }
+        drop(target_values);
+        drop(sample_phase);
 
         let mut maximum_index = 0usize;
         let mut minimum_index = 0usize;
@@ -3674,6 +3894,8 @@ pub mod hp {
         let signed_residuals = match source.precomputed_signed_residuals {
             Some(values) => values.to_vec(),
             None => {
+                let _phase =
+                    crate::ccm::capture_runtime::Stage::new("target residual signed quadrature");
                 let mut local_gl_tables = SharedGlTables::new();
                 let gl_tables = supplied_gl_tables.unwrap_or(&mut local_gl_tables);
                 let mut values = Vec::with_capacity(source.rules.len());
@@ -4518,12 +4740,10 @@ pub mod hp {
                     weighted_rule_abscissae(*rule, &lambda, prec, Some(&gl_tables)),
                 );
                 let recorded_values = std::cell::RefCell::new(Vec::new());
-                let distance = distance_to_target_with_tables_bound(
-                    |u: &Float| {
-                        let value = rule_values.eval(u);
-                        recorded_values.borrow_mut().push(value.clone());
-                        value
-                    },
+                let distance = quadrature_provider::ccm_distance(
+                    &eigenfunction,
+                    Some(&rule_values),
+                    Some(&recorded_values),
                     &lambda,
                     alpha,
                     *rule,
