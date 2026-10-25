@@ -35,8 +35,8 @@ mod recovery;
 mod sturm;
 pub use recovery::{
     dense_symmetric_eigenpair_at_index_hp, dense_symmetric_eigenvector_for_value_detailed_hp,
-    tridiag_eigenvector_for_value_detailed_hp, HpEigenvectorRecovery, HpEigenvectorRecoveryFailure,
-    DENSE_EIGENVECTOR_SEMANTICS,
+    tridiag_eigenvector_for_value_detailed_hp, validate_tridiag_eigenvector_hp,
+    HpEigenvectorRecovery, HpEigenvectorRecoveryFailure, DENSE_EIGENVECTOR_SEMANTICS,
 };
 
 /// Arithmetic identity for retained QR results.

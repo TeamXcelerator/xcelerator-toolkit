@@ -1423,6 +1423,8 @@ const WEIL_STATE_KINDS: &[&str] = &[
 ];
 const PROLATE_KINDS: &[&str] = &[
     "prolate_eigenvalue_spectrum",
+    "prolate_finite_dirichlet_modes",
+    "prolate_finite_dirichlet_profile",
     "ccm_prolate_spectrum",
     "ccm_prolate_basis",
     "ccm_prolate_candidate",

@@ -43,3 +43,41 @@ For those APIs, `n_grid` still means interior finite-difference nodes. Existing 
 The new spectrum identity is `prolate-bounded-legendre-even-spectrum-v1`; its retained dimension is an even Legendre basis count, and its cache precision includes internal guard bits. The candidate reuse-plan identity is `prolate-bounded-legendre-candidate-v6`. Returned candidate discretization is `prolate-bounded-legendre-even-v2`. The old spectrum identity `prolate-fd-working-precision-spectrum-v0.15.1-v2` remains exclusive to the explicit historical model. The identities do not alias. Every cached new-model eigenvalue is checked against its ordered index in the current source tridiagonal before use. The historical candidate also checks its two selected source-matrix indices before using a cached spectrum.
 
 Finite-grid trial bases now pass a precision-scaled reorthogonalization check before Gram formation. The public solver independently requires the stored Gram form minus `max_diagonal*2^(-p/2)*I` to be positive definite by directed inertia, after exact power-of-two scaling. Unresolved bases fail closed. Returned Ritz reports must also satisfy a `2^(-p/2)` scaled-backward-error gate. This qualifies the rounded finite pencil; it does not certify an arbitrary original basis or continuum approximation.
+
+
+## Managed finite-Dirichlet reuse
+
+`hp::compute_k_lambda_finite_dirichlet_via_cache` retains the complete ordered
+historical spectrum and adds two artifacts in the public/private `prolate`
+family. `prolate_finite_dirichlet_modes` stores the selected raw unit-Euclidean-norm
+vectors, recovered Rayleigh values, and directed isolating windows for modes 0
+and 4. `prolate_finite_dirichlet_profile` stores the logarithmic grid and sampled
+comparison kernel. The returned API, finite-difference matrix, inverse-iteration
+search, sign convention, continuous-L2 scaling, trapezoidal integral ratio,
+piecewise-linear interpolation, and sequential finite-sum arithmetic are unchanged.
+
+Both identities bind exact source cutoff text and its MPFR precision, realized
+odd grid size, working precision, complete-spectrum arithmetic, recovery algorithm
+and options, and normalization. The mode identity binds its complete-spectrum
+payload; the profile identity binds its mode payload and sample count. Each
+persisted artifact names its exact source manifest as a dependency. Changing only
+the sample count reuses the recovered modes. The requested `n_grid` remains the
+result's resolution budget even when two budgets resolve to the same odd grid.
+
+Ordinary mode reuse validates shape, finiteness, unit norm, parity, node count,
+Rayleigh value, directed source-index counts, and the existing recovery path's
+directed residual/separation angle gate. It performs no QR solve, factorization,
+or inverse iteration. Scaling and normalization replay afterward in their
+historical order. Ordinary profile reuse checks identity, shape, finite scalars,
+positive nondecreasing grid order (including rounded duplicates), and exact MPFR
+endpoints; its authenticated parent and cached computed-assurance interior grid
+points and samples do not constitute a pointwise accuracy certificate.
+It does not replay the finite-sum sampling loop.
+
+`RequireReuse` refuses any missing layer. `Refresh` recomputes the complete
+spectrum, recovered vectors, and sampled profile. `VerifyAgainstReference`
+recomputes all three layers in the isolated validation cache and compares every
+logical payload to read-only references. Corrupt or incompatible artifacts fail
+closed under the common cache policy. A mathematically plausible but changed
+profile is detected by full reference verification; ordinary computed-assurance
+reuse does not independently prove every cached sample.

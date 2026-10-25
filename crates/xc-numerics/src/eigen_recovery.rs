@@ -529,6 +529,46 @@ fn assess(
         seed_solves: 0,
     }))
 }
+/// Recheck a stored tridiagonal vector with the recovery path's directed
+/// residual/separation gate, without a spectrum solve or inverse iteration.
+/// The supplied isolating window is proved again by exact-source Sturm counts.
+/// This checks the rounded source matrix and vector, not continuum accuracy.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_tridiag_eigenvector_hp(
+    d: &[Float],
+    e: &[Float],
+    vector: &[Float],
+    index: usize,
+    lower: &Float,
+    upper: &Float,
+    p: u32,
+) -> Result<HpEigenvectorRecovery> {
+    // Reject invalid MPFR precision before invoking Float::with_val, which
+    // otherwise panics instead of returning the public API's error result.
+    Matrix::Tridiagonal(d, e).validate(p)?;
+    let rounded_d: Vec<_> = d.iter().map(|x| Float::with_val(p, x)).collect();
+    let rounded_e: Vec<_> = e.iter().map(|x| Float::with_val(p, x)).collect();
+    let matrix = Matrix::Tridiagonal(&rounded_d, &rounded_e);
+    matrix.validate(p)?;
+    anyhow::ensure!(
+        vector.len() == d.len()
+            && index < d.len()
+            && vector.iter().all(Float::is_finite)
+            && lower.is_finite()
+            && upper.is_finite()
+            && lower < upper,
+        "invalid stored eigenvector or isolating window"
+    );
+    let w = (p * 2 + 64).max(p.saturating_add(32)).min(1_000_000);
+    anyhow::ensure!(
+        matrix.count(lower, w)? == index && matrix.count(upper, w)? == index + 1,
+        "stored eigenvector window does not isolate its source index"
+    );
+    let scale = matrix.scale(w)?;
+    assess(matrix, vector, lower, upper, &scale, index, p, w)?
+        .ok_or_else(|| unresolved("stored eigenvector fails directed residual/separation gate"))
+}
+
 /// Selected-index recovery of the matrix rounded once to `p` bits, with directed angle evidence.
 pub fn dense_symmetric_eigenpair_at_index_hp(
     a: &[Float],
@@ -606,4 +646,29 @@ pub(super) fn tridiagonal_at_index(
         opts,
         false,
     )
+}
+
+#[cfg(test)]
+mod cached_vector_validation_tests {
+    use super::*;
+
+    #[test]
+    fn stored_tridiagonal_vector_rejects_invalid_precision_before_rounding() {
+        let diagonal = [Float::with_val(64, 1)];
+        let vector = [Float::with_val(64, 1)];
+        let lower = Float::with_val(64, 0);
+        let upper = Float::with_val(64, 2);
+        for p in [0, 1, 32, 1_000_001] {
+            assert!(
+                validate_tridiag_eigenvector_hp(&diagonal, &[], &vector, 0, &lower, &upper, p,)
+                    .is_err()
+            );
+        }
+        let report =
+            validate_tridiag_eigenvector_hp(&diagonal, &[], &vector, 0, &lower, &upper, 64)
+                .unwrap();
+        assert_eq!(report.eigenvalue, 1);
+        assert_eq!(report.iterations, 0);
+        assert_eq!(report.seed_solves, 0);
+    }
 }

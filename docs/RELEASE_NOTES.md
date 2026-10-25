@@ -1,5 +1,18 @@
 # Release notes
 
+## Candidate additions
+
+Finite-Dirichlet prolate comparisons retain recovered mode vectors and sampled
+profiles as separate managed artifacts, with exact source dependencies. Warm
+reuse avoids inverse iteration and profile production; verification and refresh
+recompute them. The complete spectrum and established numerical values are
+unchanged. See [the numerical model](PROLATE_NUMERICAL_MODEL.md).
+
+Complete runtime target documents have configurable byte admission through
+`XC_TARGET_MAXIMUM_BYTES` (64 MiB by default, at most 4 GiB), additionally bounded
+by one eighth of an explicit research working-memory budget. Oversized documents
+and provider request frames are rejected without dropping coefficients.
+
 ## 0.17.0 (2026-10-19)
 
 This release includes the response-acceleration and retained-recovery updates

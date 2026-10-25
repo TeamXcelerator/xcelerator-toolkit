@@ -87,6 +87,74 @@ struct Connection {
     precision_bits: u32,
     _executable_file: File,
 }
+
+struct RequestFrame {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
+
+struct InputSize {
+    bytes: u64,
+    maximum: u64,
+}
+
+impl Write for InputSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .filter(|length| *length <= self.maximum)
+            .ok_or_else(|| {
+                std::io::Error::other("target input exceeds its configured byte limit")
+            })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn admit_input(input: &serde_json::Value, maximum: u64) -> Result<()> {
+    // Count without constructing a second large buffer or starting a provider.
+    serde_json::to_writer(&mut InputSize { bytes: 0, maximum }, input)?;
+    Ok(())
+}
+
+impl Write for RequestFrame {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let length = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("target request length overflows"))?;
+        if length > self.maximum {
+            return Err(std::io::Error::other(
+                "target request exceeds its configured byte limit",
+            ));
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| std::io::Error::other("cannot reserve target request memory"))?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn request_frame(request: &serde_json::Value, maximum: u64) -> Result<Vec<u8>> {
+    let mut frame = RequestFrame {
+        bytes: Vec::new(),
+        maximum: usize::try_from(maximum).context("target request exceeds address space")?,
+    };
+    serde_json::to_writer(&mut frame, request)?;
+    frame.write_all(b"\n")?;
+    Ok(frame.bytes)
+}
+
 impl Connection {
     fn exchange(&mut self, message: &serde_json::Value) -> Result<serde_json::Value> {
         anyhow::ensure!(
@@ -113,8 +181,7 @@ impl Connection {
             fields.insert("protocol_version".into(), 2.into());
             fields.insert("request_nonce".into(), nonce.clone().into());
             fields.insert("precision_bits".into(), self.precision_bits.into());
-            let mut frame = serde_json::to_vec(&request)?;
-            frame.push(b'\n');
+            let frame = request_frame(&request, super::input::target_request_maximum_bytes()?)?;
             let remaining = || {
                 self.timeout
                     .checked_sub(started.elapsed())
@@ -357,6 +424,7 @@ struct Provider {
 impl Provider {
     fn start(spec: &ExternalProfileSpec, bits: u32) -> Result<Self> {
         spec.validate()?;
+        admit_input(&spec.input, super::input::target_maximum_bytes()?)?;
         anyhow::ensure!(
             bits <= spec.evaluation_precision_bits,
             "external target requires regeneration at the requested precision"
@@ -609,6 +677,22 @@ mod tests {
     use super::*;
     fn reply(id: u64) -> serde_json::Value {
         serde_json::json!({"protocol_version":2,"request_nonce":"test-nonce","request_id":id,"operation":"evaluate","precision_bits":256,"value":"0.5"})
+    }
+    #[test]
+    fn request_frames_keep_exact_json_and_enforce_the_complete_frame_budget() {
+        let request = serde_json::json!({"operation":"initialize","input":["0.125","1e-2000"]});
+        let mut expected = serde_json::to_vec(&request).unwrap();
+        expected.push(b'\n');
+        assert_eq!(
+            request_frame(&request, expected.len() as u64).unwrap(),
+            expected
+        );
+        assert!(request_frame(&request, expected.len() as u64 - 1).is_err());
+        assert!(request_frame(&request, 0).is_err());
+        let input = &request["input"];
+        let length = serde_json::to_vec(input).unwrap().len() as u64;
+        admit_input(input, length).unwrap();
+        assert!(admit_input(input, length - 1).is_err());
     }
     #[test]
     fn pure_reply_keys_carry_a_digest_not_the_target_input() {
