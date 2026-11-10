@@ -451,7 +451,7 @@ mod energy_extension_tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -578,8 +578,36 @@ mod energy_extension_tests {
             &execution,
         )
         .unwrap();
-        assert!(replay.reused_manifest.is_some());
-        assert_eq!(first.value.data, replay.value.data);
+        assert!(replay.produced_manifest.is_some());
+        assert!(first
+            .value
+            .data
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("path one"));
+        assert!(replay
+            .value
+            .data
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("path two"));
+        assert_ne!(first.value.data, replay.value.data);
+        let identical = f::capture_with_context(
+            "finite_root_budget",
+            &s,
+            Some(&m),
+            None,
+            None,
+            None,
+            &[],
+            &cache,
+            &execution,
+        )
+        .unwrap();
+        assert!(identical.reused_manifest.is_some());
+        assert_eq!(identical.value.data, replay.value.data);
     }
 }
 use rug::{float::Constant, Float};
@@ -2449,21 +2477,19 @@ fn capability_dependent_diagnostics_do_not_reuse_other_or_unspecified_backends()
             CacheVisibility::Local,
         );
         for capability in [Some(!cfg!(feature = "arb")), None] {
-            let mut value = serde_json::to_value(&current.value).unwrap();
+            let value = serde_json::to_value(&current.value).unwrap();
+            let mut request = current.value.request.clone();
             match capability {
                 Some(available) => {
-                    value["request"]["arb_available"] = json!(available);
+                    request["arb_available"] = json!(available);
                 }
                 None => {
-                    value["request"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("arb_available");
+                    request.as_object_mut().unwrap().remove("arb_available");
                 }
             }
             let mut semantic: SemanticKeyEnvelope =
                 serde_json::from_str(&manifest.tags[SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
-            semantic.resolved_mathematical_parameters["request"] = value["request"].clone();
+            semantic.resolved_mathematical_parameters["request"] = request;
             let logical = format!(
                 "ccm/research/{}/{}",
                 manifest.key.kind,
@@ -3179,7 +3205,7 @@ fn finite_capture_resource_limits_do_not_poison_warm_replay() {
         )),
     }]);
     let policy = CachePolicy {
-        current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         minimum_quality: CacheQuality::Validated,
         accepted_schema_versions: vec![1],
         allow_deprecated: false,
@@ -3365,12 +3391,10 @@ fn profile_preflight_preserves_compact_request_identity_without_evaluation() {
         refused["failure_predicates"],
         serde_json::json!(["basis_id"])
     );
-    assert!(
-        f::analyze_profiles(&invalid)
-            .unwrap_err()
-            .to_string()
-            .contains("basis_id")
-    );
+    assert!(f::analyze_profiles(&invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("basis_id"));
 }
 #[test]
 fn profile_preflight_identifies_work_refusal_and_does_not_relax_it() {
@@ -4117,7 +4141,7 @@ fn streamed_trial_energy_budget_acceptance_is_independent_of_threads_cold_and_wa
         )),
     }]);
     let policy = CachePolicy {
-        current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         minimum_quality: CacheQuality::Validated,
         accepted_schema_versions: vec![1],
         allow_deprecated: false,
@@ -4180,13 +4204,39 @@ fn continuous_l1_profile_output_is_pinned_at_any_thread_count() {
                 .unwrap()
                 .value
                 .data;
-                ContentDigest::sha256(&serde_json::to_vec(&value).unwrap()).0
+                let new_digest=ContentDigest::sha256(&serde_json::to_vec(&value).unwrap()).0;
+                // Reconstruct only the four former identity fields. Recovering
+                // the frozen old digest proves every numerical/report field is unchanged.
+                let mut legacy=serde_json::to_value(&value).unwrap();
+                let mut functional: f::BoundedFunctional=serde_json::from_value(legacy["result"]["paired_profiles"]["functional"].clone()).unwrap();
+                let definition=input.target.as_ref().unwrap().definition_digest.clone();
+                functional.id=format!("finite-window-target-inner-product:{}",definition.0);
+                let vector=|label:&str| f::ComplexVector {label:label.into(),
+                    real:["0","1","0"].map(xc_solver::trial_energy::ExactBounds::point).to_vec(),
+                    imaginary:vec![xc_solver::trial_energy::ExactBounds::point("0");3]};
+                let legacy_request=f::ProfileRequest {basis_id:"centered_full_V_fourier".into(),lambda_squared:input.lambda_squared.clone(),
+                    scope:"stored state and finite target projection; functional reference has center one".into(),definition_digest:definition,
+                    profiles:vec![vector("retained_state"),vector("finite_target_projection")],functional: functional.clone(),
+                    intervals_per_half:32,precision_bits:160};
+                legacy["result"]["paired_profiles"]["functional"]=serde_json::to_value(functional).unwrap();
+                legacy["result"]["paired_profiles"]["request_digest"]=json!(ContentDigest::sha256_finite_json(&legacy_request).unwrap());
+                for pair in legacy["result"]["paired_profiles"]["pairs"].as_array_mut().unwrap() {
+                    assert_eq!(pair["real_normalization_witness"]["request_sha256"],"d820ff97b727938516651d56835be7ff0958671864f97c788cf81175639608cb");
+                    pair["real_normalization_witness"]["request_sha256"]=json!("68f42078bbf0af9041fd58cd7f9b76d17571e0fc6129fab6dda17e67a7ca5ea6");
+                }
+                // Serialize through Analysis to preserve the original struct field order.
+                let legacy:f::Analysis=serde_json::from_value(legacy).unwrap();
+                assert_eq!(ContentDigest::sha256(&serde_json::to_vec(&legacy).unwrap()).0,PINNED_CONTINUOUS_L1_DIGEST);
+                new_digest
             })
     };
     let one = digest(1);
     eprintln!("CONTINUOUS_L1_DIGEST {one}");
     assert_eq!(digest(8), one);
-    assert_eq!(one, PINNED_CONTINUOUS_L1_DIGEST);
+    assert_eq!(
+        one,
+        "22abc16243e704e00980f7e6320003500a9b764d759829559fd7f9fb399036e6"
+    );
 }
 /// Output of the sequential evaluation, before node evaluation was parallel.
 const PINNED_CONTINUOUS_L1_DIGEST: &str =

@@ -6,11 +6,12 @@ from pathlib import Path
 if not __debug__:
     raise RuntimeError("benchmark_band_recovery.py requires Python without -O so acceptance checks execute")
 
-def local_environment():
+def local_environment(cache_root=None):
     """Keep synthetic acceptance runs independent of ambient research/cache settings."""
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("XC_RESEARCH_", "XC_CACHE_", "XC_PUBLISH_"))}
     env.update(XC_CACHE_REMOTE="none", XC_PUBLISH_TARGET="none", XC_PUBLISH_EXECUTE="false")
+    if cache_root is not None:env["XC_CACHE_ROOT"] = str(cache_root)
     return env
 
 
@@ -33,9 +34,9 @@ def main():
  (root/'external.json').write_bytes(external)
  task=dict(operation='extended_research',diagnostic='band_reconstruction',state=dict(manifest='state.manifest.json',payload='state.json'),input='external.json',input_sha256=sha(external))
  def plan(name):
-  path=root/(name+'.json');path.write_bytes(enc(dict(schema_version=1,approved_payload_digests=[digest],cache_root='cache-budget' if name in ['limited','raised'] else 'cache-'+name,jobs=[dict(id='band',task=task)])));return path
+  path=root/(name+'.json');path.write_bytes(enc(dict(schema_version=1,approved_payload_digests=[digest],cache_root='cache-budget' if name in ['limited','raised','warm-limited'] else 'cache-'+name,jobs=[dict(id='band',task=task)])));return path
  def run(name,workers,checkpoint,stop=False,budget=None):
-  env=dict(local_environment(),XC_RESEARCH_CHECKPOINT_DIR=str(root/checkpoint),XC_RESEARCH_SUMMARY_DIR=str(root/('summaries-'+name)),RAYON_NUM_THREADS=str(workers))
+  env=dict(local_environment(root/("runtime-cache-"+name)),XC_RESEARCH_CHECKPOINT_DIR=str(root/checkpoint),XC_RESEARCH_SUMMARY_DIR=str(root/('summaries-'+name)),RAYON_NUM_THREADS=str(workers))
   if budget is not None:env['XC_RESEARCH_BASIS_BYTES']=str(budget)
   start=time.perf_counter();proc=subprocess.Popen([str(binary),str(plan(name)),str(root/('out-'+name))],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,env=env)
   killed=False
@@ -48,15 +49,23 @@ def main():
   result=dict(name=name,workers=workers,seconds=time.perf_counter()-start,exit_code=code,interrupted=killed)
   if stop:
    assert killed,'did not reach interruption point'
+  elif name=='limited':
+   assert code!=0,'an execution refusal was presented as a retained artifact'
+   assert not (root/('out-'+name)/'band.json').exists(),'limited result was exported as reusable'
+   for path in (root/'cache-budget').rglob('*.json'):
+    document=json.loads(path.read_text())
+    assert not isinstance(document,dict) or document.get('key',{}).get('kind')!='ccm_band_reconstruction','limited result entered the managed cache'
+   result.update(report_sha256=None,outcome='budget_limited_not_retained')
   else:
    assert code==0,(name,code)
-   packet=json.loads((root/('out-'+name)/'band.json').read_text());report=packet['report'];assert report['data']['outcome']==('unresolved' if budget==1 else 'point_measurement'),report['data'].get('reason');result['report_sha256']=sha(enc(report));result['outcome']=report['data']['outcome']
+   packet=json.loads((root/('out-'+name)/'band.json').read_text());report=packet['report'];assert report['data']['outcome']=='point_measurement',report['data'].get('reason');result['report_sha256']=sha(enc(report));result['outcome']=report['data']['outcome']
   return result
  limited=run('limited',1,'checkpoint-budget',budget=1);raised=run('raised',1,'checkpoint-budget')
- assert limited['report_sha256']!=raised['report_sha256'],'raising the budget reused the limited report'
+ warm=run('warm-limited',1,'checkpoint-budget',budget=1)
+ assert warm['report_sha256']==raised['report_sha256'],'a lower operational budget invalidated a complete reusable result'
  results=[run('interrupted',1,'checkpoint-shared',True),run('resumed',1,'checkpoint-shared'),run('cold-one',1,'checkpoint-cold-one'),run('cold-four',4,'checkpoint-cold-four')]
  assert len({r['report_sha256'] for r in results[1:]})==1,'resumption or worker count changed report'
  log=(root/'resumed.log').read_text();assert re.search(r'band recurrence resumed at degree [1-9]',log), 'recurrence did not resume'
- result=dict(scope='synthetic local finite signed-band benchmark; no campaign or network claim',atoms=a.atoms,degree=a.degree,precision_bits=256,identical_reports=True,resumed_from_saved_degree=True,budget_raise_recomputed=True,budget_runs=[limited,raised],runs=results)
+ result=dict(scope='synthetic local finite signed-band benchmark; no campaign or network claim',atoms=a.atoms,degree=a.degree,precision_bits=256,identical_reports=True,resumed_from_saved_degree=True,budget_raise_recomputed=True,budget_runs=[limited,raised,warm],completed_result_reused_under_lower_budget=True,runs=results)
  (root/'results.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2))
 if __name__=='__main__':main()

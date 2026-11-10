@@ -446,7 +446,7 @@ fn reconstruct_inner(
                 .write_all(&buffer[..read])
                 .map_err(|error| map_io_error(error, cancellation))?;
         }
-        let part_digest = ContentDigest(format!("{:x}", part_hasher.finalize()));
+        let part_digest = ContentDigest(xc_core::hex_lower(&part_hasher.finalize()));
         if part_size != part.size_bytes || part_digest != part.content_digest {
             return Err(CacheError::DigestMismatch {
                 expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),
@@ -458,7 +458,7 @@ fn reconstruct_inner(
     output.flush()?;
     output.inner.sync_all()?;
     drop(output);
-    let package_digest = ContentDigest(format!("{:x}", package_hasher.finalize()));
+    let package_digest = ContentDigest(xc_core::hex_lower(&package_hasher.finalize()));
     if package_size != record.package_size_bytes || package_digest != record.package_digest {
         return Err(CacheError::DigestMismatch {
             expected: format!(
@@ -612,7 +612,7 @@ fn verify_canonical_payload_zip64_inner(
                 writer.write_all(&digest_buffer[..read])?;
             }
         }
-        let digest = ContentDigest(format!("{:x}", hasher.finalize()));
+        let digest = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
         if size != item.size_bytes || digest != item.content_digest {
             return Err(CacheError::DigestMismatch {
                 expected: format!("{} ({} bytes)", item.content_digest, item.size_bytes),
@@ -770,7 +770,7 @@ fn package_inner(
                 .write_all(&buffer[..read])
                 .map_err(|error| map_io_error(error, cancellation))?;
         }
-        let actual_digest = ContentDigest(format!("{:x}", item_hasher.finalize()));
+        let actual_digest = ContentDigest(xc_core::hex_lower(&item_hasher.finalize()));
         if item_size != item.size_bytes || actual_digest != item.content_digest {
             return Err(CacheError::DigestMismatch {
                 expected: format!("{} ({} bytes)", item.content_digest, item.size_bytes),
@@ -942,7 +942,7 @@ fn digest_file(
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(ContentDigest(format!("{:x}", hasher.finalize())))
+    Ok(ContentDigest(xc_core::hex_lower(&hasher.finalize())))
 }
 
 fn create_temporary_file(destination: &Path) -> Result<(PathBuf, File), CacheError> {
@@ -1146,6 +1146,117 @@ mod tests {
         assert_eq!(alpha.last_modified().unwrap().year(), 1980);
         drop(alpha);
         assert_eq!(archive.by_index(1).unwrap().name(), "data/beta.bin");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn actual_v1_and_v2_encoder_archives_keep_their_profiles_and_payloads() {
+        let root = test_root("legacy-encoder-archives");
+        let (multi, _) = fixture(&root);
+        let single_bytes = b"{\"legacy\":true}\n";
+        let single = CanonicalPayloadEnvelope {
+            dimensions: vec![1],
+            ordered_items: vec![LogicalPayloadItem {
+                normalized_path: "payload.json".to_owned(),
+                content_digest: ContentDigest::sha256(single_bytes),
+                size_bytes: single_bytes.len() as u64,
+            }],
+            ..multi.clone()
+        };
+        let cases: [(&[u8], &str, &str, &CanonicalPayloadEnvelope); 3] = [
+            (
+                include_bytes!("../tests/fixtures/legacy-zip/deterministic-v1-multi.zip"),
+                DETERMINISTIC_ZIP64_PROFILE_V1,
+                "7f055ac842984a82133d8f55ad0320da1fab69ff838c1ba49d2dd839dad22da0",
+                &multi,
+            ),
+            (
+                include_bytes!("../tests/fixtures/legacy-zip/deterministic-v1-single.zip"),
+                DETERMINISTIC_ZIP64_PROFILE_V1,
+                "55bb83e72b1489e33353c45eba5a65acccd222c6b760b6e7b40726f238cab563",
+                &single,
+            ),
+            (
+                include_bytes!("../tests/fixtures/legacy-zip/deterministic-v2-multi.zip"),
+                DETERMINISTIC_ZIP64_PROFILE_V2,
+                "2023bee9a5e03a2082e5ad31d34eafe5fd5be0314fb07c141af1a831fc908b21",
+                &multi,
+            ),
+        ];
+        for (index, (bytes, profile, digest, envelope)) in cases.into_iter().enumerate() {
+            assert_eq!(ContentDigest::sha256(bytes).0, digest);
+            let path = root.join(format!("legacy-{index}.zip"));
+            fs::write(&path, bytes).unwrap();
+            let mut encoded = bytes;
+            let record = crate::stream_split_encoded(
+                &mut encoded,
+                envelope.digest().unwrap(),
+                profile,
+                &crate::TransportPolicy::default(),
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            let verified =
+                verify_canonical_payload_zip64(envelope, &record, &path, &CancellationToken::new())
+                    .unwrap();
+            assert_eq!(record.encoder_profile, profile);
+            assert_eq!(
+                verified.canonical_payload_digest,
+                envelope.digest().unwrap()
+            );
+            assert_eq!(verified.package_digest.0, digest);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_encoder_reproduces_immutable_single_and_multi_item_archives() {
+        let root = test_root("current-encoder-original-bytes");
+        let (multi, sources) = fixture(&root);
+        let payload = b"{\"legacy\":true}\n";
+        let single = CanonicalPayloadEnvelope {
+            dimensions: vec![1],
+            ordered_items: vec![LogicalPayloadItem {
+                normalized_path: "payload.json".to_owned(),
+                content_digest: ContentDigest::sha256(payload),
+                size_bytes: payload.len() as u64,
+            }],
+            ..multi.clone()
+        };
+        let single_path = root.join("single.zip");
+        let single_report = package_canonical_payload_bytes_zip64(
+            &single,
+            "payload.json",
+            payload,
+            &single_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            single_report.encoder_profile,
+            DETERMINISTIC_ZIP64_PROFILE_V1
+        );
+        assert_eq!(
+            fs::read(single_path).unwrap(),
+            include_bytes!("../tests/fixtures/legacy-zip/deterministic-v1-single.zip")
+        );
+        let multi_path = root.join("multi.zip");
+        let multi_report = package_canonical_payload_zip64(
+            &multi,
+            &sources,
+            &multi_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(multi_report.encoder_profile, DETERMINISTIC_ZIP64_PROFILE_V2);
+        assert_eq!(
+            fs::read(multi_path).unwrap(),
+            include_bytes!("../tests/fixtures/legacy-zip/deterministic-v2-multi.zip")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

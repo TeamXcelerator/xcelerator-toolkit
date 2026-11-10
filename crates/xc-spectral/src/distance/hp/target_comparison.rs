@@ -609,8 +609,9 @@ pub fn capture_target_comparison_via_cache(
     let prec = cfg.precision_bits;
     let working = prec.saturating_add(GUARD_BITS);
     let target_spec = crate::target::TargetProfileSpec::from_environment()?;
-    let target_definition_digest = target_spec.digest()?;
+    let target_definition_digest = target_spec.base_value_digest()?;
     let lambda_sq_identity = lambda_squared_identity(params);
+    target_spec.admit_evaluation(&lambda_sq_identity, working)?;
     let lambda_sq = crate::ccm::hp::lambda_squared_value_hp(params, working)?;
     anyhow::ensure!(lambda_sq > 1u32, "target comparison needs lambda^2 > 1");
     let lambda = lambda_sq.sqrt();
@@ -686,6 +687,7 @@ pub fn capture_target_comparison_via_cache(
         minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
+            target_spec.manifest_provenance_tag()?,
             ("domain".to_owned(), "ccm".to_owned()),
             (
                 "artifact".to_owned(),

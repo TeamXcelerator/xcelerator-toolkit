@@ -134,6 +134,10 @@ class OperationalEnvironmentGuards(unittest.TestCase):
                 self.assertEqual(env["XC_PUBLISH_TARGET"],"none")
                 self.assertEqual(env["XC_PUBLISH_EXECUTE"],"false")
                 self.assertEqual(env["PATH"],settings["PATH"])
+                isolated=module.local_environment(Path('fixture-runtime-cache'))
+                self.assertEqual(isolated['XC_CACHE_ROOT'],'fixture-runtime-cache')
+                self.assertEqual(isolated['XC_CACHE_REMOTE'],'none')
+                self.assertEqual(isolated['XC_PUBLISH_EXECUTE'],'false')
 
 
 

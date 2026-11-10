@@ -169,6 +169,60 @@ pub fn execute_next_payload_batch(
     journal: &mut PublicationTransactionJournal,
     destination: PublicationDestination,
 ) -> Result<PublicationStepOutcome, CacheError> {
+    crate::publication_admission::require_private_unadmitted(destination)?;
+    execute_next_payload_batch_inner(
+        remote,
+        checkpoints,
+        cancellation,
+        authenticated_session,
+        capacity_policy,
+        staging_root,
+        resources,
+        journal,
+        destination,
+    )
+}
+
+/// Artifact-bound entry point for public or private payload publication.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_next_payload_batch_admitted(
+    remote: &dyn RemoteGitStore,
+    checkpoints: &PublicationJournalStore,
+    cancellation: &CancellationToken,
+    authenticated_session: &AuthenticatedGitHubSession,
+    capacity_policy: &PublicationFinalizationPolicy,
+    staging_root: &Path,
+    resources: &ResourcePolicy,
+    journal: &mut PublicationTransactionJournal,
+    destination: PublicationDestination,
+    admission: &crate::PublicationAdmission,
+) -> Result<PublicationStepOutcome, CacheError> {
+    admission.check(journal, destination)?;
+    execute_next_payload_batch_inner(
+        remote,
+        checkpoints,
+        cancellation,
+        authenticated_session,
+        capacity_policy,
+        staging_root,
+        resources,
+        journal,
+        destination,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_next_payload_batch_inner(
+    remote: &dyn RemoteGitStore,
+    checkpoints: &PublicationJournalStore,
+    cancellation: &CancellationToken,
+    authenticated_session: &AuthenticatedGitHubSession,
+    capacity_policy: &PublicationFinalizationPolicy,
+    staging_root: &Path,
+    resources: &ResourcePolicy,
+    journal: &mut PublicationTransactionJournal,
+    destination: PublicationDestination,
+) -> Result<PublicationStepOutcome, CacheError> {
     cancellation
         .check()
         .map_err(|error| CacheError::Cancelled(error.to_string()))?;
@@ -498,7 +552,7 @@ fn stage_verified_payload_record(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         plan_publication_batches, CapacityLedger, PublicationBatchPlan,
@@ -598,15 +652,15 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    struct FakeRemote {
+    pub(crate) struct FakeRemote {
         head: Mutex<String>,
         paths: Mutex<HashMap<(String, String), ContentDigest>>,
         conflict_once: Mutex<bool>,
-        calls: Mutex<usize>,
+        pub(crate) calls: Mutex<usize>,
     }
 
     impl FakeRemote {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 head: Mutex::new("head-0".to_owned()),
                 paths: Mutex::new(HashMap::new()),
@@ -740,6 +794,45 @@ mod tests {
                 })
             }
         }
+    }
+
+    #[test]
+    fn public_writers_without_artifact_admission_make_zero_remote_calls() {
+        let remote = FakeRemote::new();
+        let root = temporary_root("public-admission-required");
+        let checkpoints = PublicationJournalStore::new(root.path());
+        let mut journal = journal();
+        let original = journal.clone();
+        let error = execute_next_payload_batch(
+            &remote,
+            &checkpoints,
+            &CancellationToken::new(),
+            &authenticated_session(),
+            &PublicationFinalizationPolicy::default(),
+            &root,
+            &ResourcePolicy::default(),
+            &mut journal,
+            PublicationDestination::Public,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::PermissionDenied(_)));
+        let error = crate::execute_next_finalization_step(
+            &remote,
+            &checkpoints,
+            &CancellationToken::new(),
+            &authenticated_session(),
+            &PublicationFinalizationPolicy::default(),
+            &mut journal,
+            PublicationDestination::Public,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::PermissionDenied(_)));
+        assert_eq!(*remote.calls.lock().unwrap(), 0);
+        assert_eq!(journal, original);
+        assert!(checkpoints
+            .load_if_exists(&journal.transaction_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

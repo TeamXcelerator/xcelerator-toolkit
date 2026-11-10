@@ -14,7 +14,8 @@ use xc_numerics::rational_interval_product::{
     self, ContractionAdmission, ContractionExecution, ContractionOptions,
 };
 
-type RowResults = Vec<Vec<Result<Option<Float>>>>;
+type RowValues = Vec<Result<Option<Float>>>;
+type RowResults = Vec<RowValues>;
 
 /// Shrink only an unstarted tile. Completed tiles are retained in row order;
 /// any error after entering a product backend remains fatal, even if its
@@ -45,8 +46,8 @@ fn admitted_row_tiles<T>(
             {
                 tile_rows = (end - start) / 2;
                 eprintln!(
-                    "[HP] prime-response workspace admission: reducing unstarted tile from {} to {tile_rows} rows; same backend and precision",
-                    end - start
+                    "[HP] prime-response workspace admission: reducing unstarted tile from {} to {tile_rows} rows; same backend and precision; reason: {error:#}",
+                    end - start,
                 );
             }
             Err(error) => {
@@ -259,6 +260,172 @@ fn integer_row(prepared: &CoefficientSource<'_>, row: usize) -> Result<(Vec<Inte
     Ok((numerators, sine))
 }
 
+/// Additional simultaneous fallback storage. One fallback row is already
+/// covered by the operand reservation. Charge every additional worker for
+/// numerator/rational coexistence, converted interval coefficients, ordered
+/// interval terms and MPFR scratch; result rows belong to the parent's budget.
+/// This is independent of the contraction's own still-live reservation.
+fn finishing_scratch_per_row(
+    inner: usize,
+    left_bits: u32,
+    denominator_bits: u32,
+    work: u32,
+) -> u128 {
+    let integer_bytes = u128::from(left_bits.max(denominator_bits)).div_ceil(8) + 128;
+    let scalar_bytes = u128::from(work).div_ceil(8) + 128;
+    8 * (inner as u128 + 1) * (2 * integer_bytes + 8 * scalar_bytes)
+}
+
+struct FinishingSchedule {
+    workers: usize,
+    _scratch: Option<xc_core::MemoryReservation>,
+}
+
+fn admit_finishing(
+    resources: &xc_core::RunResources,
+    rows: usize,
+    requested_workers: usize,
+    per_row_bytes: u128,
+) -> Result<FinishingSchedule> {
+    let workers = requested_workers
+        .min(rows)
+        .min(resources.worker_limit())
+        .min(rayon::current_num_threads());
+    let serial = || FinishingSchedule {
+        workers: 1,
+        _scratch: None,
+    };
+    if workers <= 1 {
+        return Ok(serial());
+    }
+    let Some(extra_bytes) = per_row_bytes
+        .checked_mul((workers - 1) as u128)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    else {
+        return Ok(serial());
+    };
+    match resources.try_reserve_working(extra_bytes) {
+        Ok(scratch) => Ok(FinishingSchedule {
+            workers,
+            _scratch: Some(scratch),
+        }),
+        Err(_capacity_error) => {
+            // This typed ledger API fails only for capacity or cancellation.
+            // Cancellation is never an optional-optimization refusal. No
+            // backend or numerical error is caught here, and the completed
+            // contraction is not repeated when capacity selects serial work.
+            resources.check_cancelled()?;
+            Ok(serial())
+        }
+    }
+}
+
+/// Exactly the admitted number of serial row producers bounds live fallback
+/// scratch. Indexed group collection is followed by a SERIAL Result reduction:
+/// Rayon short-circuit collection must not select a later row's fatal error.
+fn finish_rows_in_order<T: Send>(
+    count: usize,
+    schedule: &FinishingSchedule,
+    resources: &xc_core::RunResources,
+    finish: impl Fn(usize) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    if schedule.workers <= 1 || count <= 1 {
+        return (0..count).map(finish).collect();
+    }
+    xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
+    let chunk = count.div_ceil(schedule.workers);
+    let groups = (0..count.div_ceil(chunk))
+        .into_par_iter()
+        .map(|job| {
+            let _scope = resources.enter();
+            let start = job * chunk;
+            (start..(start + chunk).min(count))
+                .map(&finish)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    groups.into_iter().flatten().collect()
+}
+
+struct RowFinishing<'a, 'source> {
+    prepared: &'a CoefficientSource<'source>,
+    active: &'a [(usize, BatchEventGuard)],
+    modes: usize,
+    exponent: i64,
+    p: u32,
+    work: u32,
+}
+
+impl RowFinishing<'_, '_> {
+    fn row(
+        &self,
+        row: usize,
+        cosines: &[I],
+        sine: Option<&I>,
+        failure: Option<&str>,
+    ) -> Result<RowValues> {
+        if let Some(message) = failure {
+            return Ok(self
+                .active
+                .iter()
+                .map(|_| Err(anyhow::anyhow!(message.to_owned())))
+                .collect());
+        }
+        let mut reference = None;
+        let mut values = Vec::with_capacity(self.active.len());
+        for (column, (_, event)) in self.active.iter().enumerate() {
+            let cosine = &cosines[column];
+            let sum = if let Some(sine) = sine {
+                cosine.add(
+                    &sine
+                        .mul(&event.pi)
+                        .mul(&event.reduced)
+                        .mul(&event.sines[row.abs_diff(self.modes)]),
+                )
+            } else {
+                cosine.clone()
+            };
+            let value = match scale(&sum.mul(&event.coefficient), self.exponent)
+                .and_then(|value| rounded(&value, self.p))
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    values.push(Err(error));
+                    continue;
+                }
+            };
+            if value.as_ref().is_some_and(|value| !value.is_zero()) {
+                values.push(Ok(value));
+                continue;
+            }
+            // Keep the original event loop, every interval operation, and the
+            // exact-zero/reference policy. Each row owns its fallback buffer.
+            if reference.is_none() {
+                let (cosine, _) = self.prepared.prime_coefficients(row)?;
+                reference = Some(
+                    cosine
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, value)| *value != &0)
+                        .map(|(k, value)| (k, I::from_rational(value, self.work)))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            values.push(apply_batch_row(
+                reference.as_ref().unwrap(),
+                sine,
+                event,
+                row,
+                self.modes,
+                self.exponent,
+                self.p,
+                self.work,
+            ));
+        }
+        Ok(values)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_rows(
     prepared: &CoefficientSource<'_>,
@@ -317,7 +484,16 @@ fn apply_rows_with_backend(
         + (usize::BITS - (2 * modes).max(1).leading_zeros())
         + 4;
     let scalar_bytes = u128::from(work).div_ceil(8) + 128;
-    admitted_row_tiles(count, tile_rows, |start, end| {
+    // Optional operational timing stays outside mathematical payloads and
+    // restart identities. Contraction includes CPU packing/reconstruction;
+    // it must not be reported as device-only elapsed time.
+    let timed = std::env::var("XC_RESPONSE_TIMING").is_ok_and(|value| value == "1");
+    let batch_started = std::time::Instant::now();
+    let mut preparation = std::time::Duration::ZERO;
+    let mut contraction_time = std::time::Duration::ZERO;
+    let mut finishing = std::time::Duration::ZERO;
+    let result = admitted_row_tiles(count, tile_rows, |start, end| {
+        let preparation_started = timed.then(std::time::Instant::now);
         let tile_rows = end - start;
         // This reservation covers borrowed operands excluded from the numerical
         // helper: the common integer row tile, cloned cosine columns, sine factors,
@@ -360,7 +536,6 @@ fn apply_rows_with_backend(
             max_modular_scalar_products: 1_000_000_000_000,
             workers,
         };
-        let mut rows = Vec::with_capacity(tile_rows);
         let mut numerators = Vec::with_capacity((end - start) * inner);
         let mut sines = Vec::with_capacity(end - start);
         let mut failures = Vec::with_capacity(end - start);
@@ -396,6 +571,10 @@ fn apply_rows_with_backend(
         }
         // No error from contract, including post-entry resource refusal, is
         // interpreted as permission to switch backends or arithmetic routes.
+        if let Some(started) = preparation_started {
+            preparation += started.elapsed();
+        }
+        let contraction_started = timed.then(std::time::Instant::now);
         let contraction = rational_interval_product::contract(
             &numerators,
             &common.denominator,
@@ -407,79 +586,444 @@ fn apply_rows_with_backend(
             },
             work,
             options,
-        )?;
-        for row in start..end {
-            let local = row - start;
-            if let Some(message) = &failures[local] {
-                rows.push(
-                    active
-                        .iter()
-                        .map(|_| Err(anyhow::anyhow!(message.clone())))
-                        .collect(),
-                );
-                continue;
-            }
-            let mut reference = None;
-            let mut values = Vec::with_capacity(active.len());
-            for (column, (_, event)) in active.iter().enumerate() {
-                let cosine = &contraction.values()[local * active.len() + column];
-                let sum = if let Some(sine) = &sines[local] {
-                    cosine.add(
-                        &sine
-                            .mul(&event.pi)
-                            .mul(&event.reduced)
-                            .mul(&event.sines[row.abs_diff(modes)]),
-                    )
-                } else {
-                    cosine.clone()
-                };
-                let value = match scale(&sum.mul(&event.coefficient), exponent)
-                    .and_then(|value| rounded(&value, p))
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        values.push(Err(error));
-                        continue;
-                    }
-                };
-                if value.as_ref().is_some_and(|value| !value.is_zero()) {
-                    values.push(Ok(value));
-                    continue;
-                }
-                // A real exact zero does not specify MPFR's signed-zero byte.
-                // Reuse the original operation order for that case, and for a
-                // width-limited result that may still resolve at this guard.
-                if reference.is_none() {
-                    let (cosine, _) = prepared.prime_coefficients(row)?;
-                    reference = Some(
-                        cosine
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, value)| *value != &0)
-                            .map(|(k, value)| (k, I::from_rational(value, work)))
-                            .collect::<Vec<_>>(),
-                    );
-                }
-                values.push(apply_batch_row(
-                    reference.as_ref().unwrap(),
-                    sines[local].as_ref(),
-                    event,
-                    row,
-                    modes,
-                    exponent,
-                    p,
-                    work,
-                ));
-            }
-            rows.push(values);
+        );
+        if let Some(started) = contraction_started {
+            contraction_time += started.elapsed();
         }
-        Ok(rows)
-    })
+        let contraction = contraction?;
+        let finishing_started = timed.then(std::time::Instant::now);
+        let schedule = admit_finishing(
+            &resources,
+            tile_rows,
+            workers,
+            finishing_scratch_per_row(
+                inner,
+                left_bits,
+                common.denominator.significant_bits(),
+                work,
+            ),
+        )?;
+        let context = RowFinishing {
+            prepared,
+            active,
+            modes,
+            exponent,
+            p,
+            work,
+        };
+        let rows = finish_rows_in_order(tile_rows, &schedule, &resources, |local| {
+            context.row(
+                start + local,
+                &contraction.values()[local * active.len()..(local + 1) * active.len()],
+                sines[local].as_ref(),
+                failures[local].as_deref(),
+            )
+        });
+        if let Some(started) = finishing_started {
+            finishing += started.elapsed();
+        }
+        rows
+    });
+    if timed {
+        let elapsed = batch_started.elapsed();
+        let other = elapsed.saturating_sub(preparation + contraction_time + finishing);
+        xc_core::progress_message!(
+            "[HP] prime-response tile timing: rows={count}, events={}, work={work} bits, workspace={workspace} bytes, host_workers={workers}, status={}; preparation={:.6}s; contraction_host_and_device={:.6}s; finishing={:.6}s; admission_or_unfinished={:.6}s; total={:.6}s",
+            active.len(),
+            if result.is_ok() { "tiles_returned" } else { "error" },
+            preparation.as_secs_f64(),
+            contraction_time.as_secs_f64(),
+            finishing.as_secs_f64(),
+            other.as_secs_f64(),
+            elapsed.as_secs_f64(),
+        );
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_same_finished_rows(actual: &RowResults, expected: &RowResults) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(expected) {
+                match (actual, expected) {
+                    (Ok(Some(a)), Ok(Some(b))) => {
+                        assert_eq!(a.to_integer_exp(), b.to_integer_exp());
+                        assert_eq!(a.prec(), b.prec());
+                        assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+                    }
+                    (Ok(None), Ok(None)) => {}
+                    (Err(a), Err(b)) => assert_eq!(format!("{a:#}"), format!("{b:#}")),
+                    (a, b) => panic!("finishing outcomes differ: {a:?} versus {b:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_finishing_admission_accounts_live_storage_and_preserves_scope() {
+        let ordinary = finishing_scratch_per_row(121, 4096, 64, 6836);
+        assert!(finishing_scratch_per_row(121, 4096, 32768, 6836) > ordinary);
+        assert!(finishing_scratch_per_row(121, 4096, 64, 13672) > ordinary);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap()
+            .install(|| {
+                let resources = xc_core::RunResources::with_worker_limit(1024, 4).unwrap();
+                let _scope = resources.enter();
+                // Model still-live contraction/operand reservations. Only 224
+                // bytes remain, so three additional 100-byte rows cannot fit.
+                let held = resources.try_reserve_working(800).unwrap();
+                let serial = admit_finishing(&resources, 11, 8, 100).unwrap();
+                assert_eq!(serial.workers, 1);
+                assert_eq!(resources.usage().working_bytes, 800);
+                assert_eq!(
+                    finish_rows_in_order(11, &serial, &resources, Ok).unwrap(),
+                    (0..11).collect::<Vec<_>>()
+                );
+                drop(held);
+                let schedule = admit_finishing(&resources, 11, 8, 100).unwrap();
+                assert_eq!(schedule.workers, 4, "respect the run's worker cap");
+                assert_eq!(resources.usage().working_bytes, 300);
+                let current = std::sync::atomic::AtomicUsize::new(0);
+                let peak = std::sync::atomic::AtomicUsize::new(0);
+                let result = finish_rows_in_order(11, &schedule, &resources, |row| {
+                    let current_scope = xc_core::RunResources::current().unwrap();
+                    let check = current_scope.try_reserve_working(1).unwrap();
+                    assert!(check.belongs_to(&resources));
+                    let active = current.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                    current.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(row)
+                })
+                .unwrap();
+                assert_eq!(result, (0..11).collect::<Vec<_>>());
+                assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 4);
+                assert_eq!(resources.usage().working_bytes, 300);
+                drop(schedule);
+                assert_eq!(resources.usage().working_bytes, 0);
+                assert_eq!(
+                    admit_finishing(&resources, 11, 4, u128::MAX)
+                        .unwrap()
+                        .workers,
+                    1
+                );
+                assert_eq!(admit_finishing(&resources, 11, 1, 100).unwrap().workers, 1);
+                assert_eq!(admit_finishing(&resources, 1, 4, 100).unwrap().workers, 1);
+                resources.cancel();
+                let error = admit_finishing(&resources, 11, 4, 100).err().unwrap();
+                assert!(error.is::<xc_core::ConfigError>());
+                assert_eq!(error.to_string(), "run work cancelled by owner");
+            });
+    }
+
+    #[test]
+    fn parallel_finishing_keeps_first_fatal_row_and_nested_none_error_order() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                let resources = xc_core::RunResources::with_worker_limit(1 << 20, 4).unwrap();
+                for workers in [1, 2, 4] {
+                    let schedule = admit_finishing(&resources, 11, workers, 100).unwrap();
+                    let error = finish_rows_in_order(11, &schedule, &resources, |row| {
+                        if row == 1 || row == 8 {
+                            Err(anyhow::anyhow!("fatal reference row {row}")
+                                .context(ContractionExecution))
+                        } else {
+                            Ok(row)
+                        }
+                    })
+                    .unwrap_err();
+                    assert!(error.is::<ContractionExecution>());
+                    assert!(format!("{error:#}").contains("fatal reference row 1"));
+                    let rows = finish_rows_in_order(11, &schedule, &resources, |row| {
+                        Ok(vec![if row == 1 {
+                            Ok(None)
+                        } else if row == 8 {
+                            Err(anyhow::anyhow!("stored later cell error"))
+                        } else {
+                            Ok(Some(Float::with_val(128, row)))
+                        }])
+                    })
+                    .unwrap();
+                    assert!(rows[8][0].is_err(), "preserve the stored cell error");
+                    assert!(
+                        ordered_batch_rows(rows.into_iter().map(|mut row| row.remove(0)).collect())
+                            .unwrap()
+                            .is_none(),
+                        "earlier unresolved row still suppresses later cell error"
+                    );
+                }
+                assert_eq!(resources.usage().working_bytes, 0);
+            });
+    }
+
+    #[test]
+    fn parallel_finishing_rejects_mixed_worker_exponent_ranges_before_rows() {
+        unsafe extern "C" {
+            fn mpfr_set_emin(value: std::os::raw::c_long) -> i32;
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .start_handler(|index| {
+                if index != 0 {
+                    assert_eq!(unsafe { mpfr_set_emin(-1000) }, 0);
+                }
+            })
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::with_worker_limit(1 << 20, 3).unwrap();
+            let schedule = admit_finishing(&resources, 9, 3, 100).unwrap();
+            let called = std::sync::atomic::AtomicBool::new(false);
+            let error = finish_rows_in_order(9, &schedule, &resources, |row| {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(row)
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("exponent range"));
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        });
+    }
+
+    // Build and admit exactly one set of contraction values outside all
+    // finishing timings. Test-owned values remain charged after each original
+    // contraction owner is dropped. No artifact or cache is produced.
+    fn with_finishing_fixture(
+        backend: ProductBackend,
+        modes: usize,
+        p: u32,
+        event_count: usize,
+        kind: usize,
+        test: impl FnOnce(&RowFinishing<'_, '_>, &[I], &[Option<I>], &xc_core::RunResources, u128),
+    ) {
+        let resources = xc_core::RunResources::with_worker_limit(2 << 30, 4).unwrap();
+        let _scope = resources.enter();
+        let exact = (0..2 * modes + 1)
+            .map(|k| {
+                let value = match kind {
+                    0 => (k as i32 - modes as i32) * (k as i32 + 3),
+                    1 => k as i32 - modes as i32,
+                    _ => 0,
+                };
+                let denominator = if kind == 0 {
+                    k + 5
+                } else {
+                    k.abs_diff(modes) + 5
+                };
+                (Float::with_val(p, value) / denominator)
+                    .to_rational()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let prepared = CoefficientSource::new(&exact, modes, 2 << 30);
+        let common = prepared.common.as_ref().unwrap();
+        let work = 2 * p + 64;
+        let length = Float::with_val(p, 1000).ln();
+        let active = crate::ccm::try_prime_powers_up_to(1000).unwrap()[..event_count]
+            .iter()
+            .enumerate()
+            .map(|(index, &(power, prime, _))| {
+                (
+                    index,
+                    prepare_batch_event(modes, power, prime, &length, p, work, true)
+                        .unwrap()
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let columns = (0..=modes)
+            .flat_map(|k| {
+                active
+                    .iter()
+                    .map(move |(_, event)| event.cosines[k].clone())
+            })
+            .collect::<Vec<_>>();
+        let mut numerator_rows = Vec::new();
+        let mut sines = Vec::new();
+        for row in 0..exact.len() {
+            let (numerators, sine) = integer_row(&prepared, row).unwrap();
+            numerator_rows.extend(numerators);
+            sines.push((sine != 0).then(|| I::from_rational(&sine, work)));
+        }
+        let left_bits = numerator_rows
+            .iter()
+            .map(Integer::significant_bits)
+            .max()
+            .unwrap();
+        let storage = (exact.len() * event_count * 2) as u64 * (u64::from(work).div_ceil(8) + 128);
+        let _stored = resources.try_reserve_retained(storage).unwrap();
+        let mut values = Vec::with_capacity(exact.len() * event_count);
+        for start in (0..exact.len()).step_by(128) {
+            let end = (start + 128).min(exact.len());
+            let result = rational_interval_product::contract(
+                &numerator_rows[start * (modes + 1)..end * (modes + 1)],
+                &common.denominator,
+                &columns,
+                ProductShape {
+                    rows: end - start,
+                    inner: modes + 1,
+                    cols: event_count,
+                },
+                work,
+                ContractionOptions {
+                    backend,
+                    max_workspace_bytes: 1536 << 20,
+                    max_integer_bits: 67_108_864,
+                    max_exponent_span: 67_108_864,
+                    max_scalar_products: 1_000_000_000_000,
+                    max_modular_scalar_products: 1_000_000_000_000,
+                    workers: 4,
+                },
+            )
+            .unwrap();
+            values.extend_from_slice(result.values());
+        }
+        let context = RowFinishing {
+            prepared: &prepared,
+            active: &active,
+            modes,
+            exponent: 0,
+            p,
+            work,
+        };
+        let scratch = finishing_scratch_per_row(
+            modes + 1,
+            left_bits,
+            common.denominator.significant_bits(),
+            work,
+        );
+        test(&context, &values, &sines, &resources, scratch);
+    }
+
+    #[test]
+    fn parallel_finishing_exact_cells_reference_fallback_and_capacity_route() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                for p in [64, 128, 729] {
+                    for kind in 0..3 {
+                        with_finishing_fixture(
+                            ProductBackend::Cpu,
+                            3,
+                            p,
+                            4,
+                            kind,
+                            |context, values, sines, resources, scratch| {
+                                let count = sines.len();
+                                let columns = context.active.len();
+                                let serial = admit_finishing(resources, count, 1, scratch).unwrap();
+                                let finish = |row| {
+                                    context.row(
+                                        row,
+                                        &values[row * columns..(row + 1) * columns],
+                                        sines[row].as_ref(),
+                                        None,
+                                    )
+                                };
+                                let expected =
+                                    finish_rows_in_order(count, &serial, resources, finish)
+                                        .unwrap();
+                                for workers in [2, 4] {
+                                    let schedule =
+                                        admit_finishing(resources, count, workers, scratch)
+                                            .unwrap();
+                                    assert_eq!(schedule.workers, workers);
+                                    let actual =
+                                        finish_rows_in_order(count, &schedule, resources, finish)
+                                            .unwrap();
+                                    assert_same_finished_rows(&actual, &expected);
+                                    // Wider GPU intervals force the exact same
+                                    // reference-row fallback as a zero result.
+                                    let forced = vec![
+                                        I::new(
+                                            Float::with_val(context.work, -1),
+                                            Float::with_val(context.work, 1)
+                                        )
+                                        .unwrap();
+                                        columns
+                                    ];
+                                    let reference =
+                                        |row| context.row(row, &forced, sines[row].as_ref(), None);
+                                    let baseline =
+                                        finish_rows_in_order(count, &serial, resources, reference)
+                                            .unwrap();
+                                    let actual = finish_rows_in_order(
+                                        count, &schedule, resources, reference,
+                                    )
+                                    .unwrap();
+                                    assert_same_finished_rows(&actual, &baseline);
+                                }
+                                // A typed capacity refusal affects scheduling only.
+                                let available = resources.maximum_bytes()
+                                    - resources.usage().retained_bytes
+                                    - resources.usage().working_bytes;
+                                let held = resources.try_reserve_working(available).unwrap();
+                                let refused =
+                                    admit_finishing(resources, count, 4, scratch).unwrap();
+                                assert_eq!(refused.workers, 1);
+                                let actual =
+                                    finish_rows_in_order(count, &refused, resources, finish)
+                                        .unwrap();
+                                assert_same_finished_rows(&actual, &expected);
+                                drop(held);
+                                // Retain individual cell errors; do not promote
+                                // them into an outer early-return or drop None.
+                                let failed = context
+                                    .row(
+                                        0,
+                                        &values[..columns],
+                                        sines[0].as_ref(),
+                                        Some("row source refused"),
+                                    )
+                                    .unwrap();
+                                assert!(failed.iter().all(|value| value
+                                    .as_ref()
+                                    .unwrap_err()
+                                    .to_string()
+                                    == "row source refused"));
+                            },
+                        );
+                    }
+                }
+            });
+    }
+
+    #[test]
+    #[ignore = "supervised same-contraction CUDA row-finishing screen; no claim workload"]
+    fn measure_parallel_gpu_row_finishing_same_contraction() {
+        rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap().install(|| {
+            for (modes, p, events) in [(12, 192, 4), (12, 729, 4), (120, 3386, 32), (120, 3386, 64)] {
+                with_finishing_fixture(ProductBackend::Cuda, modes, p, events, 0,
+                    |context, values, sines, resources, scratch| {
+                        let finish = |row| context.row(row, &values[row * events..(row + 1) * events], sines[row].as_ref(), None);
+                        let serial = admit_finishing(resources, sines.len(), 1, scratch).unwrap();
+                        let expected = finish_rows_in_order(sines.len(), &serial, resources, finish).unwrap();
+                        for trial in 0..4 {
+                            let order = if trial % 2 == 0 { [1, 2, 4] } else { [4, 2, 1] };
+                            for workers in order {
+                                let schedule = admit_finishing(resources, sines.len(), workers, scratch).unwrap();
+                                assert_eq!(schedule.workers, workers);
+                                let started = std::time::Instant::now();
+                                let actual = finish_rows_in_order(sines.len(), &schedule, resources, finish).unwrap();
+                                let seconds = started.elapsed().as_secs_f64();
+                                assert_same_finished_rows(&actual, &expected);
+                                println!("same_contraction_finishing modes={modes} p={p} work={} events={events} rows={} trial={trial} workers={workers} seconds={seconds:.6} extra_scratch_bytes={} exact_scalar_precision_sign_and_outcomes=passed contraction=precomputed_cuda screening_only=true", context.work, sines.len(), schedule._scratch.as_ref().map_or(0, xc_core::MemoryReservation::bytes));
+                            }
+                        }
+                    });
+            }
+        });
+    }
 
     #[test]
     fn admission_retiles_only_unstarted_rows_and_keeps_order() {
@@ -620,6 +1164,41 @@ mod tests {
         guard: u32,
         workspace: u128,
     ) {
+        fixture_compare_workspace_routes(backend, p, modes, guard, workspace, &[false, true]);
+    }
+
+    fn fixture_compare_workspace_routes(
+        backend: ProductBackend,
+        p: u32,
+        modes: usize,
+        guard: u32,
+        workspace: u128,
+        parallel_routes: &[bool],
+    ) {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                fixture_compare_workspace_on_pool(
+                    backend,
+                    p,
+                    modes,
+                    guard,
+                    workspace,
+                    parallel_routes,
+                );
+            });
+    }
+
+    fn fixture_compare_workspace_on_pool(
+        backend: ProductBackend,
+        p: u32,
+        modes: usize,
+        guard: u32,
+        workspace: u128,
+        parallel_routes: &[bool],
+    ) {
         let resources = xc_core::RunResources::with_worker_limit(1 << 30, 4).unwrap();
         let _scope = resources.enter();
         for kind in 0..3 {
@@ -663,36 +1242,40 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
-            let actual = apply_rows_with_backend(
-                &prepared, &active, modes, exponent, p, work, false, workspace, backend,
-            )
-            .unwrap();
-            for (row, values) in actual.into_iter().enumerate() {
-                let (cosine, sine) = prepared.prime_coefficients(row).unwrap();
-                let cosine = cosine
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, v)| *v != &0)
-                    .map(|(k, v)| (k, I::from_rational(v, work)))
-                    .collect::<Vec<_>>();
-                let sine = (sine != 0).then(|| I::from_rational(&sine, work));
-                for ((_, event), got) in active.iter().zip(values) {
-                    let expected = apply_batch_row(
-                        &cosine,
-                        sine.as_ref(),
-                        event,
-                        row,
-                        modes,
-                        exponent,
-                        p,
-                        work,
+            for &parallel in parallel_routes {
+                let actual = with_admitted_host_workers(Some(if parallel { 4 } else { 1 }), || {
+                    apply_rows_with_backend(
+                        &prepared, &active, modes, exponent, p, work, parallel, workspace, backend,
                     )
-                    .unwrap()
-                    .unwrap();
-                    let got = got.unwrap().unwrap();
-                    assert_eq!(got.to_integer_exp(), expected.to_integer_exp());
-                    assert_eq!(got.prec(), expected.prec());
-                    assert_eq!(got.is_sign_negative(), expected.is_sign_negative());
+                })
+                .unwrap();
+                for (row, values) in actual.into_iter().enumerate() {
+                    let (cosine, sine) = prepared.prime_coefficients(row).unwrap();
+                    let cosine = cosine
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| *v != &0)
+                        .map(|(k, v)| (k, I::from_rational(v, work)))
+                        .collect::<Vec<_>>();
+                    let sine = (sine != 0).then(|| I::from_rational(&sine, work));
+                    for ((_, event), got) in active.iter().zip(values) {
+                        let expected = apply_batch_row(
+                            &cosine,
+                            sine.as_ref(),
+                            event,
+                            row,
+                            modes,
+                            exponent,
+                            p,
+                            work,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        let got = got.unwrap().unwrap();
+                        assert_eq!(got.to_integer_exp(), expected.to_integer_exp());
+                        assert_eq!(got.prec(), expected.prec());
+                        assert_eq!(got.is_sign_negative(), expected.is_sign_negative());
+                    }
                 }
             }
         }
@@ -711,11 +1294,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "supervised CUDA workspace retiling and exact action identity"]
+    #[ignore = "supervised automatic CUDA constrained workspace and exact action identity"]
     fn cuda_constrained_workspace_rows_match_legacy_actions_and_signed_zeros() {
-        // Force row retiling while leaving enough room for CUDA's fixed CRT
-        // scratch. High-precision/late-guard identity is qualified separately.
-        fixture_compare_workspace(ProductBackend::Cuda, 128, 256, 64, 32 << 20);
+        // Preserve the original automatic one-worker 32-MiB coverage. Forced
+        // pipeline mode has a different fixed-buffer budget and is qualified
+        // by the ample-workspace CUDA fixtures, not this automatic-mode test.
+        fixture_compare_workspace_routes(ProductBackend::Cuda, 128, 256, 64, 32 << 20, &[false]);
+        // Add explicit 64-MiB coverage for both one and four host workers.
+        // The four-worker 32-MiB route can refuse AFTER backend entry, where
+        // production correctly does not retile. These are planned separate
+        // fixtures, never retries. Deterministic retile/error tests are separate.
+        fixture_compare_workspace(ProductBackend::Cuda, 128, 256, 64, 64 << 20);
     }
 
     #[test]
@@ -1000,9 +1589,13 @@ mod tests {
                     .map(|values| bits(values));
                     assert!(channels.iter().all(|values| values.len() == 3));
                     assert_eq!(resources.usage().working_bytes, 0);
+                    // The admitted output owns its reservation until consumed.
+                    // Check release after dropping it, not while it is live.
+                    assert!(resources.usage().retained_bytes > 0);
+                    drop(action);
                     assert_eq!(resources.usage().retained_bytes, 0);
 
-                    // UFlowVelocityActions contains only the four channels.
+                    // The four mathematical channels have been copied above.
                     // Also compare every prime-action metadata field through
                     // the same public-to-parent batch delegate, with its tail.
                     let exponent = vector

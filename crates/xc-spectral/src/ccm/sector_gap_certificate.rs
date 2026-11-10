@@ -30,6 +30,45 @@ use xc_numerics::interval::RationalInterval;
 #[cfg(feature = "arb")]
 use super::CcmParams;
 
+pub mod compact;
+
+/// Borrow one actual certificate representation without changing its identity.
+#[derive(Clone, Copy, Debug)]
+pub enum SectorGapCertificateRef<'a> {
+    Full(&'a PortableCcmSectorGapCertificate),
+    Compact(&'a compact::CompactCcmSectorGapCertificate),
+}
+
+impl SectorGapCertificateRef<'_> {
+    pub fn precision_bits(self) -> u32 {
+        match self {
+            Self::Full(c) => c.precision_bits,
+            Self::Compact(c) => c.precision_bits,
+        }
+    }
+    pub fn n_modes(self) -> usize {
+        match self {
+            Self::Full(c) => c.n_modes,
+            Self::Compact(c) => c.n_modes,
+        }
+    }
+    pub fn integer_cutoff_c(self) -> u64 {
+        match self {
+            Self::Full(c) => c.integer_cutoff_c,
+            Self::Compact(c) => c.integer_cutoff_c,
+        }
+    }
+    pub fn parity_invariance_premise(self) -> &'static str {
+        PARITY_INVARIANCE_PREMISE
+    }
+    pub fn content_digest(self) -> Result<ContentDigest> {
+        match self {
+            Self::Full(c) => certificate_content_digest(c),
+            Self::Compact(c) => ContentDigest::sha256_finite_json(c).map_err(Into::into),
+        }
+    }
+}
+
 const SCHEMA_VERSION: u32 = 4;
 const SELECTED_INERTIA_SEMANTICS: &str = "directed_mpfr_selected_interval_inertia_guard_ladder_v1";
 const CLAIM_SCOPE: &str =
@@ -211,26 +250,69 @@ pub mod root_budget {
         request: &Request,
         token: &CancellationToken,
     ) -> Result<Report> {
+        analyze_with_certificate_ref(s, super::SectorGapCertificateRef::Full(c), request, token)
+    }
+
+    pub fn analyze_with_certificate_ref(
+        s: &RetainedState,
+        c: super::SectorGapCertificateRef<'_>,
+        request: &Request,
+        token: &CancellationToken,
+    ) -> Result<Report> {
         let p = request.precision_bits;
         if token.is_cancelled() {
             bail!("root budget cancelled");
         }
-        if s.modes > 512
-            || s.coefficients.len() != 2 * s.modes + 1
+        let dimension = super::checked_full_dimension(s.modes)?;
+        if dimension > i64::MAX as usize
+            || s.coefficients.len() != dimension
             || request.windows.is_empty()
             || request.windows.len() > 256
             || p < s.precision
-            || p < c.precision_bits
+            || p < c.precision_bits()
             || !(64..=65536).contains(&p)
         {
             bail!("root budget dimension, precision or row limit");
         }
-        if c.n_modes != s.modes
-            || c.lambda_squared != s.cutoff
-            || c.cutoff_free_tau.len() != s.coefficients.len() * s.coefficients.len()
+        if c.n_modes() != s.modes
+            || c.integer_cutoff_c().to_string() != s.cutoff
+            || matches!(c, super::SectorGapCertificateRef::Full(full)
+                if full.lambda_squared != s.cutoff
+                    || dimension.checked_mul(dimension) != Some(full.cutoff_free_tau.len()))
         {
             bail!("root budget source and matrix configuration mismatch");
         }
+        let resources = super::runtime_resources()?;
+        let _resource_scope = resources.enter();
+        let _working = crate::ccm::capture_runtime::reserve_working(u128::from(
+            root_workspace_bytes(dimension, p, request.windows.len())?,
+        ))?;
+        // Full replay is admitted here; compact reconstruction independently
+        // admits its larger assembly/LDLT workspace, or uses a live verified handle.
+        let _proof_working = match c {
+            super::SectorGapCertificateRef::Full(full) => super::reserve_certificate_workspace(
+                s.modes,
+                p.max(full.full_matrix_inertia_certificate.precision_bits)
+                    .max(
+                        full.even_ground
+                            .inertia_precision_bits
+                            .unwrap_or(full.precision_bits),
+                    )
+                    .max(
+                        full.even_first_excited
+                            .inertia_precision_bits
+                            .unwrap_or(full.precision_bits),
+                    )
+                    .max(
+                        full.odd_ground
+                            .inertia_precision_bits
+                            .unwrap_or(full.precision_bits),
+                    ),
+                full.integer_cutoff_c,
+                full.geometric_terms,
+            )?,
+            super::SectorGapCertificateRef::Compact(_) => None,
+        };
         let mut indices = std::collections::BTreeSet::new();
         for window in &request.windows {
             if window.requested_index == 0 || !indices.insert(window.requested_index) {
@@ -245,7 +327,13 @@ pub mod root_budget {
         }
         // This call verifies the numerical proof and independently reconstructs
         // the named CCM matrix, preventing self-consistent foreign certificates.
-        let eta = crate::ccm::transform_enclosure::verified_state_error(s, c, p)?;
+        let eta = match c {
+            super::SectorGapCertificateRef::Full(c) => {
+                crate::ccm::transform_enclosure::verified_state_error(s, c, p)?
+            }
+            compact => crate::ccm::transform_enclosure::verified_state_error_ref(s, compact, p)?,
+        };
+        drop(_proof_working);
         if token.is_cancelled() {
             bail!("root budget cancelled");
         }
@@ -268,7 +356,7 @@ pub mod root_budget {
         let poles: Vec<_> = (0..weights.len())
             .map(|j| spacing.mul(&I::from_i64(j as i64 - s.modes as i64, p)))
             .collect();
-        let matrix_certificate_digest = super::certificate_content_digest(c)?;
+        let matrix_certificate_digest = c.content_digest()?;
         let branch_id = format!("finite-ground:{}:{}", s.cutoff, s.modes);
         let mut rows = Vec::new();
         for window in &request.windows {
@@ -298,6 +386,9 @@ pub mod root_budget {
             let mut l2 = I::from_i64(0, p);
             let mut l4 = l2.clone();
             for pole in &poles {
+                if token.is_cancelled() {
+                    bail!("root budget cancelled");
+                }
                 let d = I::point(magnitude_floor(&interval.sub(pole)));
                 let t = I::from_i64(1, p).div(&d.square())?;
                 l2 = l2.add(&t);
@@ -364,19 +455,55 @@ pub mod root_budget {
         }
         complete_ordinals(&mut rows, s.modes, &spacing, p)?;
         let source_digest = s.manifest.content_digest.clone();
+        let semantics = match c {
+            super::SectorGapCertificateRef::Full(_) => "ccm-analytic-local-root-budget-v1",
+            super::SectorGapCertificateRef::Compact(_) => {
+                "ccm-analytic-local-root-budget-compact-v1"
+            }
+        };
         let request_digest = ContentDigest::sha256(&serde_json::to_vec(&(
-            "ccm-analytic-local-root-budget-v1",
+            semantics,
             &source_digest,
             &matrix_certificate_digest,
             request,
         ))?);
-        Ok(Report{semantics:"ccm-analytic-local-root-budget-v1".into(),request_digest,source_digest,matrix_certificate_digest,
+        Ok(Report{semantics:semantics.into(),request_digest,source_digest,matrix_certificate_digest,
             lambda_squared:s.cutoff.clone(),n_modes:s.modes,unit_state_l2_error_upper:exact(eta.upper())?,rows,
             scope:"reassembled_finite_ccm_ground_inherited_parity_premise_ordinals_only_for_complete_degree_census_with_resolved_carriers_no_continuum_claim".into()})
+    }
+
+    /// Vectors, row actions and bounded exact-scalar reports. Matrix proof
+    /// workspaces are admitted separately, so a cached handle is never charged
+    /// as a second assembly. The 8192-byte term covers the allowed 65536-bit
+    /// rational input scalars; factors include directed endpoint temporaries.
+    fn root_workspace_bytes(dimension: usize, p: u32, rows: usize) -> Result<u64> {
+        let scalar = u128::from(p).div_ceil(8) + 8192;
+        let bytes = (dimension as u128)
+            .checked_mul(scalar * 64)
+            .and_then(|v| v.checked_add((rows as u128) * scalar * 256))
+            .and_then(|v| v.checked_add(1 << 20))
+            .ok_or_else(|| anyhow::anyhow!("root budget workspace size overflow"))?;
+        u64::try_from(bytes).map_err(|_| anyhow::anyhow!("root budget workspace size overflow"))
     }
     pub fn verify(
         s: &RetainedState,
         c: &PortableCcmSectorGapCertificate,
+        request: &Request,
+        report: &Report,
+        token: &CancellationToken,
+    ) -> Result<()> {
+        verify_with_certificate_ref(
+            s,
+            super::SectorGapCertificateRef::Full(c),
+            request,
+            report,
+            token,
+        )
+    }
+
+    pub fn verify_with_certificate_ref(
+        s: &RetainedState,
+        c: super::SectorGapCertificateRef<'_>,
         request: &Request,
         report: &Report,
         token: &CancellationToken,
@@ -388,7 +515,11 @@ pub mod root_budget {
         {
             bail!("analytic root budget source, row count or ordinal scope mismatch");
         }
-        if analyze(s, c, request, token)? != *report {
+        // A verifier invocation is independent even inside a retained run.
+        let replay = super::compact::retained::freshly(|| {
+            analyze_with_certificate_ref(s, c, request, token)
+        })?;
+        if replay != *report {
             bail!("analytic root budget replay mismatch");
         }
         Ok(())
@@ -396,6 +527,36 @@ pub mod root_budget {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn larger_mode_work_is_admitted_by_resources_and_preserves_exact_kernel_order() {
+            let dimension = super::super::checked_full_dimension(513).unwrap();
+            let bytes = root_workspace_bytes(dimension, 256, 1).unwrap();
+            let resources = xc_core::RunResources::new(1 << 30).unwrap();
+            let _scope = resources.enter();
+            let working = crate::ccm::capture_runtime::reserve_working(u128::from(bytes)).unwrap();
+            let proof_bytes = super::super::certificate_workspace_bytes(513, 256, 5, 72).unwrap();
+            assert!(proof_bytes < 8 << 30);
+            assert!(resources.try_reserve_working(proof_bytes).is_err());
+            let poles = (0..dimension)
+                .map(|j| I::from_i64(j as i64 - 513, 256))
+                .collect::<Vec<_>>();
+            let mut weights = vec![I::from_i64(0, 256); dimension];
+            weights[513] = I::from_i64(1, 256);
+            let x = I::from_rational(&Rational::from((1, 2)), 256);
+            let token = CancellationToken::new();
+            let result = value(&weights, &poles, &x, false, &token).unwrap();
+            assert_eq!(result.lower(), &2);
+            assert_eq!(result.upper(), &2);
+            let derivative = value(&weights, &poles, &x, true, &token).unwrap();
+            assert_eq!(derivative.lower(), &-4);
+            assert_eq!(derivative.upper(), &-4);
+            token.cancel(xc_core::CancellationReason::UserRequested);
+            assert!(value(&weights, &poles, &x, false, &token).is_err());
+            drop(working);
+            assert_eq!(resources.usage().working_bytes, 0);
+            assert!(super::super::checked_full_dimension(usize::MAX).is_err());
+            assert!(root_workspace_bytes(usize::MAX, 65536, 256).is_err());
+        }
         fn row(index: usize, lo: &str, hi: &str) -> RootReport {
             RootReport {
                 status: RootStatus::CertifiedLocal,
@@ -529,6 +690,49 @@ fn checked_full_dimension(n_modes: usize) -> Result<usize> {
         bail!("CCM certificate requires a nonempty representable matrix");
     }
     Ok(dimension)
+}
+
+#[cfg(feature = "arb")]
+fn runtime_resources() -> Result<xc_core::RunResources> {
+    if let Some(resources) = xc_core::RunResources::current() {
+        Ok(resources)
+    } else {
+        Ok(xc_core::RunResources::new(
+            super::capture_runtime::CaptureResourcePolicy::from_environment()?
+                .maximum_working_bytes,
+        )?)
+    }
+}
+
+/// Conservative allocation allowance, not an OS RSS bound. The 48 scalar slots
+/// per full-matrix entry cover simultaneous component/canonical/parity matrices,
+/// directed LDLT copies and exact record conversion; 64 bytes per scalar include
+/// container/allocation slack. Sieve and geometric-series storage are separate.
+/// Admission changes only availability, never arithmetic or proof semantics.
+#[cfg(feature = "arb")]
+fn certificate_workspace_bytes(n: usize, p: u32, cutoff: u64, terms: usize) -> Result<u64> {
+    let d = checked_full_dimension(n)? as u128;
+    let scalar = u128::from(p).div_ceil(8) + 64;
+    let bytes = d
+        .checked_mul(d)
+        .and_then(|v| v.checked_mul(48 * scalar + 1024))
+        .and_then(|v| v.checked_add(u128::from(cutoff) * 64))
+        .and_then(|v| v.checked_add((terms as u128) * scalar * 32))
+        .and_then(|v| v.checked_add(1 << 20))
+        .ok_or_else(|| anyhow::anyhow!("sector certificate workspace size overflow"))?;
+    u64::try_from(bytes).context("sector certificate workspace size overflow")
+}
+
+#[cfg(feature = "arb")]
+fn reserve_certificate_workspace(
+    n: usize,
+    p: u32,
+    cutoff: u64,
+    terms: usize,
+) -> Result<Option<xc_core::MemoryReservation>> {
+    super::capture_runtime::reserve_working(u128::from(certificate_workspace_bytes(
+        n, p, cutoff, terms,
+    )?))
 }
 
 fn invalid_report(message: impl Into<String>) -> VerificationReport {
@@ -1231,7 +1435,7 @@ pub(super) fn verify_retained_sector_gap(
     hash.update(rug::float::exp_min().to_le_bytes());
     hash.update(rug::float::exp_max().to_le_bytes());
     hash.update(content.0.as_bytes());
-    let digest = ContentDigest(format!("{:x}", hash.finalize()));
+    let digest = ContentDigest(xc_core::hex_lower(&hash.finalize()));
     if let Some(report) = RETAINED_CHECKS.with(|cache| {
         cache
             .borrow()
@@ -1333,7 +1537,6 @@ impl Drop for AdmittedCertificate<'_> {
 pub(crate) fn certificate_content_digest(
     certificate: &PortableCcmSectorGapCertificate,
 ) -> Result<ContentDigest> {
-    use sha2::{Digest, Sha256};
     let address = std::ptr::from_ref(certificate) as usize;
     let admitted = ADMITTED_CERTIFICATES.with(|admitted| {
         admitted
@@ -1346,9 +1549,9 @@ pub(crate) fn certificate_content_digest(
     if let Some(digest) = admitted {
         return Ok(digest);
     }
-    let mut hash = Sha256::new();
-    serde_json::to_writer(&mut hash, certificate)?;
-    Ok(ContentDigest(format!("{:x}", hash.finalize())))
+    Ok(ContentDigest(xc_core::hex_lower(&xc_core::sha256_json(
+        certificate,
+    )?)))
 }
 
 fn retain_successful_check(digest: &ContentDigest, reassemble: bool, report: &VerificationReport) {

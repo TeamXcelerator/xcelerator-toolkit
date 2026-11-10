@@ -6,11 +6,12 @@ from pathlib import Path
 if not __debug__:
     raise RuntimeError("test_research_backfill.py requires Python without -O so acceptance checks execute")
 
-def local_environment():
+def local_environment(cache_root=None):
     """Keep synthetic acceptance runs independent of ambient research/cache settings."""
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("XC_RESEARCH_", "XC_CACHE_", "XC_PUBLISH_"))}
     env.update(XC_CACHE_REMOTE="none", XC_PUBLISH_TARGET="none", XC_PUBLISH_EXECUTE="false")
+    if cache_root is not None:env["XC_CACHE_ROOT"] = str(cache_root)
     return env
 
 
@@ -60,12 +61,12 @@ def main():
      plan=root/"batch.json";plan.write_bytes(enc(batch));out=root/"output"
      def run(plan=plan,out=out):
       previous=set(out.glob('summary-*.json'))
-      result=subprocess.run([str(a.binary),str(plan),str(out)],capture_output=True,text=True,env=local_environment())
+      result=subprocess.run([str(a.binary),str(plan),str(out)],capture_output=True,text=True,env=local_environment(root/"runtime-cache"))
       created=set(out.glob('summary-*.json'))-previous
       assert len(created)<=1,('multiple summaries for one attempt',created)
       result.summary=json.loads(next(iter(created)).read_text()) if created else None
       return result
-     cold=run();assert cold.returncode==0,cold.stderr
+     cold=run();assert cold.returncode==0,(cold.stderr,cold.summary)
      saved={i:(out/(i+".json")).read_bytes() for i,_ in tasks}
      warm=run();assert warm.returncode==0,warm.stderr
      assert all((out/(i+".json")).read_bytes()==b for i,b in saved.items())

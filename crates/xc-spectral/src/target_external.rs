@@ -23,6 +23,23 @@ pub struct ExternalProfileSpec {
     pub evaluation_precision_bits: u32,
     pub provider_sha256: String,
     pub input: serde_json::Value,
+    /// Schema-4 callers explicitly declare that `input` contains the complete
+    /// numerical provider input. Toolkit never strips fields from opaque input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_contract: Option<ExternalTargetValueContract>,
+    /// Attribution and preparation receipts are authenticated with the full
+    /// descriptor but are never sent to the numerical provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_provenance: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalTargetValueContract {
+    pub schema_version: u32,
+    pub value_semantics: String,
+    pub normalization: String,
+    pub numerical_input_digest: xc_cache::ContentDigest,
 }
 impl ExternalProfileSpec {
     pub(super) fn validate(&self) -> Result<()> {
@@ -39,8 +56,29 @@ impl ExternalProfileSpec {
             "invalid provider digest"
         );
         validate_exact_input(&self.input)?;
+        if let Some(contract) = &self.value_contract {
+            anyhow::ensure!(
+                contract.schema_version == 1
+                    && !contract.value_semantics.trim().is_empty()
+                    && !contract.normalization.trim().is_empty()
+                    && contract.numerical_input_digest == xc_cache::canonical_digest(&self.input)?,
+                "external numerical input does not match its explicit value contract"
+            );
+        }
         Ok(())
     }
+}
+
+/// Recheck operator authorization and exact provider bytes before a schema-4
+/// cache lookup. This opens the executable for hashing but never launches it.
+pub(super) fn admit_declared_values(spec: &ExternalProfileSpec) -> Result<()> {
+    spec.validate()?;
+    admit_input(&spec.input, super::input::target_maximum_bytes()?)?;
+    let path = std::env::var_os("XC_TARGET_PROVIDER_EXECUTABLE")
+        .context("external target requires explicit XC_TARGET_PROVIDER_EXECUTABLE authorization")?;
+    anyhow::ensure!(!path.is_empty(), "empty target provider path");
+    verified_executable(Path::new(&path), &spec.provider_sha256)?;
+    Ok(())
 }
 
 fn validate_exact_input(value: &serde_json::Value) -> Result<()> {
@@ -716,6 +754,8 @@ mod tests {
     #[test]
     fn pure_reply_keys_carry_a_digest_not_the_target_input() {
         let spec = |coefficient: &str| ExternalProfileSpec {
+            value_contract: None,
+            execution_provenance: None,
             lambda_squared: "100".into(),
             evaluation_precision_bits: 4096,
             provider_sha256: "ab".repeat(32),
@@ -838,6 +878,8 @@ mod tests {
     #[test]
     fn external_policy_rejects_invalid_cutoff_precision_and_digest() {
         let mut s = ExternalProfileSpec {
+            value_contract: None,
+            execution_provenance: None,
             lambda_squared: "4".into(),
             evaluation_precision_bits: 256,
             provider_sha256: "a".repeat(64),

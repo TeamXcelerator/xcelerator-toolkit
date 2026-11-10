@@ -431,7 +431,7 @@ fn budget_stop_before_any_measurement_is_not_retained() {
         )),
     }]);
     let policy = CachePolicy {
-        current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         minimum_quality: CacheQuality::Validated,
         accepted_schema_versions: vec![1],
         allow_deprecated: false,
@@ -531,7 +531,7 @@ fn workspace_limited_partial_report_is_not_retained() {
         )),
     }]);
     let policy = CachePolicy {
-        current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         minimum_quality: CacheQuality::Validated,
         accepted_schema_versions: vec![1],
         allow_deprecated: false,

@@ -107,6 +107,36 @@ class ReleaseAssets(unittest.TestCase):
    git('add','.');git('commit','-m','invalid script fixture')
    with self.assertRaisesRegex(ValueError,'script contains CR'):assets.repository_bytes(root)
 class ExhaustiveSchemaContracts(unittest.TestCase):
+ def test_numerical_record_schema_keeps_data_gates_and_rejects_producer_wrappers(self):
+  import copy,generate_research_schemas as schemas
+  from jsonschema import Draft202012Validator
+  kind='ccm_operator_energy_analysis'
+  with tempfile.TemporaryDirectory() as t:
+   schemas.generate(Path(t))
+   old=json.loads((Path(t)/schemas.filename(kind)).read_text())
+   current=json.loads((Path(t)/schemas.filename(kind,2)).read_text())
+  self.assertEqual(old['properties']['schema_version']['const'],1)
+  self.assertIn('request',old['required'])
+  self.assertNotIn('request',current['properties'])
+  value=dict(schema_version=2,semantics=kind+'/value-v1',kind=kind,
+   scope=current['properties']['scope']['const'],data=dict(lambda_squared='9',n_modes=1,precision_bits=128,
+    source_eigenvalue='3',coefficient_norm_squared='1',rayleigh_quotient='3',eigenvalue_defect='0',
+    relative_residual='0',residual_normalization='relative_to_abs_eigenvalue_and_coefficient_l2_norm',
+    sum_absolute_energy_terms='3',cancellation_digits=None,component_decomposition='not supplied',
+    ground_selection='not established'))
+  validator=Draft202012Validator(current)
+  validator.validate(value)
+  for field,replacement in [('request',{}),('source_dependencies',[]),('schema_version',1),
+                            ('semantics',kind+'/value-v999'),('semantics','ccm_reference_source/value-v1'),
+                            ('expected_rows',-1),('unexpected',True)]:
+   bad=copy.deepcopy(value);bad[field]=replacement
+   self.assertFalse(validator.is_valid(bad),(field,replacement))
+  for field in ['residual_normalization','rayleigh_quotient','precision_bits']:
+   bad=copy.deepcopy(value);bad['data'].pop(field)
+   self.assertFalse(validator.is_valid(bad),field)
+  bad=copy.deepcopy(value);bad['data']['relative_residual']='NaN'
+  self.assertFalse(validator.is_valid(bad))
+  value['expected_rows']=0;validator.validate(value)
  def test_current_producer_revision_is_accepted_and_future_revision_rejected(self):
   import re,generate_research_schemas as schemas
   from jsonschema import Draft202012Validator

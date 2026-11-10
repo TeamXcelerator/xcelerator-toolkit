@@ -201,7 +201,7 @@ fn f64_batch_sha256(batch: &[OperatorBatchOutcome<f64>]) -> String {
             hasher.update(value.to_bits().to_le_bytes());
         }
     }
-    format!("{:x}", hasher.finalize())
+    xc_core::hex_lower(&hasher.finalize())
 }
 
 #[cfg(test)]

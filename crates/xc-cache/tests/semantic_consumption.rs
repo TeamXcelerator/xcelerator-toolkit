@@ -151,6 +151,7 @@ fn artifact(
     };
     let transport_digest = encoding.digest().unwrap();
     let manifest = CanonicalArtifactManifest {
+        provenance: None,
         schema_version: 1,
         artifact_family: "ccm".to_owned(),
         semantic_key: semantic_key.clone(),

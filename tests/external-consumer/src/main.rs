@@ -91,7 +91,10 @@ fn verify_portable_exact_certificate() -> Result<(), Box<dyn std::error::Error>>
     let report = verify_portable_interval_inertia_certificate(&certificate);
     assert!(report.valid, "{report:?}");
     let directed = xc_certify::exact::build_portable_interval_inertia_certificate_mpfr(
-        &matrix, 2, 256, "directed_mpfr",
+        &matrix,
+        2,
+        256,
+        "directed_mpfr",
         ContentDigest::sha256(b"external exact assembly evidence"),
         BTreeMap::from([("problem".to_owned(), "positive diagonal".to_owned())]),
         vec!["finite two-dimensional claim".to_owned()],
@@ -171,7 +174,7 @@ fn current_ultra_requests_retained_research_without_changing_primary_algorithm()
             .unwrap()
             .capture_reference_projection
     );
-    assert_eq!(plan.semantics, "ccm-measurement-capture-plan-v7");
+    assert_eq!(plan.semantics, "ccm-measurement-capture-plan-v8");
     let receipt = plan.receipt().unwrap();
     assert!(receipt.outcomes().contains_key("assembly_error"));
     assert!(receipt.outcomes().contains_key("checkpoint_spectra"));

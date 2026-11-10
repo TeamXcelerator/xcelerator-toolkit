@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate shared v1 retained-research payload schemas; never edits artifact indexes."""
+"""Generate explicit v1/v2 retained-observation schemas; never edits artifact indexes."""
 import json, argparse, copy
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
@@ -449,7 +449,61 @@ def revision_contract(schema,kind):
   bound_fields=[name+'_'+side for name in core for side in ['lower','upper']]+['arithmetic_precision_bits']
   schema.setdefault('allOf',[]).append({'if':{'properties':{'semantics':enum(*RETAINED_REVISIONS[6:]),'data':{'properties':{'outcome':enum('point_measurement','rank_or_precision_unresolved')}}}},'then':{'properties':{'data':{'properties':{'values':{'required':core+bound_fields}}}}}})
 
-def filename(kind):return kind.replace('_','-')+'-v1.schema.json'
+def filename(kind, version=1):return kind.replace('_','-')+'-v'+str(version)+'.schema.json'
+
+
+def numerical_schema(kind, legacy):
+ # Value revision 1 retains the numerical contracts of the final legacy
+ # revision. Specialize its metadata-conditioned data constraints explicitly;
+ # legacy schemas themselves are emitted without modification.
+ from jsonschema import Draft202012Validator
+ request={}
+ for name, rule in legacy['properties']['request'].get('properties',{}).items():
+  if 'const' in rule:request[name]=rule['const']
+  elif 'enum' in rule:request[name]=rule['enum'][-1]
+ fixed={'schema_version':1,'semantics':RETAINED_REVISIONS[-1],
+        'source_dependencies':[],'request':request}
+ def project(node):
+  if isinstance(node,bool):return node
+  result={}
+  for key,value in node.items():
+   if key=='properties':
+    kept={}
+    for field,constraint in value.items():
+     if field in fixed:
+      if not Draft202012Validator(constraint).is_valid(fixed[field]):return False
+     else:kept[field]=copy.deepcopy(constraint)
+    if kept:result[key]=kept
+   elif key=='required':
+    kept=[field for field in value if field not in fixed]
+    if kept:result[key]=kept
+   elif key in ('allOf','anyOf','oneOf'):
+    result[key]=[project(child) for child in value]
+   elif key in ('if','then','else','not'):
+    result[key]=project(value)
+   else:result[key]=copy.deepcopy(value)
+  if 'if' in result and isinstance(result['if'],bool):
+   branch=result.pop('then',True) if result['if'] else result.pop('else',True)
+   for field in ('if','then','else'):result.pop(field,None)
+   if branch is False:return False
+   if branch is not True:result.setdefault('allOf',[]).append(branch)
+  if 'allOf' in result:
+   if any(child is False for child in result['allOf']):return False
+   result['allOf']=[child for child in result['allOf'] if child is not True]
+   if not result['allOf']:result.pop('allOf')
+  return result or True
+ data=copy.deepcopy(legacy['properties']['data'])
+ if kind=='ccm_configuration_comparison':data['properties']['outcome']['enum'].append('awaiting_cohort')
+ result={'$schema':'https://json-schema.org/draft/2020-12/schema',
+         'title':kind+' retained observation v2',
+         'description':'Retained observation payload; exact requests and ancestry are authenticated by the manifest. Shape validation is not numerical proof. Separate same-kind finite/cohort/preparation APIs retain their own data validators.',
+         **obj(dict(schema_version={'const':2},semantics={'const':kind+'/value-v1'},
+                    kind={'const':kind},scope=copy.deepcopy(legacy['properties']['scope']),data=data))}
+ result['properties']['expected_rows']=I
+ constraints=[project(clause) for clause in legacy.get('allOf',[])]
+ constraints=[clause for clause in constraints if clause is not True]
+ if constraints:result['allOf']=constraints
+ return result
 def generate(output=None):
  output=Path(output) if output else ROOT/'docs/schemas'
  output.mkdir(parents=True,exist_ok=True)
@@ -463,5 +517,6 @@ def generate(output=None):
   revision_contract(schema,kind)
   if kind=='ccm_transform_enclosure':schema['properties']['scope']={'const':'finite_retained_function_enclosures; source_scope_explicit; no_infinite_limit_claim'}
   (output/filename(kind)).write_text(json.dumps(schema,indent=2)+'\n',encoding='utf8',newline='\n')
+  (output/filename(kind,2)).write_text(json.dumps(numerical_schema(kind,schema),indent=2)+'\n',encoding='utf8',newline='\n')
 if __name__=='__main__':
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path);a=p.parse_args();generate(a.output)

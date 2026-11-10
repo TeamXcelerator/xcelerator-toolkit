@@ -193,6 +193,13 @@ mod native {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "windows",
+        expect(
+            clippy::useless_conversion,
+            reason = "C long is i32 on Windows but i64 on LP64 targets; keep the checked portable conversion"
+        )
+    )]
     fn native_bridge_and_rug_share_mpfr_thread_context() {
         // A separate MPFR copy can report the same default range. Changing
         // this test thread's range proves the bridge observes Rug's context.

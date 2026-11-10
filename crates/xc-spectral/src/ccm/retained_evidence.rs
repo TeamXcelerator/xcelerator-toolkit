@@ -131,17 +131,11 @@ fn admits(m: &ArtifactManifest, b: &[u8], allowed: &[ContentDigest], kind: &str)
     }
     Ok(())
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResearchRecord<T> {
-    pub schema_version: u32,
-    pub semantics: String,
-    pub kind: String,
-    pub scope: String,
-    pub source_dependencies: Vec<DependencyRef>,
-    pub request: Value,
-    pub data: T,
-}
+#[path = "retained_evidence/record.rs"]
+mod record;
+#[path = "retained_evidence/request.rs"]
+mod request;
+pub use record::ResearchRecord;
 pub(super) fn managed<T, F, V>(
     kind: &str,
     request: Value,
@@ -155,20 +149,75 @@ where
     F: FnOnce() -> Result<T>,
     V: Fn(&T) -> Result<()>,
 {
+    managed_annotated(
+        kind,
+        request,
+        sources,
+        cache,
+        &BTreeMap::new(),
+        compute,
+        validate,
+    )
+}
+
+pub(super) fn managed_annotated<T, F, V>(
+    kind: &str,
+    request: Value,
+    sources: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+    annotations: &BTreeMap<String, String>,
+    compute: F,
+    validate: V,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<T>>>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Result<T>,
+    V: Fn(&T) -> Result<()>,
+{
+    managed_with_input_identities(
+        kind,
+        request,
+        sources,
+        cache,
+        annotations,
+        None,
+        compute,
+        validate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn managed_with_input_identities<T, F, V>(
+    kind: &str,
+    request: Value,
+    sources: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+    annotations: &BTreeMap<String, String>,
+    numerical_inputs: Option<&[NumericalInputIdentity]>,
+    compute: F,
+    validate: V,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<T>>>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Result<T>,
+    V: Fn(&T) -> Result<()>,
+{
     with_managed_request(
         kind,
         &request,
         sources,
         cache,
+        annotations,
+        numerical_inputs,
         |req, scope, dependencies, identities| {
-            Ok(resolve_or_compute_json_artifact_with_dependencies(
+            let mut result = resolve_or_compute_json_artifact_with_dependencies(
                 req,
                 || {
                     let data = compute().map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
                     Ok((
                         ResearchRecord {
-                            schema_version: 1,
-                            semantics: SEMANTICS.into(),
+                            schema_version: 2,
+                            semantics: req.semantic_key.mathematical_semantics_version.clone(),
                             kind: kind.into(),
                             scope: scope.into(),
                             source_dependencies: identities.clone(),
@@ -179,12 +228,12 @@ where
                     ))
                 },
                 |r| {
-                    if r.schema_version != 1
-                        || r.semantics != SEMANTICS
+                    if r.schema_version != 2
+                        || r.semantics != req.semantic_key.mathematical_semantics_version
                         || r.kind != kind
                         || r.scope != scope
-                        || r.source_dependencies != identities
-                        || r.request != request
+                        || r.request.get("expected_rows").and_then(Value::as_u64)
+                            != request.get("expected_rows").and_then(Value::as_u64)
                     {
                         return Err(CacheError::InvalidManifest(
                             "retained research identity mismatch".into(),
@@ -192,7 +241,10 @@ where
                     }
                     validate(&r.data).map_err(|e| CacheError::InvalidManifest(e.to_string()))
                 },
-            )?)
+            )?;
+            result.value.source_dependencies = identities;
+            result.value.request = request.clone();
+            Ok(result)
         },
     )
 }
@@ -202,6 +254,8 @@ fn with_managed_request<R>(
     request: &Value,
     sources: &[ArtifactManifest],
     cache: &ArtifactCacheContext<'_>,
+    annotations: &BTreeMap<String, String>,
+    numerical_inputs: Option<&[NumericalInputIdentity]>,
     resolve: impl FnOnce(
         &ArtifactExecutionCacheRequest<'_>,
         &str,
@@ -225,9 +279,9 @@ fn with_managed_request<R>(
     } else {
         SCOPE
     };
-    let public = sources
-        .iter()
-        .all(|m| m.visibility == CacheVisibility::Public);
+    let mut provenance = provenance_for_numerical_inputs(kind, sources, Vec::new())?;
+    provenance.producer_annotations = annotations.clone();
+    let public = provenance.disclosure == ArtifactDisclosure::PublicInputs;
     if cache.write_visibility == CacheVisibility::Public
         && (!public || artifact_kind_is_private_only(kind))
     {
@@ -238,17 +292,25 @@ fn with_managed_request<R>(
     let dependencies = sorted_dependencies(sources.iter().map(dep).collect());
     let identities =
         sorted_dependencies(sources.iter().map(research_identity_dependency).collect());
-    let semantic = SemanticKeyEnvelope {
-        schema_version: 1,
-        artifact_kind: kind.into(),
-        mathematical_semantics_version: SEMANTICS.into(),
-        resolved_mathematical_parameters: json!({"request":request,"source_dependencies":identities,"source_parents_are_public":public}),
-        normalization: None,
-        target: Some(kind.into()),
-        subspace: None,
-        source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some(SEMANTICS.into()),
-    };
+    let contract = artifact_identity_contract(kind)?;
+    anyhow::ensure!(
+        contract.payload_codec == "retained-research-v2",
+        "kind does not use the retained research request/codec contract"
+    );
+    let inputs = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| NumericalInputIdentity {
+            role: format!("source-{index}"),
+            kind: source.key.kind.clone(),
+            meaning: "validated-typed-source-content-v1".into(),
+            content_digest: source.content_digest.clone(),
+        })
+        .collect::<Vec<_>>();
+    let semantic = numerical_request_key(
+        &request::RetainedRequest::new(contract.kind, request)?,
+        numerical_inputs.unwrap_or(&inputs),
+    )?;
     let key = ContentDigest::sha256(&serde_json::to_vec(&semantic)?);
     let logical = format!("ccm/research/{kind}/{}", key.0);
     let req = ArtifactExecutionCacheRequest {
@@ -266,72 +328,51 @@ fn with_managed_request<R>(
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
         minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
-        tags: BTreeMap::from([("assurance".into(), "computed_not_certified".into())]),
+        tags: BTreeMap::from([
+            ("assurance".into(), "computed_not_certified".into()),
+            (
+                MANIFEST_PROVENANCE_V2_TAG.into(),
+                serde_json::to_string(&provenance)?,
+            ),
+        ]),
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
     resolve(&req, scope, dependencies, identities)
 }
 
-/// Retain only the fact of complete typed admission, not a second large input.
-/// The execution core still authenticates payload bytes, manifests, policy and
-/// ancestry on every access; a run memo avoids repeating the stable codec and
-/// domain validation for an identical payload and validation context.
-pub(super) fn managed_admission<T, F, V>(
-    kind: &str,
-    request: Value,
-    sources: &[ArtifactManifest],
-    cache: &ArtifactCacheContext<'_>,
-    context: &xc_cache::ValidatedValueMemoContext,
-    compute: F,
-    validate: V,
-) -> Result<ArtifactExecutionCacheResult<xc_cache::SharedValidated<()>>>
-where
-    T: Serialize + DeserializeOwned + 'static,
-    F: FnOnce() -> Result<T>,
-    V: Fn(&T) -> Result<()>,
-{
-    with_managed_request(
-        kind,
-        &request,
-        sources,
-        cache,
-        |req, scope, dependencies, identities| {
-            Ok(xc_cache::resolve_or_compute_json_artifact_admission(
-                req,
-                context,
-                || {
-                    let data = compute().map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
-                    Ok((
-                        ResearchRecord {
-                            schema_version: 1,
-                            semantics: SEMANTICS.into(),
-                            kind: kind.into(),
-                            scope: scope.into(),
-                            source_dependencies: identities.clone(),
-                            request: request.clone(),
-                            data,
-                        },
-                        dependencies.clone(),
-                    ))
-                },
-                |r| {
-                    if r.schema_version != 1
-                        || r.semantics != SEMANTICS
-                        || r.kind != kind
-                        || r.scope != scope
-                        || r.source_dependencies != identities
-                        || r.request != request
-                    {
-                        return Err(CacheError::InvalidManifest(
-                            "retained research identity mismatch".into(),
-                        ));
-                    }
-                    validate(&r.data).map_err(|e| CacheError::InvalidManifest(e.to_string()))
-                },
-            )?)
-        },
-    )
+fn admitted_record_header<T>(record: &ResearchRecord<T>) -> bool {
+    match record.schema_version {
+        1 => [
+            SEMANTICS,
+            GUARDED_RANGE_POINT_SEMANTICS,
+            LEGACY_DEFINITION_SEMANTICS,
+            PREVIOUS_DEFINITION_SEMANTICS,
+            LATEST_DEFINITION_SEMANTICS,
+            COMPACTNESS_DEFINITION_SEMANTICS,
+            ATOM_DEFINITION_SEMANTICS,
+            CLUSTER_DEFINITION_SEMANTICS,
+            WEIGHTED_DEFINITION_SEMANTICS,
+            PROJECTION_DEFINITION_SEMANTICS,
+            SIGNED_DEFINITION_SEMANTICS,
+            ENERGY_DEFINITION_SEMANTICS,
+            DIRECTIONAL_DEFINITION_SEMANTICS,
+            ALLOWANCE_DEFINITION_SEMANTICS,
+            TRANSFORM_INTERVAL_SEMANTICS,
+            OBSERVATION_INTERVAL_SEMANTICS,
+            TRANSFER_INTERVAL_SEMANTICS,
+            SIGNED_BAND_POINT_SEMANTICS,
+            ROOT_ADAPTER_POINT_SEMANTICS,
+            TAIL_MODEL_POINT_SEMANTICS,
+            COMPLEX_TRANSFORM_INTERVAL_SEMANTICS,
+            OPERATOR_CLUSTER_INTERVAL_SEMANTICS,
+        ]
+        .contains(&record.semantics.as_str()),
+        2 => artifact_identity_contract(&record.kind).is_ok_and(|contract| {
+            record.semantics == format!("{}/value-v{}", contract.kind, contract.value_revision)
+        }),
+        _ => false,
+    }
 }
 
 /// Explicit finite Fourier reference. This is not an automatically certified
@@ -347,6 +388,19 @@ pub struct ReferenceSpec {
     pub approximation_scope: String,
 }
 impl ReferenceSpec {
+    fn numerical_spec(&self) -> Result<Self> {
+        self.validate()?;
+        let mut numerical = self.clone();
+        numerical.definition = "finite supplied centered Fourier coefficient values".into();
+        numerical.lambda_squared = canonical_decimal(&self.lambda_squared)?;
+        numerical.coefficients = self
+            .coefficients
+            .iter()
+            .map(|value| canonical_decimal(value))
+            .collect::<Result<_>>()?;
+        Ok(numerical)
+    }
+
     fn validate(&self) -> Result<()> {
         precision(self.precision_bits)?;
         if self.schema_version != 1
@@ -391,12 +445,22 @@ pub fn capture_reference(
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ReferenceData>>> {
     spec.validate()?;
-    let digest = ContentDigest::sha256(&serde_json::to_vec(spec)?);
-    managed(
+    let annotations = BTreeMap::from([
+        ("reference_definition".into(), spec.definition.clone()),
+        (
+            "supplied_reference_descriptor_digest".into(),
+            xc_cache::canonical_digest(spec)?.0,
+        ),
+    ]);
+    let numerical = spec.numerical_spec()?;
+    let spec = &numerical;
+    let digest = xc_cache::canonical_digest(spec)?;
+    managed_annotated(
         "ccm_reference_source",
         serde_json::to_value(spec)?,
         &[],
         cache,
+        &annotations,
         || {
             Ok(ReferenceData {
                 spec: spec.clone(),
@@ -437,38 +501,18 @@ impl RetainedReference {
         admits(m, b, allowed, "ccm_reference_source")?;
         let r: ResearchRecord<ReferenceData> = serde_json::from_slice(b)?;
         r.data.spec.validate()?;
-        if r.schema_version != 1
-            || ![
-                SEMANTICS,
-                GUARDED_RANGE_POINT_SEMANTICS,
-                LEGACY_DEFINITION_SEMANTICS,
-                PREVIOUS_DEFINITION_SEMANTICS,
-                LATEST_DEFINITION_SEMANTICS,
-                COMPACTNESS_DEFINITION_SEMANTICS,
-                ATOM_DEFINITION_SEMANTICS,
-                CLUSTER_DEFINITION_SEMANTICS,
-                WEIGHTED_DEFINITION_SEMANTICS,
-                PROJECTION_DEFINITION_SEMANTICS,
-                SIGNED_DEFINITION_SEMANTICS,
-                ENERGY_DEFINITION_SEMANTICS,
-                DIRECTIONAL_DEFINITION_SEMANTICS,
-                ALLOWANCE_DEFINITION_SEMANTICS,
-                TRANSFORM_INTERVAL_SEMANTICS,
-                OBSERVATION_INTERVAL_SEMANTICS,
-                TRANSFER_INTERVAL_SEMANTICS,
-                SIGNED_BAND_POINT_SEMANTICS,
-                ROOT_ADAPTER_POINT_SEMANTICS,
-                TAIL_MODEL_POINT_SEMANTICS,
-                COMPLEX_TRANSFORM_INTERVAL_SEMANTICS,
-                OPERATOR_CLUSTER_INTERVAL_SEMANTICS,
-            ]
-            .contains(&r.semantics.as_str())
+        if !admitted_record_header(&r)
             || r.kind != "ccm_reference_source"
             || r.scope != SCOPE
             || !r.source_dependencies.is_empty()
             || !m.dependencies.is_empty()
-            || r.request != serde_json::to_value(&r.data.spec)?
-            || r.data.definition_digest != ContentDigest::sha256(&serde_json::to_vec(&r.data.spec)?)
+            || (r.schema_version == 1 && r.request != serde_json::to_value(&r.data.spec)?)
+            || r.data.definition_digest
+                != if r.schema_version == 1 {
+                    ContentDigest::sha256(&serde_json::to_vec(&r.data.spec)?)
+                } else {
+                    xc_cache::canonical_digest(&r.data.spec)?
+                }
             || r.data.basis != "centered_full_V_fourier; coefficient_points; zero_extension"
             || r.data.certification != "not_certified; approximation_error_not_enclosed"
         {
@@ -498,6 +542,16 @@ pub struct DatasetSpec {
     pub points: Vec<EvaluationPoint>,
 }
 impl DatasetSpec {
+    fn numerical_spec(&self) -> Result<Self> {
+        self.validate()?;
+        let mut values = self.clone();
+        values.attribution = "admitted numerical evaluation points".into();
+        for point in &mut values.points {
+            point.value = point.value.as_deref().map(canonical_decimal).transpose()?;
+        }
+        Ok(values)
+    }
+
     fn validate(&self) -> Result<()> {
         precision(self.precision_bits)?;
         if self.schema_version != 1
@@ -538,11 +592,21 @@ pub fn capture_dataset(
     if spec.role == "retained_ccm_roots" {
         bail!("retained CCM roots require authenticated root-window input");
     }
-    managed(
+    let annotations = BTreeMap::from([
+        ("dataset_attribution".into(), spec.attribution.clone()),
+        (
+            "dataset_descriptor_digest".into(),
+            canonical_digest(spec)?.0,
+        ),
+    ]);
+    let numerical = spec.numerical_spec()?;
+    let spec = &numerical;
+    managed_annotated(
         "research_reference_dataset",
         serde_json::to_value(spec)?,
         &[],
         cache,
+        &annotations,
         || Ok(spec.clone()),
         |v| {
             v.validate()?;
@@ -571,35 +635,10 @@ impl RetainedDataset {
         admits(m, b, allowed, "research_reference_dataset")?;
         let r: ResearchRecord<DatasetSpec> = serde_json::from_slice(b)?;
         r.data.validate()?;
-        if r.schema_version != 1
-            || ![
-                SEMANTICS,
-                GUARDED_RANGE_POINT_SEMANTICS,
-                LEGACY_DEFINITION_SEMANTICS,
-                PREVIOUS_DEFINITION_SEMANTICS,
-                LATEST_DEFINITION_SEMANTICS,
-                COMPACTNESS_DEFINITION_SEMANTICS,
-                ATOM_DEFINITION_SEMANTICS,
-                CLUSTER_DEFINITION_SEMANTICS,
-                WEIGHTED_DEFINITION_SEMANTICS,
-                PROJECTION_DEFINITION_SEMANTICS,
-                SIGNED_DEFINITION_SEMANTICS,
-                ENERGY_DEFINITION_SEMANTICS,
-                DIRECTIONAL_DEFINITION_SEMANTICS,
-                ALLOWANCE_DEFINITION_SEMANTICS,
-                TRANSFORM_INTERVAL_SEMANTICS,
-                OBSERVATION_INTERVAL_SEMANTICS,
-                TRANSFER_INTERVAL_SEMANTICS,
-                SIGNED_BAND_POINT_SEMANTICS,
-                ROOT_ADAPTER_POINT_SEMANTICS,
-                TAIL_MODEL_POINT_SEMANTICS,
-                COMPLEX_TRANSFORM_INTERVAL_SEMANTICS,
-                OPERATOR_CLUSTER_INTERVAL_SEMANTICS,
-            ]
-            .contains(&r.semantics.as_str())
+        if !admitted_record_header(&r)
             || r.kind != "research_reference_dataset"
             || r.scope != SCOPE
-            || r.request != serde_json::to_value(&r.data)?
+            || (r.schema_version == 1 && r.request != serde_json::to_value(&r.data)?)
             || !r.source_dependencies.is_empty()
             || !m.dependencies.is_empty()
             || r.data.role == "retained_ccm_roots"
@@ -657,8 +696,8 @@ impl RetainedRoots {
         {
             bail!("root/state dependency closure mismatch");
         }
-        if !matches!(r["schema_version"].as_u64(), Some(3 | 5 | 6))
-            || ((r["schema_version"].as_u64() == Some(6)
+        if !matches!(r["schema_version"].as_u64(), Some(3 | 5 | 6 | 7 | 8))
+            || ((matches!(r["schema_version"].as_u64(), Some(6..=8))
                 || r.get("secular_source_content_digest").is_some())
                 && r["secular_source_content_digest"].as_str() != Some(&secular.content_digest.0))
             || !matches!(sec["schema_version"].as_u64(), Some(1 | 2))
@@ -673,7 +712,7 @@ impl RetainedRoots {
         {
             bail!("unsupported root schema or acquisition policy");
         }
-        let acquisition = json!({"source_schema":r["schema_version"],"discovery_mode":r["discovery_mode"],"reference_seeds_used":r["reference_seeds_used"],"reference_dataset":r["reference_dataset"],"root_domain":r.get("root_domain").cloned().unwrap_or(json!("positive")),"force_even":r["force_even"],"parity_policy":r["parity_policy"],"root_precision_policy":r["root_precision_policy"]});
+        let acquisition = json!({"source_schema":r["schema_version"],"discovery_mode":r["discovery_mode"],"reference_seeds_used":r["reference_seeds_used"],"root_domain":r.get("root_domain").cloned().unwrap_or(json!("positive")),"force_even":r["force_even"],"parity_policy":r["parity_policy"],"root_precision_policy":r["root_precision_policy"]});
         // Adaptive solver metadata describes work and accuracy, never storage.
         // hp::adaptive_root_outcome downrounds every numeric value to this precision.
         let root_precision = state.precision;
@@ -1006,11 +1045,13 @@ fn transforms_with_guard_limit(
     } else {
         "exact_cutoff_stored_points_directed_sinc_v1"
     };
+    let numerical_dataset = dataset.numerical_spec()?;
+    let dataset = &numerical_dataset;
     let mut sources = vec![state.manifest.clone()];
     sources.extend_from_slice(extra);
     managed(
         "ccm_indexed_transform_analysis",
-        json!({"options":o,"dataset":dataset,"formula":formula,"transform_arithmetic":arithmetic,"maximum_transform_guard_bits":maximum_guard,"curvature_output":"outward_upper_endpoint_v1"}),
+        json!({"working_precision_bits":o.working_precision_bits,"dataset":dataset,"formula":formula,"transform_arithmetic":arithmetic,"maximum_transform_guard_bits":maximum_guard,"curvature_output":"outward_upper_endpoint_v1"}),
         &sources,
         cache,
         || {
@@ -1931,6 +1972,24 @@ fn acceptance_tolerance(text: &str, p: u32) -> Result<Float> {
 mod renewed_boundary_contract {
     use super::*;
     #[test]
+    fn finite_reference_labels_are_provenance_and_values_are_material() {
+        let a = ReferenceSpec {
+            schema_version: 1,
+            definition: "provider A".into(),
+            lambda_squared: "9.0".into(),
+            precision_bits: 128,
+            approximation_scope: "finite supplied coefficients".into(),
+            coefficients: vec!["1.00".into()],
+        };
+        let mut b = a.clone();
+        b.definition = "provider B".into();
+        b.lambda_squared = "9".into();
+        b.coefficients[0] = "1".into();
+        assert_eq!(a.numerical_spec().unwrap(), b.numerical_spec().unwrap());
+        b.coefficients[0] = "2".into();
+        assert_ne!(a.numerical_spec().unwrap(), b.numerical_spec().unwrap());
+    }
+    #[test]
     fn acceptance_decimal_cannot_round_up_to_half() {
         let value = acceptance_tolerance("0.499999999999999999999999999999999999999", 64).unwrap();
         assert!(value < 0.5);
@@ -2336,7 +2395,7 @@ mod cross_store_identity {
         let run = |source: &ArtifactManifest| {
             managed(
                 "ccm_operator_energy_analysis",
-                json!({"test":"cross-store"}),
+                json!({"precision_bits":128,"formula":"finite synthetic form","residual_semantics":"cross-store-test-v1"}),
                 std::slice::from_ref(source),
                 &cache,
                 || {
@@ -2370,6 +2429,301 @@ mod cross_store_identity {
         assert_ne!(
             research_identity_dependency(&other),
             research_identity_dependency(&local)
+        );
+    }
+    #[test]
+    fn reference_provenance_changes_reuse_but_changed_coefficients_miss() {
+        let directory = xc_core::test_support::TestDir::new("reference-value-reuse");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "local",
+                directory.to_path_buf(),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let mut spec = ReferenceSpec {
+            schema_version: 1,
+            definition: "original provider receipt".into(),
+            lambda_squared: "9".into(),
+            precision_bits: 128,
+            approximation_scope: "finite supplied Fourier coefficients".into(),
+            coefficients: vec!["1".into()],
+        };
+        let cold = capture_reference(&spec, &cache).unwrap();
+        let original = cold.produced_manifest.as_ref().unwrap();
+        spec.definition = "new provider receipt".into();
+        spec.coefficients[0] = "1.000".into();
+        let warm = ArtifactCacheContext {
+            mode: ArtifactExecutionCacheMode::RequireReuse,
+            write_on_miss: false,
+            ..cache
+        };
+        let hit = capture_reference(&spec, &warm).unwrap();
+        assert_eq!(
+            hit.reused_manifest.as_ref().unwrap().content_digest,
+            original.content_digest
+        );
+        assert_eq!(
+            hit.reused_manifest.as_ref().unwrap().tags,
+            original.tags,
+            "warm reuse preserves the actual original producer"
+        );
+        assert_eq!(
+            serde_json::to_vec(&cold.value).unwrap(),
+            serde_json::to_vec(&hit.value).unwrap()
+        );
+        spec.coefficients[0] = "2".into();
+        assert!(capture_reference(&spec, &warm).is_err());
+    }
+    #[test]
+    fn compactness_reuses_with_unrelated_target_bundle_and_operational_limit_changes() {
+        let directory = xc_core::test_support::TestDir::new("compactness-consumed-inputs");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "local",
+                directory.to_path_buf(),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let bytes =
+            serde_json::to_vec(&json!({"schema_version":3,"lambda_squared":"9","n_modes":0,
+            "precision_bits":128,"force_even":true,"eigenvalue":"1","eigenvector":["1"]}))
+            .unwrap();
+        let mut manifest = parent("independent-state", "local", json!([]));
+        manifest.key =
+            ArtifactKey::new("ccm_weil_eigenpair", "independent-state", b"state").unwrap();
+        manifest.content_digest = ContentDigest::sha256(&bytes);
+        manifest.size_bytes = bytes.len() as u64;
+        manifest.objects = vec![CacheObjectRef {
+            content_digest: manifest.content_digest.clone(),
+            size_bytes: manifest.size_bytes,
+        }];
+        manifest.tags.insert(
+            MANIFEST_PROVENANCE_V2_TAG.into(),
+            serde_json::to_string(
+                &provenance_for_numerical_inputs("ccm_weil_eigenpair", &[], vec![]).unwrap(),
+            )
+            .unwrap(),
+        );
+        let state = RetainedState::from_payload(
+            &manifest,
+            &bytes,
+            std::slice::from_ref(&manifest.content_digest),
+        )
+        .unwrap();
+        let mut options = super::super::extended_research::ExtensionOptions::for_source(&state);
+        let cold = super::super::extended_research::capture_extended(
+            "compactness",
+            &state,
+            None,
+            None,
+            None,
+            &options,
+            &[],
+            &cache,
+        )
+        .unwrap();
+        let input=serde_json::from_value(json!({"schema_version":1,"source_eigenpair":manifest.content_digest,
+            "lambda_squared":"9","n_modes":0,"precision_bits":128,"convention_id":"unrelated target provider",
+            "definition_digest":ContentDigest::sha256(b"private target receipt"),"approximation_scope":"finite unrelated values"})).unwrap();
+        options.maximum_estimated_output_bytes *= 2;
+        options.maximum_working_bytes = Some(1 << 30);
+        let warm = ArtifactCacheContext {
+            mode: ArtifactExecutionCacheMode::RequireReuse,
+            write_on_miss: false,
+            ..cache
+        };
+        let hit = super::super::extended_research::capture_extended(
+            "compactness",
+            &state,
+            None,
+            None,
+            Some(&input),
+            &options,
+            &[],
+            &warm,
+        )
+        .unwrap();
+        let selected = hit.reused_manifest.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_vec(&cold.value).unwrap(),
+            serde_json::to_vec(&hit.value).unwrap()
+        );
+        assert_eq!(
+            local_artifact_disclosure(selected).unwrap(),
+            ArtifactDisclosure::PublicInputs
+        );
+        assert!(selected
+            .dependencies
+            .iter()
+            .all(|parent| parent.key.kind != "ccm_external_research_source"));
+        options.exponential_rates.push("3".into());
+        assert!(super::super::extended_research::capture_extended(
+            "compactness",
+            &state,
+            None,
+            None,
+            Some(&input),
+            &options,
+            &[],
+            &warm
+        )
+        .is_err());
+    }
+    #[test]
+    fn preflight_keys_inventory_and_preserves_selected_source_provenance() {
+        let directory = xc_core::test_support::TestDir::new("compactness-consumed-inputs");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "local",
+                directory.to_path_buf(),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let bytes =
+            serde_json::to_vec(&json!({"schema_version":3,"lambda_squared":"9","n_modes":0,
+            "precision_bits":128,"force_even":true,"eigenvalue":"1","eigenvector":["1"]}))
+            .unwrap();
+        let mut manifest = parent("independent-state", "local", json!([]));
+        manifest.key =
+            ArtifactKey::new("ccm_weil_eigenpair", "independent-state", b"state").unwrap();
+        manifest.content_digest = ContentDigest::sha256(&bytes);
+        manifest.size_bytes = bytes.len() as u64;
+        manifest.objects = vec![CacheObjectRef {
+            content_digest: manifest.content_digest.clone(),
+            size_bytes: manifest.size_bytes,
+        }];
+        manifest.tags.insert(
+            MANIFEST_PROVENANCE_V2_TAG.into(),
+            serde_json::to_string(
+                &provenance_for_numerical_inputs("ccm_weil_eigenpair", &[], vec![]).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut state = RetainedState::from_payload(
+            &manifest,
+            &bytes,
+            std::slice::from_ref(&manifest.content_digest),
+        )
+        .unwrap();
+        let mut options = super::super::extended_research::ExtensionOptions::for_source(&state);
+        let cold = super::super::extended_research::capture_extended(
+            "capture_preflight",
+            &state,
+            None,
+            None,
+            None,
+            &options,
+            &[],
+            &cache,
+        )
+        .unwrap();
+        let original = cold.produced_manifest.as_ref().unwrap();
+        state.coefficients[0] = Float::with_val(128, 2);
+        state.manifest.content_digest = ContentDigest::sha256(b"different state values");
+        state.manifest.objects[0].content_digest = state.manifest.content_digest.clone();
+        state.selection_policy = Some("different acquisition policy".into());
+        let warm = ArtifactCacheContext {
+            mode: ArtifactExecutionCacheMode::RequireReuse,
+            write_on_miss: false,
+            ..cache
+        };
+        let hit = super::super::extended_research::capture_extended(
+            "capture_preflight",
+            &state,
+            None,
+            None,
+            None,
+            &options,
+            &[],
+            &warm,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&hit.value.data).unwrap(),
+            serde_json::to_value(&cold.value.data).unwrap()
+        );
+        assert_eq!(hit.reused_manifest.as_ref().unwrap(), original);
+        options.maximum_estimated_output_bytes *= 2;
+        assert!(
+            super::super::extended_research::capture_extended(
+                "capture_preflight",
+                &state,
+                None,
+                None,
+                None,
+                &options,
+                &[],
+                &warm
+            )
+            .is_err(),
+            "reported budget changes are material"
         );
     }
 }

@@ -29,86 +29,165 @@ fn sample_native_versions() -> Result<Vec<u8>> {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedSamples {
+    values: Vec<String>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedProjection {
+    coefficients: Vec<String>,
+    approximation_scope: String,
+}
+
+/// Resolve finite samples before launching the evaluator, then resolve a Fourier
+/// projection from those samples. Neither computation consumes eigenvectors.
 pub(super) fn prepare(
     state: &RetainedState,
     spec: &crate::target::TargetProfileSpec,
     intervals: usize,
-) -> Result<(ResearchInputs, ExternalResearchInputs)> {
+    cache: &xc_cache::ArtifactCacheContext<'_>,
+) -> Result<(
+    ResearchInputs,
+    ExternalResearchInputs,
+    Vec<xc_cache::ArtifactManifest>,
+)> {
     ensure!(
         intervals >= 2 * state.modes + 2 && intervals <= 131072 && intervals.is_multiple_of(2),
         "target research sampling requires an even grid resolving the retained Fourier modes"
     );
     let _stage = super::capture_runtime::Stage::new("runtime target research samples");
     let p = state.precision.saturating_add(64);
+    spec.admit_evaluation(&state.cutoff, p)?;
     precision(p)?;
-    let store = super::capture_runtime::Checkpoints::new(&(
-        "runtime-target-samples-and-fourier-v1",
-        &state.manifest.content_digest,
-        &state.cutoff,
-        state.modes,
-        p,
-        intervals,
-        spec.digest()?,
-    ))?;
-    if let Some((reference, input)) =
-        store.load::<(ResearchInputs, ExternalResearchInputs)>("reference")?
+    let definition = ContentDigest(spec.base_value_digest()?);
+    let mut annotations = spec.producer_annotations()?;
+    let sample_result = managed_annotated(
+        "ccm_external_research_source",
+        serde_json::json!({
+            "target_preparation":"uniform-log-samples-v1", "target_value":definition,
+            "lambda_squared":state.cutoff, "precision_bits":p, "intervals":intervals
+        }),
+        &[],
+        cache,
+        &annotations,
+        || {
+            let target = crate::target::hp::TargetEvaluator::from_spec(spec, p)?;
+            let cutoff = scalar(&state.cutoff, p)?;
+            target.validate_lambda(&cutoff.clone().sqrt())?;
+            let l = cutoff.clone().ln();
+            let workers = sample_workers(spec, intervals + 1)?;
+            Ok(PreparedSamples {
+                values: sample_values(&target, spec, p, &cutoff, &l, intervals, workers)?
+                    .iter()
+                    .map(dec)
+                    .collect(),
+            })
+        },
+        |samples: &PreparedSamples| {
+            ensure!(
+                samples.values.len() == intervals + 1,
+                "target sample count mismatch"
+            );
+            for value in &samples.values {
+                scalar(value, p)?;
+            }
+            Ok(())
+        },
+    )?;
+    let mut sources = Vec::new();
+    if let Some(manifest) = sample_result
+        .reused_manifest
+        .or(sample_result.produced_manifest)
     {
-        reference.validate()?;
-        input.matches(state)?;
-        return Ok((reference, input));
+        annotations = xc_cache::manifest_producer_annotations(&manifest)?;
+        sources.push(manifest);
     }
-    let target = {
-        let _phase = super::capture_runtime::Stage::new("runtime target evaluator setup");
-        crate::target::hp::TargetEvaluator::from_spec(spec, p)?
-    };
-    let cutoff = scalar(&state.cutoff, p)?;
-    target.validate_lambda(&cutoff.clone().sqrt())?;
-    let l = cutoff.clone().ln();
-    let definition = ContentDigest(spec.digest()?);
-    let workers = sample_workers(spec, intervals + 1)?;
-    let values = sample_values(&target, spec, p, &cutoff, &l, intervals, workers)?;
-    let projection_phase = super::capture_runtime::Stage::new("runtime target Fourier projection");
-    let mut samples = Vec::with_capacity(intervals + 1);
-    let mut fine = vec![Float::with_val(p, 0); state.modes + 1];
-    let mut coarse = fine.clone();
-    for (j, value) in values.into_iter().enumerate() {
-        let angle = Float::with_val(p, Constant::Pi) * (Float::with_val(p, j) / intervals + 1u32);
-        let cosine = angle.cos();
-        let mut previous = Float::with_val(p, 1);
-        let mut current = cosine.clone();
-        let weight = if j == 0 || j == intervals { 2u32 } else { 1u32 };
-        for k in 0..=state.modes {
-            let basis = if k == 0 {
-                Float::with_val(p, 1)
-            } else {
-                current.clone()
-            };
-            let contribution = Float::with_val(p, &value) * basis / weight;
-            fine[k] += &contribution;
-            if j.is_multiple_of(2) {
-                coarse[k] += &contribution;
+    let samples = sample_result.value.data.values;
+    // Content is known from the retained sample payload; building this key never
+    // evaluates the target. The exact selected producer remains a manifest edge.
+    let projection_result = managed_annotated(
+        "ccm_external_research_source",
+        serde_json::json!({
+            "target_preparation":"even-fourier-trapezoid-v1", "samples":ContentDigest::sha256_json(&samples)?,
+            "precision_bits":p, "intervals":intervals, "n_modes":state.modes
+        }),
+        &sources,
+        cache,
+        &annotations,
+        || {
+            let values = &samples;
+            let projection_phase =
+                super::capture_runtime::Stage::new("runtime target Fourier projection");
+            let mut fine = vec![Float::with_val(p, 0); state.modes + 1];
+            let mut coarse = fine.clone();
+            for (j, value) in values.iter().enumerate() {
+                let value = scalar(value, p)?;
+                let angle =
+                    Float::with_val(p, Constant::Pi) * (Float::with_val(p, j) / intervals + 1u32);
+                let cosine = angle.cos();
+                let mut previous = Float::with_val(p, 1);
+                let mut current = cosine.clone();
+                let weight = if j == 0 || j == intervals { 2u32 } else { 1u32 };
+                for k in 0..=state.modes {
+                    let basis = if k == 0 {
+                        Float::with_val(p, 1)
+                    } else {
+                        current.clone()
+                    };
+                    let contribution = Float::with_val(p, &value) * basis / weight;
+                    fine[k] += &contribution;
+                    if j.is_multiple_of(2) {
+                        coarse[k] += &contribution;
+                    }
+                    if k > 0 {
+                        let next = Float::with_val(p, &cosine) * &current * 2u32 - &previous;
+                        previous = current;
+                        current = next;
+                    }
+                }
             }
-            if k > 0 {
-                let next = Float::with_val(p, &cosine) * &current * 2u32 - &previous;
-                previous = current;
-                current = next;
+            let mut refinement = Float::with_val(p, 0);
+            for (f, c) in fine.iter_mut().zip(&mut coarse) {
+                *f /= intervals;
+                *c /= intervals / 2;
+                refinement = refinement.max(&(Float::with_val(p, &*f) - &*c).abs());
             }
-        }
-        samples.push(dec(&value));
+            let coefficients: Vec<String> = (0..=2 * state.modes)
+                .map(|j| dec(&fine[j.abs_diff(state.modes)]))
+                .collect();
+            drop(projection_phase);
+            let scope = format!("supplied runtime target sampled on {intervals} uniform log-coordinate intervals; finite even Fourier projection through mode {}; composite trapezoid; maximum coefficient change on half grid={}; this measured refinement is not a quadrature, source-error, or infinite-tail certificate", state.modes, dec(&refinement));
+
+            Ok(PreparedProjection {
+                coefficients,
+                approximation_scope: scope,
+            })
+        },
+        |projection: &PreparedProjection| {
+            ensure!(
+                projection.coefficients.len() == 2 * state.modes + 1,
+                "target projection dimension mismatch"
+            );
+            ensure!(
+                !projection.approximation_scope.is_empty(),
+                "target projection scope missing"
+            );
+            for value in &projection.coefficients {
+                scalar(value, p)?;
+            }
+            Ok(())
+        },
+    )?;
+    if let Some(manifest) = projection_result
+        .reused_manifest
+        .or(projection_result.produced_manifest)
+    {
+        sources.push(manifest);
     }
-    let mut refinement = Float::with_val(p, 0);
-    for (f, c) in fine.iter_mut().zip(&mut coarse) {
-        *f /= intervals;
-        *c /= intervals / 2;
-        refinement = refinement.max(&(Float::with_val(p, &*f) - &*c).abs());
-    }
-    let coefficients = (0..=2 * state.modes)
-        .map(|j| dec(&fine[j.abs_diff(state.modes)]))
-        .collect();
-    drop(projection_phase);
-    let _phase =
-        super::capture_runtime::Stage::new("runtime target output validation and checkpoint");
-    let scope = format!("supplied runtime target sampled on {intervals} uniform log-coordinate intervals; finite even Fourier projection through mode {}; composite trapezoid; maximum coefficient change on half grid={}; this measured refinement is not a quadrature, source-error, or infinite-tail certificate", state.modes, dec(&refinement));
+    let coefficients = projection_result.value.data.coefficients;
+    let scope = projection_result.value.data.approximation_scope;
     let reference = ResearchInputs {
         schema_version: 1,
         reference: ReferenceSpec {
@@ -136,6 +215,7 @@ pub(super) fn prepare(
         "convention_id":"runtime-target-samples-and-fourier-v1",
         "definition_digest":definition,"approximation_scope":scope
     }))?;
+    input.producer_annotations = annotations;
     input.target = Some(SampledReference {
         definition_digest: definition,
         evaluation_policy: "configured target evaluator; uniform x=log(u) nodes; normalized at u=1"
@@ -149,10 +229,7 @@ pub(super) fn prepare(
         trial_coefficients: Some(reference.reference.coefficients.clone()),
     });
     input.validate()?;
-    if let Err(e) = store.save("reference", &(&reference, &input)) {
-        xc_core::progress_message!("target research checkpoint unavailable: {e}");
-    }
-    Ok((reference, input))
+    Ok((reference, input, sources))
 }
 
 /// Largest default number of concurrent provider processes.
@@ -266,7 +343,7 @@ fn target_values_at_impl(
         && crate::target::provider_declared_pure()?
     {
         ensure!(
-            target.definition_digest() == spec.digest()?,
+            target.base_value_digest() == spec.base_value_digest()?,
             "runtime target checkpoint source mismatch"
         );
         // Admit the coordinate key before formatting it, plus serialized and
@@ -287,7 +364,7 @@ fn target_values_at_impl(
         if let Some(reservation) = reservation {
             let store = super::capture_runtime::Checkpoints::new(&(
                 "runtime-target-point-blocks-v1",
-                spec.digest()?,
+                spec.base_value_digest()?,
                 p,
                 sample_native_versions()?,
                 (lambda.prec(), lambda.to_string()),
@@ -893,7 +970,7 @@ fn main(){
  }
 }
 "#).unwrap();
-        let executable = root.join("provider");
+        let executable = root.join(format!("provider{}", std::env::consts::EXE_SUFFIX));
         let output = Command::new("rustc")
             .arg("--edition=2021")
             .arg(&source)
@@ -971,7 +1048,7 @@ fn main(){
     #[test]
     fn supplied_target_preparation_preserves_identity_and_does_not_invent_tail_inputs() {
         use crate::target::{GaussianPolynomialSeriesSpec, ScalarScaleSpec, TargetProfileSpec};
-        let spec = TargetProfileSpec {
+        let mut spec = TargetProfileSpec {
             schema_version: 1,
             profile_id: "research-sample-fixture".into(),
             external_profile: None,
@@ -996,7 +1073,7 @@ fn main(){
             "maximum_reader_version":null,"quality":"validated","visibility":"private",
             "immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
         })).unwrap();
-        let state = RetainedState {
+        let mut state = RetainedState {
             manifest,
             cutoff: "9".into(),
             modes: 2,
@@ -1005,13 +1082,23 @@ fn main(){
             eigenvalue: "1".into(),
             selection_policy: None,
         };
-        let (reference, input) = prepare(&state, &spec, 256).unwrap();
+        let directory = xc_core::test_support::TestDir::new("target-values-reuse");
+        let mut config = xc_cache::ManagedArtifactCacheConfig::from_environment()
+            .unwrap()
+            .unwrap();
+        config.cache_root = directory.to_path_buf();
+        config.publication_target = xc_core::PublicationTarget::None;
+        config.execute_remote_mutations = false;
+        config.remote_cache_mode = xc_cache::ManagedRemoteCacheMode::None;
+        let session = xc_cache::ManagedArtifactCacheSession::new(config).unwrap();
+        let cache = session.context();
+        let (reference, input, cold_sources) = prepare(&state, &spec, 256, &cache).unwrap();
         eprintln!(
             "target preparation fixture digest: {}",
             ContentDigest::sha256_json(&(&reference, &input)).unwrap().0
         );
         assert_eq!(input.source_eigenpair, state.manifest.content_digest);
-        assert_eq!(input.definition_digest.0, spec.digest().unwrap());
+        assert_eq!(input.definition_digest.0, spec.base_value_digest().unwrap());
         assert_eq!(reference.reference.coefficients.len(), 2 * state.modes + 1);
         assert_eq!(input.target.as_ref().unwrap().values.len(), 257);
         assert_eq!(
@@ -1025,6 +1112,48 @@ fn main(){
             .reference
             .approximation_scope
             .contains("not a quadrature"));
-        assert!(prepare(&state, &spec, 255).is_err());
+        assert_eq!(cold_sources.len(), 2);
+        assert_eq!(cold_sources[1].dependencies.len(), 1);
+        assert_eq!(
+            cold_sources[1].dependencies[0].content_digest,
+            cold_sources[0].content_digest
+        );
+        let warm = xc_cache::ArtifactCacheContext {
+            mode: xc_cache::ArtifactExecutionCacheMode::RequireReuse,
+            write_on_miss: false,
+            ..cache
+        };
+        spec.profile_id = "new-producer-label".into();
+        state.manifest.content_digest = ContentDigest::sha256(b"different eigenvector source");
+        state.manifest.objects[0].content_digest = state.manifest.content_digest.clone();
+        state.coefficients[0] = Float::with_val(128, 2);
+        let (again, rebound, warm_sources) = prepare(&state, &spec, 256, &warm).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&reference).unwrap()
+        );
+        assert_eq!(rebound.target, input.target);
+        assert_eq!(rebound.source_eigenpair, state.manifest.content_digest);
+        assert_eq!(rebound.producer_annotations, input.producer_annotations);
+        assert_eq!(
+            warm_sources, cold_sources,
+            "reuse must preserve the actual producer receipts"
+        );
+        assert!(warm_sources
+            .iter()
+            .all(|m| xc_cache::local_artifact_disclosure(m).unwrap()
+                == xc_cache::ArtifactDisclosure::PrivateOnly));
+        state.modes = 3;
+        assert!(
+            prepare(&state, &spec, 256, &warm).is_err(),
+            "new projection coverage must miss"
+        );
+        state.modes = 2;
+        state.precision += 32;
+        assert!(
+            prepare(&state, &spec, 256, &warm).is_err(),
+            "new sample precision must miss"
+        );
+        assert!(prepare(&state, &spec, 255, &warm).is_err());
     }
 }

@@ -41,6 +41,13 @@ pub mod capture_run;
 /// Rebuild response scalars from authenticated retained states and tangents.
 pub mod response_repair;
 
+/// Exact, source-bound movable-root counts in the open stored pole span.
+pub mod finite_window_census;
+
+/// Refine roots of an authenticated retained point source without repeating
+/// matrix assembly or the original state-selection proof.
+pub mod retained_root_recovery;
+
 mod complete_discovery;
 mod eigenstate_accuracy;
 #[cfg(test)]
@@ -63,6 +70,7 @@ mod evenness;
 mod matrix_point_math;
 mod parity_math;
 mod prime_response_kernel;
+mod response_checkpoints;
 mod response_performance;
 #[cfg(test)]
 mod response_performance_reference;
@@ -102,7 +110,9 @@ mod state_residual_bounds;
 mod symmetry_math;
 mod u_flow_math;
 mod verified_discovery;
-use response_performance::{FreshResponseSeal, PreparedRootResponses, ResponseProgress};
+use response_performance::{
+    FreshResponseSeal, LazyUFlowRootResponses, PreparedRootResponses, ResponseProgress,
+};
 
 // Conservative crossovers from the ignored release-mode benchmark below.
 // Decimal conversion becomes worthwhile at fewer entries as MPFR precision
@@ -2553,6 +2563,15 @@ impl CcmDistanceCaptureOptions {
     }
 }
 
+/// Explicit storage representation for a separately requested analytic proof.
+/// This setting never requests certification by itself.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CcmSectorGapCertificateFormat {
+    #[default]
+    Full,
+    Compact(super::sector_gap_certificate::compact::ReconstructionSourceIdentity),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CcmResearchCaptureOptions {
     pub capture_evenness: bool,
@@ -2562,6 +2581,7 @@ pub struct CcmResearchCaptureOptions {
     /// interval computation and is deliberately not implied by `maximum`.
     pub sector_gap_certification:
         Option<super::sector_gap_certificate::CcmSectorGapCertificationOptions>,
+    pub sector_gap_certificate_format: CcmSectorGapCertificateFormat,
     /// Optional root-only interval certification. This certifies the exact
     /// retained finite secular point source; it does not request the much
     /// more expensive interval reconstruction of Tau.
@@ -2605,6 +2625,7 @@ impl CcmResearchCaptureOptions {
                 requested_sector_eigenpairs,
             )),
             sector_gap_certification: None,
+            sector_gap_certificate_format: CcmSectorGapCertificateFormat::Full,
             root_certification: None,
             distance_capture: Some(
                 CcmDistanceCaptureOptions::default_convention(4_000, 1_000)
@@ -2638,6 +2659,19 @@ impl CcmResearchCaptureOptions {
         options: super::sector_gap_certificate::CcmSectorGapCertificationOptions,
     ) -> Self {
         self.sector_gap_certification = Some(options);
+        self.sector_gap_certificate_format = CcmSectorGapCertificateFormat::Full;
+        self
+    }
+
+    /// Request the compact analytic replay certificate. Its real compact
+    /// payload/manifest is retained; no legacy full certificate is published.
+    pub fn with_compact_sector_gap_certification(
+        mut self,
+        options: super::sector_gap_certificate::CcmSectorGapCertificationOptions,
+        source: super::sector_gap_certificate::compact::ReconstructionSourceIdentity,
+    ) -> Self {
+        self.sector_gap_certification = Some(options);
+        self.sector_gap_certificate_format = CcmSectorGapCertificateFormat::Compact(source);
         self
     }
 
@@ -2689,6 +2723,8 @@ pub struct CcmResearchCaptureResult {
     /// certification opt-in succeeds.
     pub sector_gap_certificate:
         Option<super::sector_gap_certificate::PortableCcmSectorGapCertificate>,
+    pub compact_sector_gap_certificate:
+        Option<super::sector_gap_certificate::compact::CompactCcmSectorGapCertificate>,
     /// Why requested sector-gap certification produced no certificate. The
     /// computed sector gap and every other measurement are still returned.
     pub sector_gap_certification_limitation: Option<String>,
@@ -5596,6 +5632,10 @@ fn compute_sector_spectrum(
 // producer from the authenticated transform allowance and exact parent sources.
 // The standalone producer retains the full proof and per-vector guide route as
 // an independent arithmetic reference. No caller-provided allowance is accepted.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "authenticated matrix, reduction, transform, bounds, and precision stay explicit at this private boundary"
+)]
 fn compute_sector_spectrum_with_bounds(
     matrix: &[Float],
     dimension: usize,
@@ -6571,6 +6611,55 @@ fn certify_sector_gap_from_resolution(
     bail!("CCM sector-gap certification requires an xc-spectral build with the arb feature")
 }
 
+fn certify_compact_sector_gap_from_resolution(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    options: super::sector_gap_certificate::CcmSectorGapCertificationOptions,
+    resolution: &CcmSectorGapResolution,
+    source: super::sector_gap_certificate::compact::ReconstructionSourceIdentity,
+    cache: Option<&ArtifactCacheContext<'_>>,
+) -> Result<
+    xc_cache::ArtifactExecutionCacheResult<
+        super::sector_gap_certificate::compact::CompactCcmSectorGapCertificate,
+    >,
+> {
+    #[cfg(feature = "arb")]
+    {
+        let cache =
+            cache.context("compact sector-gap certification requires a managed cache context")?;
+        let even = resolution
+            .even_manifest
+            .as_ref()
+            .context("compact certification missing even guide manifest")?;
+        let odd = resolution
+            .odd_manifest
+            .as_ref()
+            .context("compact certification missing odd guide manifest")?;
+        let gap = resolution
+            .gap_manifest
+            .as_ref()
+            .context("compact certification missing gap guide manifest")?;
+        super::sector_gap_certificate::compact::cache::resolve_or_compute(
+            params,
+            cfg.precision_bits,
+            &resolution.gap.even.eigenpairs[0].eigenvalue,
+            &resolution.gap.even.eigenpairs[1].eigenvalue,
+            &resolution.gap.odd.eigenpairs[0].eigenvalue,
+            even,
+            odd,
+            gap,
+            options,
+            source,
+            cache,
+        )
+    }
+    #[cfg(not(feature = "arb"))]
+    {
+        let _ = (params, cfg, options, resolution, source, cache);
+        bail!("compact sector-gap certification requires an xc-spectral build with the arb feature")
+    }
+}
+
 fn analyze_sector_gap_from_retained_source(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -7020,11 +7109,8 @@ fn validate_identical_payload_once<P: Serialize, T>(
     payload: &P,
     validate: impl FnOnce() -> std::result::Result<T, CacheError>,
 ) -> std::result::Result<(), CacheError> {
-    use sha2::{Digest, Sha256};
     // Streaming avoids a second matrix-sized JSON buffer for retained LU.
-    let mut hasher = Sha256::new();
-    serde_json::to_writer(&mut hasher, payload)?;
-    let digest = ContentDigest(format!("{:x}", hasher.finalize()));
+    let digest = ContentDigest(xc_core::hex_lower(&xc_core::sha256_json(payload)?));
     if slot
         .borrow()
         .as_ref()
@@ -7091,7 +7177,7 @@ fn hp_values_memo_identity(values: &[Float]) -> String {
     for digest in chunk_digests {
         hasher.update(digest);
     }
-    format!("{:x}", hasher.finalize())
+    xc_core::hex_lower(&hasher.finalize())
 }
 
 #[cfg(test)]
@@ -7753,6 +7839,108 @@ mod validation_capacity_repair {
         assert!(!Rc::ptr_eq(&first, &third));
         assert_eq!(retained.borrow().len(), 2);
     }
+    #[test]
+    #[ignore = "requires an admitted CUDA device and XC_DENSE_BACKEND=cuda; run alone"]
+    fn cuda_factorization_cold_warm_cache_matches_cpu() {
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
+            FilesystemCacheStore,
+        };
+        assert_eq!(std::env::var("XC_DENSE_BACKEND").as_deref(), Ok("cuda"));
+        let p = 128;
+        let params = CcmParams::from_lambda_sq_integer(5, 8);
+        let mut cfg = HighPrecConfig::for_decimal_digits(30);
+        cfg.precision_bits = p;
+        let n = 9;
+        let matrix = (0..n * n)
+            .map(|index| {
+                let (row, col) = (index / n, index % n);
+                if row == col {
+                    Float::with_val(p, 4)
+                } else {
+                    Float::with_val(p, (row + col + 1) as u32) / 128
+                }
+            })
+            .collect::<Vec<_>>();
+        let source = conditioning_test_manifest("ccm_even_sector_matrix", "retained-lu-source");
+        let directory = xc_core::test_support::TestDir::new("runtime-lu-reuse");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "workstation",
+                directory.to_path_buf(),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let context = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["workstation".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let expected = xc_numerics::linalg::lu_factor_blocked(
+            &matrix,
+            n,
+            xc_numerics::linalg::DenseLuOptions {
+                backend: xc_numerics::modular_product::ProductBackend::Cpu,
+                max_workspace_bytes: 1 << 30,
+                tile_edge: 4,
+                workers: 2,
+            },
+        )
+        .unwrap();
+        let (cold, original) = resolve_factorization_via_cache(
+            &params,
+            &cfg,
+            &matrix,
+            &source,
+            "even",
+            &context,
+            &RuntimeLuFactors::default(),
+        )
+        .unwrap();
+        assert_eq!(cold.perm, expected.perm);
+        assert_eq!(cold.lu, expected.lu);
+        assert!(original
+            .tags
+            .contains_key(xc_cache::MANIFEST_PROVENANCE_V2_TAG));
+        let warm_context = ArtifactCacheContext {
+            mode: ArtifactExecutionCacheMode::RequireReuse,
+            write_on_miss: false,
+            ..context
+        };
+        // A fresh runtime memo forces persistent cache lookup; RequireReuse
+        // fails rather than silently recomputing a missing factorization.
+        let (warm, selected) = resolve_factorization_via_cache(
+            &params,
+            &cfg,
+            &matrix,
+            &source,
+            "even",
+            &warm_context,
+            &RuntimeLuFactors::default(),
+        )
+        .unwrap();
+        assert_eq!(warm.lu, cold.lu);
+        assert_eq!(warm.perm, cold.perm);
+        assert_eq!(selected, original);
+    }
 }
 
 fn factorization_cache_identity(
@@ -8261,7 +8449,7 @@ pub(crate) fn resolve_canonical_even_eigenstate_via_cache(
     })
 }
 
-const MANAGED_EIGENSTATE_SOURCE_IDENTITY: &str = "validated_tau_dependency_and_exact_log_source_v2";
+const MANAGED_EIGENSTATE_SOURCE_IDENTITY: &str = "validated_tau_values_and_exact_log_source_v3";
 
 fn validate_managed_source_length(
     params: &CcmParams,
@@ -8329,11 +8517,9 @@ fn weil_eigenpair_cache_identity(
     };
     resolved_mathematical_parameters["source_identity_arithmetic"] =
         serde_json::json!(MANAGED_EIGENSTATE_SOURCE_IDENTITY);
-    resolved_mathematical_parameters["tau_source_identity"] = serde_json::json!(DependencyRef {
-        key: tau_manifest.key.clone(),
-        content_digest: tau_manifest.content_digest.clone(),
-        required_quality: CacheQuality::Validated,
-    });
+    resolved_mathematical_parameters["tau_source_identity"] = serde_json::json!(
+        xc_cache::numerical_source_identity(tau_manifest, "tau", "stored-tau-matrix-v1")
+    );
     resolved_mathematical_parameters["l2_normalization_arithmetic"] =
         serde_json::json!(xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2);
     if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov {
@@ -10370,7 +10556,12 @@ fn decode_root_range(
 ) -> std::result::Result<Vec<EigenvalueResult>, CacheError> {
     let parity_policy = cfg.effective_parity_policy();
     let adaptive_precision = cfg.root_precision_policy == RootPrecisionPolicy::Adaptive;
-    let expected_schema = if adaptive_precision { 5 } else { 6 };
+    let expected_schema = match (reference_dataset.is_some(), adaptive_precision) {
+        (true, true) => 7,
+        (true, false) => 8,
+        (false, true) => 5,
+        (false, false) => 6,
+    };
     let expected_target_bits = cfg.precision_bits.saturating_sub(GUARD_BITS).max(1);
     let expected_seeds: Vec<String> = seeds.iter().map(Float::to_string).collect();
     if artifact.schema_version != expected_schema
@@ -10384,7 +10575,7 @@ fn decode_root_range(
         || artifact.discovery_mode != artifact_mode.as_str()
         || artifact.reference_seeds_used
             != (artifact_mode == RootArtifactMode::ReferenceSeededRefinement)
-        || artifact.reference_dataset.as_ref() != reference_dataset
+        || artifact.reference_dataset.is_some()
         || artifact.completeness != semantics.completeness(artifact_mode)
         || artifact.starting_points != expected_seeds
         || artifact.outcomes.len() != seeds.len()
@@ -10531,14 +10722,11 @@ fn root_range_semantic_key(
             serde_json::json!(FIXED_CORRECTION_GUARDS);
     }
     add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
-    if let Some(dataset) = reference_dataset {
-        resolved_parameters
-            .as_object_mut()
-            .expect("CCM root semantic parameters are an object")
-            .insert(
-                "reference_dataset".to_owned(),
-                serde_json::to_value(dataset)?,
-            );
+    if reference_dataset.is_some() {
+        // Full-table attribution is provenance; only the supplied seed window
+        // above is consumed by refinement. Unused table rows cannot change it.
+        resolved_parameters["seed_value_identity"] =
+            serde_json::json!("ordered-consumed-points-v1");
     }
     if semantics.is_advanced() {
         let parameters = resolved_parameters
@@ -10577,14 +10765,7 @@ fn root_range_semantic_key(
         serde_json::json!(xc_root::ROOT_POINT_REFINEMENT_SEMANTICS);
     resolved_parameters["generic_discovery_semantics"] =
         serde_json::json!(xc_root::ROOT_DISCOVERY_SEMANTICS);
-    let mut source_data_identities = reference_dataset
-        .map(|dataset| {
-            BTreeMap::from([(
-                "reference_zero_dataset".to_owned(),
-                ContentDigest(dataset.content_sha256.clone()),
-            )])
-        })
-        .unwrap_or_default();
+    let mut source_data_identities = BTreeMap::new();
     source_data_identities.insert(
         "ccm_secular_source".to_owned(),
         secular_source_digest.clone(),
@@ -10859,6 +11040,32 @@ fn resolve_root_range_via_cache(
         artifact_mode,
         semantics,
     );
+    let mut tags = BTreeMap::from([
+        ("domain".to_owned(), "ccm".to_owned()),
+        (
+            "artifact".to_owned(),
+            match artifact_mode {
+                RootArtifactMode::Independent => "root_discovery_window",
+                RootArtifactMode::ReferenceSeededRefinement => "root_refinement",
+            }
+            .to_owned(),
+        ),
+    ]);
+    if let Some(dataset) = reference_dataset {
+        let mut provenance = xc_cache::provenance_for_numerical_inputs(
+            &semantic_key.artifact_kind,
+            std::slice::from_ref(secular_manifest),
+            vec![],
+        )?;
+        provenance.producer_annotations.insert(
+            "reference_zero_dataset".into(),
+            serde_json::to_string(dataset)?,
+        );
+        tags.insert(
+            xc_cache::MANIFEST_PROVENANCE_V2_TAG.into(),
+            serde_json::to_string(&provenance)?,
+        );
+    }
     let request = ArtifactExecutionCacheRequest {
         operation: match artifact_mode {
             RootArtifactMode::Independent => "ccm.root_discovery.resolve_or_compute",
@@ -10877,17 +11084,7 @@ fn resolve_root_range_via_cache(
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
         minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
-        tags: BTreeMap::from([
-            ("domain".to_owned(), "ccm".to_owned()),
-            (
-                "artifact".to_owned(),
-                match artifact_mode {
-                    RootArtifactMode::Independent => "root_discovery_window",
-                    RootArtifactMode::ReferenceSeededRefinement => "root_refinement",
-                }
-                .to_owned(),
-            ),
-        ]),
+        tags,
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
@@ -10935,10 +11132,14 @@ fn resolve_root_range_via_cache(
             let dependencies = canonical_dependency_refs(vec![secular_manifest.clone()]);
             Ok((
                 PortableRootRange {
-                    schema_version: if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
-                        5
-                    } else {
-                        6
+                    schema_version: match (
+                        reference_dataset.is_some(),
+                        cfg.root_precision_policy == RootPrecisionPolicy::Adaptive,
+                    ) {
+                        (true, true) => 7,
+                        (true, false) => 8,
+                        (false, true) => 5,
+                        (false, false) => 6,
                     },
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
@@ -10950,7 +11151,7 @@ fn resolve_root_range_via_cache(
                     discovery_mode: artifact_mode.as_str().to_owned(),
                     reference_seeds_used: artifact_mode
                         == RootArtifactMode::ReferenceSeededRefinement,
-                    reference_dataset: reference_dataset.cloned(),
+                    reference_dataset: None,
                     completeness: semantics.completeness(artifact_mode).to_owned(),
                     starting_points: seeds.iter().map(Float::to_string).collect(),
                     outcomes,
@@ -12604,6 +12805,7 @@ fn compute_prime_power_response_analysis(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn compute_prime_power_response_analysis_with_memo(
     params: &CcmParams,
@@ -12639,6 +12841,7 @@ fn compute_prime_power_response_analysis_with_memo(
         spectral_preparation,
         bordered_memo,
         PrimeResponseActionPolicy::Configured,
+        None,
     )
 }
 
@@ -12672,6 +12875,7 @@ fn compute_prime_power_response_analysis_with_policy(
     spectral_preparation: &ResponseSpectralPreparation,
     bordered_memo: Option<&BorderedResponseMemo>,
     action_policy: PrimeResponseActionPolicy,
+    checkpoints: Option<&crate::ccm::capture_runtime::Checkpoints>,
 ) -> Result<PortablePrimePowerResponseAnalysis> {
     use response_performance::{ResponsePhase as Phase, ResponsePhaseTimings};
     let precision_bits = cfg.precision_bits;
@@ -12745,7 +12949,29 @@ fn compute_prime_power_response_analysis_with_policy(
         response_point_math::BorderedResidualSource::new(tau, state_eigenvalue, precision_bits);
     let resources = xc_core::RunResources::current();
     let mut events = Vec::with_capacity(prime_content.len());
-    for chunk in prime_content.chunks(batch_size) {
+    // Resume only the contiguous completed prefix. Later events still run in
+    // canonical order; an interrupted/refused event is never recorded as done.
+    if let Some(store) = checkpoints {
+        for &expected in &prime_content {
+            let edge = cutoff_equals_event_power(&lambda_identity, expected.0)?;
+            let Some(event) =
+                response_checkpoints::load(store, expected, edge, dimension, roots, precision_bits)
+            else {
+                break;
+            };
+            events.push(event);
+            progress.completed();
+        }
+        if !events.is_empty() {
+            xc_core::progress_message!(
+                "[HP] prime-power response: reused {}/{} privately completed events",
+                events.len(),
+                prime_content.len()
+            );
+        }
+    }
+    let first_pending = events.len();
+    for chunk in prime_content[first_pending..].chunks(batch_size) {
         let _scope = resources.as_ref().map(xc_core::RunResources::enter);
         if strict_cuda {
             residual_source.clear_prepared();
@@ -12954,7 +13180,12 @@ fn compute_prime_power_response_analysis_with_policy(
                     root_velocity_responses,
                 })
             })?;
+            if let Some(store) = checkpoints {
+                response_checkpoints::save(store, &event, precision_bits);
+            }
             events.push(event);
+            #[cfg(test)]
+            response_checkpoints::event_completed()?;
             if progress.completed() {
                 timings.report();
             }
@@ -13385,7 +13616,12 @@ fn resolve_prime_power_response_analysis_via_cache_with_memo(
         &request,
         || {
             let _stage = crate::ccm::capture_runtime::Stage::new("prime-power response solves");
-            let artifact = compute_prime_power_response_analysis_with_memo(
+            let checkpoints = response_checkpoints::allowed(cache.mode, cache.requested_assurance)
+                .then(|| {
+                    response_checkpoints::configured(&semantic_key, cfg, l, state_eigenvalue, xi)
+                })
+                .flatten();
+            let artifact = compute_prime_power_response_analysis_with_policy(
                 params,
                 cfg,
                 l,
@@ -13401,6 +13637,8 @@ fn resolve_prime_power_response_analysis_via_cache_with_memo(
                 &selection_digest,
                 &spectral_preparation.numerical,
                 bordered_memo,
+                PrimeResponseActionPolicy::Configured,
+                checkpoints.as_ref(),
             )
             .map_err(|error| CacheError::InvalidManifest(format!("{error:#}")))?;
             // Explicit verification modes retain independent numerical replay.
@@ -13425,7 +13663,7 @@ fn resolve_prime_power_response_analysis_via_cache_with_memo(
         |artifact| {
             if fresh.verify_fresh(artifact)? {
                 xc_core::progress_message!(
-                    "[HP] response validation: exact fresh payload seal verified; production numerical gates already passed"
+                    "[HP] response validation: exact producer payload seal verified; numerical gates passed in fresh computation or bound private execution checkpoints"
                 );
                 return Ok(());
             }
@@ -13516,6 +13754,7 @@ fn compute_u_flow_response_channel(
         bordered_solver,
         shifted_frobenius_norm,
         precision_bits,
+        None,
     )
 }
 
@@ -13533,6 +13772,7 @@ fn compute_u_flow_response_channel_with_residual_source(
     bordered_solver: &EvenSectorBorderedResponseSolver,
     shifted_frobenius_norm: &Float,
     precision_bits: u32,
+    prepared_roots: Option<&LazyUFlowRootResponses<'_>>,
 ) -> Result<(PortableUFlowResponseChannel, Vec<Float>)> {
     let dimension = unit_state.len();
     if action.len() != dimension {
@@ -13554,33 +13794,42 @@ fn compute_u_flow_response_channel_with_residual_source(
         unit_state_sum,
         precision_bits,
     )?;
-    let fixed_pole_root_velocity_responses = roots
-        .iter()
-        .map(|outcome| {
-            outcome
-                .value()
-                .map(|root| {
-                    prime_power_root_velocity_response(
-                        unit_state,
-                        &eigenvector_response,
-                        poles,
-                        root,
-                        precision_bits,
-                    )
-                    .map(|response| lossless_hp_decimal(&response))
-                })
-                .transpose()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let relative_residual = residual_source
-        .evaluate(
+    let fixed_pole_root_velocity_responses = if let Some(prepared) = prepared_roots {
+        prepared.values(&eigenvector_response, None)?
+    } else {
+        roots
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .value()
+                    .map(|root| {
+                        prime_power_root_velocity_response(
+                            unit_state,
+                            &eigenvector_response,
+                            poles,
+                            root,
+                            precision_bits,
+                        )
+                        .map(|response| lossless_hp_decimal(&response))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut evaluate_residual = || {
+        residual_source.evaluate(
             unit_state,
             &projected_forcing,
             &eigenvector_response,
             &lagrange_multiplier,
             shifted_frobenius_norm,
         )
-        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+    };
+    let relative_residual = match prepared_roots {
+        Some(prepared) => prepared.with_workspace(evaluate_residual),
+        None => evaluate_residual(),
+    }
+    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
     if !weil_eigvec_cache::residual_within_precision_floor(&relative_residual, precision_bits) {
         bail!("CCM u-flow channel {channel} failed its precision-scaled bordered residual gate");
     }
@@ -13694,6 +13943,7 @@ fn compute_u_flow_response_analysis_with_memo(
         shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits)?;
     let (poles, pole_velocities) =
         ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits)?;
+    let prepared_roots = LazyUFlowRootResponses::new(&unit_state, &poles, roots, precision_bits);
     let zero_target_velocity = Float::with_val(precision_bits, 0);
     let action_slices = [
         velocity_actions.tau_pole.as_slice(),
@@ -13712,20 +13962,23 @@ fn compute_u_flow_response_analysis_with_memo(
             &zero_target_velocity
         };
         let evaluate = |source: &mut response_point_math::BorderedResidualSource<'_>| {
-            compute_u_flow_response_channel_with_residual_source(
-                channel,
-                action,
-                target_velocity,
-                source,
-                &unit_state,
-                &unit_state_sum,
-                &ccm_scale,
-                roots,
-                &poles,
-                &bordered_solver,
-                &shifted_frobenius_norm,
-                precision_bits,
-            )
+            prepared_roots.with_workspace(|| {
+                compute_u_flow_response_channel_with_residual_source(
+                    channel,
+                    action,
+                    target_velocity,
+                    source,
+                    &unit_state,
+                    &unit_state_sum,
+                    &ccm_scale,
+                    roots,
+                    &poles,
+                    &bordered_solver,
+                    &shifted_frobenius_norm,
+                    precision_bits,
+                    Some(&prepared_roots),
+                )
+            })
         };
         let (portable, l2_vector_response) =
             response_cpu_with_eviction(&mut residual_source, || false, evaluate)
@@ -13739,44 +13992,10 @@ fn compute_u_flow_response_analysis_with_memo(
     let total_l2_vector_response = total_l2_vector_response
         .ok_or_else(|| anyhow::anyhow!("CCM u-flow total response channel is missing"))?;
     let zero_xi_velocity = vec![Float::with_val(precision_bits, 0); dimension];
-    let secular_pole_motion_root_velocity_responses = roots
-        .iter()
-        .map(|outcome| {
-            outcome
-                .value()
-                .map(|root| {
-                    secular_root_velocity_response(
-                        &unit_state,
-                        &zero_xi_velocity,
-                        &poles,
-                        &pole_velocities,
-                        root,
-                        precision_bits,
-                    )
-                    .map(|response| lossless_hp_decimal(&response))
-                })
-                .transpose()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let total_moving_pole_root_velocity_responses = roots
-        .iter()
-        .map(|outcome| {
-            outcome
-                .value()
-                .map(|root| {
-                    secular_root_velocity_response(
-                        &unit_state,
-                        &total_l2_vector_response,
-                        &poles,
-                        &pole_velocities,
-                        root,
-                        precision_bits,
-                    )
-                    .map(|response| lossless_hp_decimal(&response))
-                })
-                .transpose()
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let secular_pole_motion_root_velocity_responses =
+        prepared_roots.values(&zero_xi_velocity, Some(&pole_velocities))?;
+    let total_moving_pole_root_velocity_responses =
+        prepared_roots.values(&total_l2_vector_response, Some(&pole_velocities))?;
 
     let parity_policy = cfg.effective_parity_policy();
     Ok(PortableUFlowResponseAnalysis {
@@ -14989,27 +15208,41 @@ fn run_with_research_capture(
         }
         // Certification is additive: a certification that cannot complete is
         // recorded with its reason and never discards the computed capture.
-        let (sector_gap_certificate, sector_gap_certification_limitation) = match (
-            options.sector_gap_certification,
-            sector_resolution.as_ref(),
-        ) {
+        let (
+            sector_gap_certificate,
+            compact_sector_gap_certificate,
+            sector_gap_certification_limitation,
+        ) = match (options.sector_gap_certification, sector_resolution.as_ref()) {
             (Some(certification), Some(resolution)) => {
                 let certification_started = Instant::now();
-                match certify_sector_gap_from_resolution(
-                    params,
-                    cfg,
-                    certification,
-                    resolution,
-                    cache,
-                )
-                .map(|resolved| resolved.value)
-                {
-                    Ok(certificate) => {
+                let proof = match &options.sector_gap_certificate_format {
+                    CcmSectorGapCertificateFormat::Full => certify_sector_gap_from_resolution(
+                        params,
+                        cfg,
+                        certification,
+                        resolution,
+                        cache,
+                    )
+                    .map(|resolved| (Some(resolved.value), None)),
+                    CcmSectorGapCertificateFormat::Compact(source) => {
+                        certify_compact_sector_gap_from_resolution(
+                            params,
+                            cfg,
+                            certification,
+                            resolution,
+                            source.clone(),
+                            cache,
+                        )
+                        .map(|resolved| (None, Some(resolved.value)))
+                    }
+                };
+                match proof {
+                    Ok((full, compact)) => {
                         xc_core::progress_message!(
                             "[HP] finite sector-gap certification: exact cutoff-free parity, ordering, and simplicity replay, {:.3}s",
                             certification_started.elapsed().as_secs_f64()
                         );
-                        (Some(certificate), None)
+                        (full, compact, None)
                     }
                     Err(error) => {
                         let reason =
@@ -15017,7 +15250,7 @@ fn run_with_research_capture(
                         xc_core::progress_message!(
                             "[HP] {reason}; the computed capture is retained"
                         );
-                        (None, Some(reason))
+                        (None, None, Some(reason))
                     }
                 }
             }
@@ -15027,9 +15260,9 @@ fn run_with_research_capture(
                     None => "sector-gap certification needs resolved guide spectra; request sector analysis".to_owned(),
                 };
                 xc_core::progress_message!("[HP] {reason}; the computed capture is retained");
-                (None, Some(reason))
+                (None, None, Some(reason))
             }
-            (None, _) => (None, None),
+            (None, _) => (None, None, None),
         };
         let evenness = if options.capture_evenness {
             if let Some(resolution) = &sector_resolution {
@@ -15121,6 +15354,7 @@ fn run_with_research_capture(
             evenness,
             sector_gap,
             sector_gap_certificate,
+            compact_sector_gap_certificate,
             sector_gap_certification_limitation,
             root_certificate,
             root_certification_report,
@@ -21312,7 +21546,7 @@ mod tests {
             legacy_semantic.resolved_mathematical_parameters,
             serde_json::json!({
                 "source_identity_arithmetic": MANAGED_EIGENSTATE_SOURCE_IDENTITY,
-                "tau_source_identity": DependencyRef { key: tau_manifest.key.clone(), content_digest: tau_manifest.content_digest.clone(), required_quality: CacheQuality::Validated },
+                "tau_source_identity": xc_cache::numerical_source_identity(&tau_manifest, "tau", "stored-tau-matrix-v1"),
                 "lambda_squared": "13",
                 "n_modes": 120,
                 "precision_bits": legacy.precision_bits,
@@ -21990,10 +22224,9 @@ mod tests {
         assert!(independent
             .source_data_identities
             .contains_key("ccm_secular_source"));
-        assert_eq!(
-            seeded.source_data_identities.get("reference_zero_dataset"),
-            Some(&ContentDigest(dataset.content_sha256.clone()))
-        );
+        assert!(!seeded
+            .source_data_identities
+            .contains_key("reference_zero_dataset"));
         assert_ne!(independent.digest().unwrap(), seeded.digest().unwrap());
         let signed = root_range_semantic_key(
             &params,
@@ -22042,7 +22275,11 @@ mod tests {
             Some(&ContentDigest::sha256(b"test exact secular source")),
         )
         .unwrap();
-        assert_ne!(seeded.digest().unwrap(), other_seeded.digest().unwrap());
+        assert_eq!(
+            seeded.digest().unwrap(),
+            other_seeded.digest().unwrap(),
+            "unused table metadata is provenance"
+        );
         assert!(root_range_semantic_key(
             &params,
             &cfg,
@@ -24716,6 +24953,7 @@ mod tests {
             &preparation,
             None,
             policy,
+            None,
         )
         .unwrap();
         let compute_seconds = started.elapsed().as_secs_f64();
@@ -25161,6 +25399,17 @@ mod tests {
 
     #[test]
     fn prime_power_response_records_and_replays_full_state_and_root_transport() {
+        // This three-dimensional fixture has a deliberately small run budget.
+        // Use a bounded test pool so its stack allowance does not depend on
+        // the host's core count. Production worker admission is unchanged.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(prime_power_response_replay_fixture);
+    }
+
+    fn prime_power_response_replay_fixture() {
         let resources = xc_core::RunResources::new(32 << 20).unwrap();
         let _scope = resources.enter();
         let precision_bits = 192;
@@ -26359,7 +26608,7 @@ mod tests {
         );
         assert_eq!(
             manifests[0].minimum_reader_version,
-            ToolkitVersion::parse("0.17.0").unwrap()
+            ToolkitVersion::parse(xc_cache::CONTENT_MODEL_V2_MINIMUM_READER).unwrap()
         );
         let mut legacy = semantic.clone();
         legacy.mathematical_semantics_version = "ccm-u-flow-response-v0.15.0-v3".into();
@@ -26445,7 +26694,7 @@ mod tests {
                 );
                 assert_eq!(
                     row.minimum_reader_version,
-                    ToolkitVersion::parse("0.17.0").unwrap()
+                    ToolkitVersion::parse(xc_cache::CONTENT_MODEL_V2_MINIMUM_READER).unwrap()
                 );
                 let mut unblocked = key.clone();
                 unblocked
@@ -27040,6 +27289,7 @@ mod tests {
             capture_evenness: false,
             sector_analysis: None,
             sector_gap_certification: None,
+            sector_gap_certificate_format: CcmSectorGapCertificateFormat::Full,
             root_certification: None,
             distance_capture: None,
             capture_prime_power_response: false,
@@ -27052,6 +27302,7 @@ mod tests {
             capture_evenness: true,
             sector_analysis: Some(CcmSectorAnalysisOptions::selected(2)),
             sector_gap_certification: None,
+            sector_gap_certificate_format: CcmSectorGapCertificateFormat::Full,
             root_certification: None,
             distance_capture: None,
             capture_prime_power_response: false,
@@ -31872,13 +32123,14 @@ mod exhaustive_managed_source_identity {
         );
     }
     #[test]
-    fn exhaustive_managed_source_identity_eigenpair_parent_key() {
+    fn exhaustive_managed_source_identity_eigenpair_ignores_parent_store_label() {
         let a = eigen_manifest(2, "a");
         let b = eigen_manifest(2, "other-parent-identity");
-        assert_ne!(
-            a.key, b.key,
-            "different matrix dependency identities share an eigenpair key"
-        );
+        assert_eq!(a.key, b.key, "a store alias is not a numerical input");
+        assert_eq!(a.content_digest, b.content_digest);
+        // Both reference the same numerical factorization. Its canonical
+        // manifest, rather than this numerical key, binds the exact Tau producer.
+        assert_eq!(a.dependencies, b.dependencies);
     }
     #[test]
     fn exhaustive_managed_source_identity_rejects_mismatched_length_and_matrix() {

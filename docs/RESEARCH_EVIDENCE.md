@@ -5,6 +5,15 @@ These contracts ship in v0.15.0 and analyze retained observations. See
 managed reduction reports and visibility rules, and [capture integration](CAPTURE_LEVELS.md)
 for application responsibilities.
 
+New retained-observation payloads use schema 2: consumed-input requests and exact
+producer ancestry are authenticated by their manifests, while payloads retain the
+numerical/evidence data, per-kind value revision and applicable row coverage.
+Legacy schema-1 observations remain readable. The generated `-v1` and `-v2`
+observation schemas preserve that distinction; separate finite/cohort/preparation
+APIs sharing a kind use their own data validators. See the
+[cache content contract](CACHE_SCHEMA.md#schema-2-content-and-producer-contract).
+Schema generation requires `tools/requirements-validation.txt`.
+
 ## From an idea to a reproducible finite test
 
 1. Define the observable with `xc_core::ObservableContract`: definition and

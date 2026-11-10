@@ -594,6 +594,7 @@ fn fixture_source(
     };
     let transport = ContentDigest::sha256(b"fixture transport");
     let canonical = CanonicalArtifactManifest {
+        provenance: None,
         schema_version: 1,
         artifact_family: if kind == "ccm_weil_eigenpair" {
             "weil-states"

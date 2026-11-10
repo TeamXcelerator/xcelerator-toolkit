@@ -110,7 +110,7 @@ def main():
   tests=[];negative=0
   for f in sorted(packets.glob('*.json')):
    if f.name=='acceptance.json':continue
-   packet=json.loads(f.read_text());report=packet['report'];kind=report.get('kind') or packet['manifest']['key']['kind'];schema=json.loads((ROOT/'docs/schemas'/(kind.replace('_','-')+'-v1.schema.json')).read_text());v=Draft202012Validator(schema);v.validate(report);tests.append(kind)
+   packet=json.loads(f.read_text());report=packet['report'];kind=report.get('kind') or packet['manifest']['key']['kind'];schema=json.loads((ROOT/'docs/schemas'/(kind.replace('_','-')+'-v'+str(report['schema_version'])+'.schema.json')).read_text());v=Draft202012Validator(schema);v.validate(report);tests.append(kind)
    require(not (report.get('data',{}).get('reason') or '').startswith(';'), 'leading separator in report reason: '+kind)
    # Check the current revision contract on actual producer outputs. Shape
    # validation does not certify their numerical values or archived revisions.
@@ -122,7 +122,7 @@ def main():
      if remove:bad['request'].pop(name)
      else:bad['request'][name]='unknown-arithmetic'
      require(not v.is_valid(bad), 'schema accepted missing/unknown arithmetic contract: '+kind+' '+name);negative+=1
-   if kind=='ccm_tail_operator_analysis':
+   if kind=='ccm_tail_operator_analysis' and report['schema_version']==1:
     name='model_linear_algebra_arithmetic'
     require(report['request'].get(name)=='exact_stored_dot_product_stages_and_tail_bound_v0.15.2-v2', 'current tail producer lacks its arithmetic stamp')
     bad=json.loads(json.dumps(report));bad['request'][name]='unknown-arithmetic'
@@ -184,20 +184,25 @@ def main():
      if name not in report['data']['arithmetic_enclosures']:continue
      bad=json.loads(json.dumps(report));bad['data']['arithmetic_enclosures'].pop(name);require(not v.is_valid(bad), 'schema accepted missing projection enclosure: '+name);negative+=1
     bad=json.loads(json.dumps(report));bad['data']['arithmetic_enclosures']['source_center']=['0'];require(not v.is_valid(bad), 'schema accepted malformed projection enclosure');negative+=1
+   if report['schema_version']==2:
+    for name,value in [('request',{}),('source_dependencies',[]),('expected_rows',-1)]:
+     bad=json.loads(json.dumps(report));bad[name]=value;require(not v.is_valid(bad),'schema accepted invalid v2 envelope: '+kind+' '+name);negative+=1
    if 'diagnostic' in report.get('data',{}):
-    bad=json.loads(json.dumps(report));bad['request']['semantics']='unknown';require(not v.is_valid(bad), 'schema accepted negative mutation: '+kind);negative+=1
-    bad=json.loads(json.dumps(report));bad['request']['unexpected']=1;require(not v.is_valid(bad), 'schema accepted negative mutation: '+kind);negative+=1
-    if report['data']['diagnostic'] in ('band_reconstruction','transform_enclosure'):
-     require(report['request'].get('arb_available') is True, 'Arb producer omitted capability identity')
-     for invalid in ['true',1,None,{}]:
-      bad=json.loads(json.dumps(report));bad['request']['arb_available']=invalid;require(not v.is_valid(bad), 'schema accepted non-Boolean backend capability');negative+=1
-     legacy=json.loads(json.dumps(report));legacy['request'].pop('arb_available');require(v.is_valid(legacy), 'schema rejected historical capability-unspecified packet')
-     no_arb=json.loads(json.dumps(report));no_arb['request']['arb_available']=False;require(v.is_valid(no_arb), 'schema rejected Boolean false capability')
+    if report['schema_version']==1:
+     bad=json.loads(json.dumps(report));bad['request']['semantics']='unknown';require(not v.is_valid(bad), 'schema accepted negative mutation: '+kind);negative+=1
+     bad=json.loads(json.dumps(report));bad['request']['unexpected']=1;require(not v.is_valid(bad), 'schema accepted negative mutation: '+kind);negative+=1
+     if report['data']['diagnostic'] in ('band_reconstruction','transform_enclosure'):
+      require(report['request'].get('arb_available') is True, 'Arb producer omitted capability identity')
+      for invalid in ['true',1,None,{}]:
+       bad=json.loads(json.dumps(report));bad['request']['arb_available']=invalid;require(not v.is_valid(bad), 'schema accepted non-Boolean backend capability');negative+=1
+      legacy=json.loads(json.dumps(report));legacy['request'].pop('arb_available');require(v.is_valid(legacy), 'schema rejected historical capability-unspecified packet')
+      no_arb=json.loads(json.dumps(report));no_arb['request']['arb_available']=False;require(v.is_valid(no_arb), 'schema rejected Boolean false capability')
     if report['data']['diagnostic']=='energy_allowance':
      for name in ['conditional_energy_allowance','conditional_vector_allowance','trial_energy_magnitude']:
       bad=json.loads(json.dumps(report));bad['data']['values'].pop(name,None);require(not v.is_valid(bad), 'schema accepted missing allowance interpretation: '+name);negative+=1
      bad=json.loads(json.dumps(report));bad['data']['reason']=None;require(not v.is_valid(bad), 'schema accepted missing allowance reason');negative+=1
-     bad=json.loads(json.dumps(report));bad['request']['allowance_interpretation']='unknown';require(not v.is_valid(bad), 'schema accepted unknown allowance interpretation');negative+=1
+     if report['schema_version']==1:
+      bad=json.loads(json.dumps(report));bad['request']['allowance_interpretation']='unknown';require(not v.is_valid(bad), 'schema accepted unknown allowance interpretation');negative+=1
     # Every required present core field must actually be enforced.
     from generate_research_schemas import CORE
     keys=CORE.get(report['data']['diagnostic'],[])

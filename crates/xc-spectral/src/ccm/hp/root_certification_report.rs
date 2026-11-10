@@ -405,6 +405,10 @@ fn build_root_certification_report_with_route(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "report validation keeps each exact source identity and numerical request explicit"
+)]
 fn validate_root_certification_report(
     report: &CcmRootCertificationReport,
     params: &CcmParams,

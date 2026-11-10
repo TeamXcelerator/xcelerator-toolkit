@@ -15,7 +15,7 @@ A request is expanded into an artifact-plan DAG before execution. Every node dec
 The schema never overloads one hash with multiple meanings:
 
 1. **Semantic identity** hashes the canonical mathematical request, algorithm semantics version, and material configuration.
-2. **Canonical payload identity** hashes the logical unencoded payload manifest, including ordered file or stream digests and dependency identities.
+2. **Canonical payload identity** hashes the logical unencoded payload envelope. Schema 2 binds representation, dimensions, precision and ordered item paths, lengths and exact content digests. Exact producer ancestry is authenticated separately by the manifest. Schema 1 retains its original dependency-inclusive hash unchanged.
 3. **Transport identity** hashes a specific encoding and its ordered byte objects, such as deterministic ZIP/ZIP64 metadata and split parts.
 4. **Attestation identity** hashes a validation, certification, publication, revocation, or receipt statement about another identity.
 
@@ -28,25 +28,95 @@ An artifact manifest includes at least:
 - schema, artifact family, and semantic versions;
 - the complete canonical semantic-key envelope and its verified digest;
 - resolved mathematical-configuration digest;
-- the complete canonical logical-payload envelope, its verified digest, ordered logical items, logical byte count, and exact dependency identities;
+- the complete canonical logical-payload envelope, its verified digest, ordered logical items, and logical byte count;
 - ordered transport encodings and object digests;
 - exact dependency semantic, manifest, and payload identities;
 - mathematical claim scope and assumptions;
 - producer toolkit version, requested assurance, and reader compatibility;
 
-The canonical payload envelope records scalar backend, optional exact precision in bits, scalar representation, dimensions, endianness, special-value encoding, deterministic logical items, and exact dependency identities. The producer toolkit version is identity-bearing manifest metadata and is repeated in its digest-bound attestation. Dependency versions, execution fingerprint, source revision, actor or creator, event time, location, policy, achieved assurance, validation evidence, publication facts, and public-sanitization evidence live in linked attestations or state records. Two runs from the same producer version can therefore produce different attestations for the same semantic, payload, and manifest identities.
+The canonical payload envelope records scalar backend, optional exact precision in bits, scalar representation, dimensions, endianness, special-value encoding, and deterministic logical items. Schema 1 also includes exact dependency identities in that envelope; schema 2 authenticates them separately in the manifest. The producer toolkit version is identity-bearing manifest metadata and is repeated in its digest-bound attestation. Execution provenance can be retained in schema-2 manifest annotations or linked receipts. Actor, event time, location, achieved assurance, validation evidence and publication facts live in linked attestations or state records. Changing those linked statements need not change numerical request or payload identity.
 
 One central compatibility policy supplies the minimum producer version, reader range, and accepted manifest schemas for every artifact family/kind pair. Floors are independently adjustable by kind: a defect in tau construction can invalidate `ccm_tau_matrix` and its dependent closure without invalidating unaffected quadrature or prolate artifacts. Raising a producer floor makes older entries inadmissible cache hits, so normal execution treats them as misses and recomputes them. The same policy is shared by managed remote resolution and every direct numerical cache reader.
 
 Toolkit 0.16.0 restarted the artifact repositories from a clean slate and sets the producer and reader floor of every managed family and kind to 0.16.0 (`CLEAN_SLATE`). Artifacts produced by earlier releases are misses and are recomputed, and readers released before 0.16.0 refuse 0.16.0 artifacts instead of misreading their changed formats. Each new manifest records at least its kind's reader floor. Floors named in the version-specific sections below are historical.
 
-Publication is producer-version monotonic for each semantic identity. Before payload upload, the publisher reads the current shard index and rejects an incoming producer older than any active discoverable producer. The atomic discoverability phase repeats the check against the latest repository head, closing the concurrent-publication race. Newer producers may publish alongside immutable older history; consumers order compatible candidates by producer version first and assurance second. Revoked or quarantined entries do not block a replacement.
+Toolkit 0.17.1 retains the V1 single-item and V2 multi-item transport profiles:
+ZIP 2.4.2, flate2 1.1.9 and miniz_oxide 0.8.9 at level 6, fixed timestamps,
+Unix creator metadata and mode 0644. These writer settings also apply on
+native Windows. These transport settings require no new transport profile or
+transport reader-floor increase; the separate canonical schema-2 capability and
+reader requirement are described below.
+Immutable encoder fixtures check both decoding and exact re-encoding bytes.
+
+The compressor is selected explicitly. Cargo features unify across consumers;
+adding another flate2 backend changes the encoder graph and is outside this
+profile. Preserve the locked dependency graph and resolved features when
+reproducing package bytes. Source authentication, canonical payload validation
+and immutable transport checks continue to apply.
+
+Publication first searches every readable shard for an admissible existing result. The producer's version must satisfy its explicit kind floor, supported schema and reader window; it need not equal or exceed the newly staged producer version. An already satisfied request is a no-op. A real index replacement remains producer-version monotonic, and the atomic discoverability phase repeats that check against the latest head. Revoked or quarantined entries do not block a valid replacement.
 
 Certificates, validation reports, and publication-ready exports are separate ordinary artifacts. A canonical `ArtifactLinkSet` attaches any number of their exact semantic, manifest, and payload identities to a numerical subject without embedding report bytes in its payload or changing the subject identity. Link roles and identities are uniquely ordered and digest-bound.
 
 Unknown required fields, ambiguous semantics, missing dependency closure, revoked evidence, or untrusted attestations fail closed.
 
 The manifest is deliberately self-contained for identity rebuild and decoded validation: a reader recomputes both the semantic digest and canonical payload digest from their embedded canonical envelopes. A digest-only payload pointer is insufficient because it would allow transport verification but not verification of decoded paths, sizes, content hashes, or dependencies after a selective remote fetch.
+
+## Schema 2 content and producer contract
+
+New managed producers use canonical manifest schema 2. Its wire format contains
+`canonical_payload` (a schema-2 logical envelope), a separate exact `dependencies`
+array, and `provenance`. The latter contains a disclosure classification, optional
+producer annotations, and exact producer receipt references. The manifest digest
+binds all of them. Two admissible producers can identify the same numerical
+payload while retaining different exact ancestry and attribution.
+
+A semantic key binds the consumed inputs, their ordered roles and meaning, and
+value-affecting precision, normalization, basis, arithmetic, coverage and evidence
+scope. Toolkit releases, provider executable hashes, source attribution, local
+paths, cache visibility and successful-run scheduling budgets are provenance or
+admission policy. They do not change the numerical request. A preflight report
+that actually reports a budget, or an evidence receipt describing acquisition,
+legitimately has different content when that reported fact changes.
+
+The [kind contract catalog](CACHE_KIND_CONTRACTS.md) lists all nine families and
+95 registered kinds, including registration-only and reserved routes. Each active
+kind declares its codec and producer. Revised retained research records use
+schema 2 and per-kind value revisions, with requests and exact producer ancestry
+outside their numerical/evidence data. Seeded root records use explicit payload
+schemas 7/8 and bind the consumed seeds and ordinals; whole-reference-table
+attribution lives in manifest metadata. Independent root formats remain 5/6.
+
+New canonical records require at least reader 0.17.1 **and schema-2 capability**.
+A release version alone does not imply support: an older binary bearing the same
+version must reject the unknown format. Existing schema-1 records retain their
+original bytes, hashes and decoding rules. A warm hit preserves the original
+producer. No automatic reindexing, migration or republication occurs. Changed
+semantic keys can miss until a separately authenticated legacy mapping exists;
+there is no broad equality-based fallback that silently changes provenance.
+
+Retained-observation JSON schemas are published separately as `-v1.schema.json`
+and `-v2.schema.json` under `docs/schemas`. The v1 files preserve the legacy
+request/ancestry wrapper; v2 validates the corresponding observation data and
+its per-kind value revision, with optional expected-row coverage. Requests and
+producer dependencies belong in the authenticated manifest. These observation
+schemas are not substitutes for the numerical validators of separate finite,
+cohort or target-preparation APIs that share an artifact kind.
+
+Public publication requires artifact-aware admission before payload or metadata
+writes. The checked permit binds the exact transaction and destination. Every
+required ancestor must be independently public-admissible and compatible; missing
+or unclassified ancestry fails closed. Target-related kinds are always private,
+and required private inputs propagate that restriction to derived products.
+Matching numerical bytes do not authorize disclosure. Independent matrices remain
+eligible when a private target diagnostic consumes them. Resume reconstructs
+admission and checks metadata/batch/discovery document plans before writing.
+
+Publication reuse validates the **selected** producer's exact dependency graph,
+including compatibility and revocation across readable shards. It never replaces
+a revoked ancestor with another producer just because their payloads match.
+Transport encodings and deterministic ZIP profiles are unchanged; schema 2 is
+unrelated to the transport profile named V2.
 
 ## Independent state axes
 
@@ -524,3 +594,8 @@ state. It also cannot reconstruct an earlier nonfinite value already saved as
 `null`. Historical nullable payloads with uncertain producer behavior require
 source review or recomputation; a readable cache entry alone does not resolve
 that ambiguity.
+
+Schema-2 retained research payloads keep declared `expected_rows` as evidence
+coverage, while omitting the full request and exact producer wrapper. Coverage
+readers accept the explicit field and the legacy schema-1 request field. Missing
+rows therefore remain visible after content/provenance separation.

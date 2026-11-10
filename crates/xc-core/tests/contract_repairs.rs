@@ -89,7 +89,7 @@ fn access() -> CacheAccessProvenance {
         schema_version: 1,
         operation: "manufactured.lookup".into(),
         artifact_family: "manufactured".into(),
-        semantic_digest: format!("{:x}", Sha256::digest(serde_json::to_vec(&key).unwrap())),
+        semantic_digest: xc_core::hex_lower(&Sha256::digest(serde_json::to_vec(&key).unwrap())),
         semantic_key_schema_version: 1,
         resolved_semantic_key: key,
         selected_manifest_digest: Some("b".repeat(64)),

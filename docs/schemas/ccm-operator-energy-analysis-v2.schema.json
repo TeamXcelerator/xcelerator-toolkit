@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ccm_operator_energy_analysis retained observation v2",
+  "description": "Retained observation payload; exact requests and ancestry are authenticated by the manifest. Shape validation is not numerical proof. Separate same-kind finite/cohort/preparation APIs retain their own data validators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "kind",
+    "scope",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "semantics": {
+      "const": "ccm_operator_energy_analysis/value-v1"
+    },
+    "kind": {
+      "const": "ccm_operator_energy_analysis"
+    },
+    "scope": {
+      "const": "finite_point_inputs; no_source_error_enclosure; no_ground_selection_or_convergence_certificate"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lambda_squared",
+        "n_modes",
+        "precision_bits",
+        "source_eigenvalue",
+        "coefficient_norm_squared",
+        "rayleigh_quotient",
+        "eigenvalue_defect",
+        "relative_residual",
+        "sum_absolute_energy_terms",
+        "cancellation_digits",
+        "component_decomposition",
+        "ground_selection"
+      ],
+      "properties": {
+        "lambda_squared": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "n_modes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_eigenvalue": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "coefficient_norm_squared": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "rayleigh_quotient": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "eigenvalue_defect": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "relative_residual": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "residual_normalization": {
+          "enum": [
+            "absolute_residual_per_coefficient_l2_norm",
+            "relative_to_abs_eigenvalue_and_coefficient_l2_norm"
+          ]
+        },
+        "sum_absolute_energy_terms": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "cancellation_digits": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "component_decomposition": {
+          "type": "string"
+        },
+        "ground_selection": {
+          "type": "string"
+        }
+      }
+    },
+    "expected_rows": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "allOf": [
+    {
+      "allOf": [
+        {
+          "properties": {
+            "data": {
+              "required": [
+                "residual_normalization"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "research_observation_packet retained observation v2",
+  "description": "Retained observation payload; exact requests and ancestry are authenticated by the manifest. Shape validation is not numerical proof. Separate same-kind finite/cohort/preparation APIs retain their own data validators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "kind",
+    "scope",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "semantics": {
+      "const": "research_observation_packet/value-v1"
+    },
+    "kind": {
+      "const": "research_observation_packet"
+    },
+    "scope": {
+      "const": "finite_point_inputs; no_source_error_enclosure; no_ground_selection_or_convergence_certificate"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin",
+        "validation",
+        "original_digest",
+        "observation"
+      ],
+      "properties": {
+        "origin": {
+          "const": "externally_reported"
+        },
+        "validation": {
+          "const": "structure_and_bytes_only; numerical_claims_not_replayed"
+        },
+        "original_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+        },
+        "observation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "original_utf8",
+            "attribution",
+            "definition",
+            "hypotheses",
+            "borrowed_inputs",
+            "limitations"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": 1
+            },
+            "original_utf8": {
+              "type": "string"
+            },
+            "attribution": {
+              "type": "string"
+            },
+            "definition": {
+              "type": "string"
+            },
+            "hypotheses": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "borrowed_inputs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "limitations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "expected_rows": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

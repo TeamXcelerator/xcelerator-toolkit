@@ -362,6 +362,7 @@ fn canonical_adapter(name: &str, parents: &[ArtifactManifest]) -> ArtifactManife
         dependencies,
     };
     let canonical = CanonicalArtifactManifest {
+        provenance: None,
         schema_version: 1,
         artifact_family: "quadrature".into(),
         semantic_digest: semantic.digest().unwrap(),

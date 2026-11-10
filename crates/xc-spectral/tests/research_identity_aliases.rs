@@ -68,7 +68,15 @@ fn remote(m: &ArtifactManifest) -> ArtifactManifest {
     a.visibility = CacheVisibility::Private;
     a.dependencies.clear();
     a.created_unix_seconds = 100;
-    a.tags = BTreeMap::from([("xc.semantic_key.v1".into(), "{\"remote\":true}".into())]);
+    // Adapter provenance may differ; the authenticated mathematical declaration
+    // must remain valid even when a numerical child is already cached.
+    a.tags = BTreeMap::from([
+        (
+            SEMANTIC_KEY_MANIFEST_TAG.into(),
+            m.tags[SEMANTIC_KEY_MANIFEST_TAG].clone(),
+        ),
+        ("fixture.remote_adapter".into(), "true".into()),
+    ]);
     a
 }
 
@@ -201,12 +209,48 @@ fn extended_diagnostics_reach_one_child_from_producer_remote_and_adopted_states(
         assert_eq!(child(&reused).key, child(&first).key);
         assert_eq!(child(&reused).content_digest, child(&first).content_digest);
     }
-    // A genuinely different state identity is a different child.
-    let (other, other_bytes) = source(
+    let mut malformed = remote(&sm);
+    malformed
+        .tags
+        .insert(SEMANTIC_KEY_MANIFEST_TAG.into(), "{\"remote\":true}".into());
+    assert!(capture_extended(
+        "compactness",
+        &state(&malformed),
+        None,
+        None,
+        None,
+        &options,
+        &[],
+        &cache.context(REQUIRE),
+    )
+    .is_err());
+    // A source descriptor label does not change the consumed numerical values.
+    let (relabeled, _) = source(
         "ccm_weil_eigenpair",
         json!({"schema_version":3,"lambda_squared":"13","n_modes":1,"precision_bits":128,
             "eigenvalue":"1","eigenvector":["0","1","0"],"force_even":true,"parity_policy":"even_sector"}),
         "other-semantics",
+    );
+    let reused = capture_extended(
+        "compactness",
+        &state(&relabeled),
+        None,
+        None,
+        None,
+        &options,
+        &[],
+        &cache.context(REQUIRE),
+    )
+    .unwrap();
+    assert!(reused.reused_manifest.is_some());
+    assert_eq!(child(&reused).key, child(&first).key);
+    assert_eq!(child(&reused).content_digest, child(&first).content_digest);
+    // Changing the actual coefficients must not reuse the earlier child.
+    let (other, other_bytes) = source(
+        "ccm_weil_eigenpair",
+        json!({"schema_version":3,"lambda_squared":"13","n_modes":1,"precision_bits":128,
+            "eigenvalue":"1","eigenvector":["1","1","1"],"force_even":true,"parity_policy":"even_sector"}),
+        "stable",
     );
     let other = RetainedState::from_payload(
         &other,

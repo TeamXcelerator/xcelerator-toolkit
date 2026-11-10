@@ -20,6 +20,10 @@ mod app {
     }
     #[derive(Serialize, Deserialize)]
     #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+    #[expect(
+        clippy::large_enum_variant,
+        reason = "retain the existing request envelope and ownership for this offline batch example"
+    )]
     enum Task {
         ExtendedResearch {
             diagnostic: String,

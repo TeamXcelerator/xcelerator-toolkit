@@ -19,8 +19,8 @@ thread_local! {
 }
 
 // Root construction is quadratic in table order and increasingly expensive
-// with MPFR precision. Keep the opt-in schedule conservative until native-
-// Linux qualification supplies a better measured boundary.
+// with MPFR precision. Keep the existing conservative opt-in threshold on
+// native Linux and the qualified native Windows UCRT lane.
 const GL_ROOT_PARALLEL_MIN_WORK: u128 = 512 * 512 * 256;
 
 /// Explicit root schedule resolved by the owning precompute thread.
@@ -160,7 +160,7 @@ where
     })?;
     if policy.parallel_gl_roots && !gl_root_parallel_platform_supported() {
         return Err(HpRuntimeError {
-            message: "GL root parallelism requires native Linux and is disabled on WSL, Windows, and macOS because concurrent GMP allocation has not been qualified there"
+            message: "GL root parallelism requires native Linux or the qualified native Windows x64 GNU/UCRT build with feature arb and matching native MPFR context; WSL and other builds remain unsupported"
                 .to_owned(),
         });
     }
@@ -223,7 +223,41 @@ fn gl_root_parallel_platform_supported() -> bool {
         }
         true
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(
+        target_os = "windows",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        feature = "arb",
+        xc_windows_gnu_ucrt
+    ))]
+    {
+        // The build-time C probe establishes UCRT, native host/target, TLS,
+        // and matching GMP/MPFR versions. Keep deployment and caller-context
+        // checks at runtime as well; a Rust GNU target alone is insufficient.
+        unsafe extern "C" {
+            fn xc_gl_native_compatible() -> std::ffi::c_int;
+            fn xc_gl_mpfr_size() -> usize;
+            fn xc_gl_emin() -> i64;
+            fn xc_gl_emax() -> i64;
+        }
+        let point = rug::Float::with_val(32, 0);
+        unsafe {
+            xc_gl_native_compatible() == 1
+                && xc_gl_mpfr_size() == std::mem::size_of_val(&*point.as_raw())
+                && xc_gl_emin() == i64::from(rug::float::exp_min())
+                && xc_gl_emax() == i64::from(rug::float::exp_max())
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        all(
+            target_os = "windows",
+            target_arch = "x86_64",
+            target_env = "gnu",
+            feature = "arb",
+            xc_windows_gnu_ucrt
+        )
+    )))]
     {
         false
     }
@@ -697,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn root_parallel_policy_fails_closed_outside_native_linux() {
+    fn root_parallel_policy_fails_closed_outside_qualified_platforms() {
         let policy = HpRuntimePolicy {
             parallel_gl_roots: true,
             ..HpRuntimePolicy::default()
@@ -707,6 +741,20 @@ mod tests {
         if let Err(error) = result {
             assert!(error.to_string().contains("requires native Linux"));
         }
+    }
+
+    #[cfg(all(target_os = "windows", not(xc_windows_gnu_ucrt)))]
+    #[test]
+    fn windows_root_parallel_policy_requires_the_native_ucrt_marker() {
+        let policy = HpRuntimePolicy {
+            parallel_gl_roots: true,
+            ..HpRuntimePolicy::default()
+        };
+        let result = run_hp_with_policy(&policy, || {
+            panic!("unqualified Windows arithmetic must not run")
+        });
+        assert!(result.unwrap_err().to_string().contains("GNU/UCRT"));
+        assert_eq!(active_policy(), None);
     }
 
     #[test]

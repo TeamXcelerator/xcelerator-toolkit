@@ -765,6 +765,9 @@ fn resolve_candidate(
         CacheVisibility::Public => PublicationDestination::Public,
         _ => unreachable!("overlay validation accepts only private/public"),
     };
+    if !crate::manifest_admitted_to_destination(&manifest.value, expected_destination) {
+        return Err(CacheError::PermissionDenied("withheld_private_only".into()));
+    }
     let receipt_path = format!(
         "transactions/{}/{}/receipt.json",
         entry.publication_transaction_id,
@@ -1330,6 +1333,7 @@ mod tests {
         };
         let transport_digest = encoding.digest().unwrap();
         let manifest = CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
             artifact_family: "ccm".to_owned(),
             semantic_key: semantic_key.clone(),

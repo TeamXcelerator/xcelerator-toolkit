@@ -50,7 +50,9 @@ pub(super) fn tau_point_digest(
         hash.update(u64::try_from(value.len()).ok()?.to_le_bytes());
         hash.update(value.as_bytes());
     }
-    Some(xc_cache::ContentDigest(format!("{:x}", hash.finalize())))
+    Some(xc_cache::ContentDigest(xc_core::hex_lower(
+        &hash.finalize(),
+    )))
 }
 
 pub(super) fn identity_matches(

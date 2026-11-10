@@ -352,6 +352,7 @@ mod tests {
             dependencies: Vec::new(),
         };
         CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
             artifact_family: "fixture".to_owned(),
             semantic_digest: semantic_key.digest().unwrap(),

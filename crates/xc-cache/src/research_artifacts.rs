@@ -108,8 +108,10 @@ impl NumericalCoverage {
         let mut result = Self {
             outcome: "unassessed".into(),
             reason: data["reason"].as_str().map(str::to_owned),
-            expected_rows: value["request"]["expected_rows"]
-                .as_u64()
+            expected_rows: value
+                .get("expected_rows")
+                .or_else(|| value.get("request").and_then(|r| r.get("expected_rows")))
+                .and_then(serde_json::Value::as_u64)
                 .and_then(|n| n.try_into().ok()),
             ..Self::default()
         };

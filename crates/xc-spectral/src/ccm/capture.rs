@@ -791,6 +791,7 @@ impl CcmCapturePlan {
                     None
                 },
                 sector_gap_certification: None,
+                sector_gap_certificate_format: super::hp::CcmSectorGapCertificateFormat::Full,
                 root_certification: None,
                 distance_capture: None,
                 capture_prime_power_response: false,

@@ -182,7 +182,7 @@ impl RetainedEvenMatrix {
         resources.check_cancelled()?;
         encoded?;
         if writer.length != manifest.size_bytes
-            || format!("{:x}", writer.hash.finalize()) != manifest.content_digest.0
+            || xc_core::hex_lower(&writer.hash.finalize()) != manifest.content_digest.0
         {
             bail!("shared retained matrix does not replay its exact approved source digest and byte count");
         }

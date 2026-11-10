@@ -164,7 +164,7 @@ fn read_chunks<T: serde::de::DeserializeOwned>(
                 bail!("atom chunk changed size");
             }
         }
-        if count != c.bytes || format!("{:x}", hash.finalize()) != c.sha256.0 {
+        if count != c.bytes || xc_core::hex_lower(&hash.finalize()) != c.sha256.0 {
             bail!("atom chunk SHA-256 mismatch");
         }
         f.rewind()?;
@@ -197,7 +197,7 @@ fn read_chunks<T: serde::de::DeserializeOwned>(
             }
             result.push(serde_json::from_slice(&line)?);
         }
-        if rows != c.rows || format!("{:x}", replay.finalize()) != c.sha256.0 {
+        if rows != c.rows || xc_core::hex_lower(&replay.finalize()) != c.sha256.0 {
             bail!("atom chunk changed during decode or has wrong row count");
         }
     }

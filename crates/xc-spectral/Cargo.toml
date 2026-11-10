@@ -18,6 +18,8 @@ arb = ["hp", "xc-numerics/arb"]
 anyhow = { workspace = true }
 getrandom = { workspace = true }
 nalgebra = { workspace = true }
+# Keep nalgebra's binary64 multiplication kernels on the qualified graph.
+matrixmultiply = { workspace = true }
 num-rational = "=0.4.2"
 num-traits = "=0.2.19"
 rayon = { workspace = true }
@@ -41,7 +43,7 @@ xc-cache = { workspace = true, features = ["test-support"] }
 xc-core = { workspace = true, features = ["test-support"] }
 
 [build-dependencies]
-cc = "1.2"
+cc = "1.11.1"
 sha2 = { workspace = true }
 
 [[example]]

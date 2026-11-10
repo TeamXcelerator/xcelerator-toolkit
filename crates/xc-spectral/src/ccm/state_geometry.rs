@@ -527,9 +527,15 @@ pub fn analyze_state_geometry_via_cache(
     if cache.requested_assurance != xc_core::AssuranceLevel::Computed {
         bail!("state geometry is computed evidence, not a certificate");
     }
-    let public = source.manifest.visibility == CacheVisibility::Public;
-    if cache.write_visibility == CacheVisibility::Public && !public {
-        bail!("public state geometry requires a public source manifest");
+    let provenance = xc_cache::provenance_for_numerical_inputs(
+        ARTIFACT_KIND,
+        std::slice::from_ref(&source.manifest),
+        vec![],
+    )?;
+    if cache.write_visibility == CacheVisibility::Public
+        && provenance.disclosure != xc_cache::ArtifactDisclosure::PublicInputs
+    {
+        bail!("public state geometry requires independently public-admissible source provenance");
     }
     let dependencies = vec![DependencyRef {
         key: source.manifest.key.clone(),
@@ -540,7 +546,7 @@ pub fn analyze_state_geometry_via_cache(
         schema_version: 1,
         artifact_kind: ARTIFACT_KIND.into(),
         mathematical_semantics_version: SEMANTICS.into(),
-        resolved_mathematical_parameters: serde_json::json!({"source_dependencies":[xc_cache::research_identity_dependency(&source.manifest)],"options":options,"source_parents_are_public":public}),
+        resolved_mathematical_parameters: serde_json::json!({"source_dependencies":[xc_cache::numerical_source_identity(&source.manifest, "state", "stored-weil-state-v1")],"options":options}),
         normalization: Some(CONVENTION.into()),
         target: Some("actual_retained_state_geometry".into()),
         subspace: None,
@@ -568,6 +574,10 @@ pub fn analyze_state_geometry_via_cache(
         tags: BTreeMap::from([
             ("domain".into(), "ccm".into()),
             ("assurance".into(), "computed_not_certified".into()),
+            (
+                xc_cache::MANIFEST_PROVENANCE_V2_TAG.into(),
+                serde_json::to_string(&provenance)?,
+            ),
         ]),
         provenance_digest: None,
         production_sink: cache.production_sink,

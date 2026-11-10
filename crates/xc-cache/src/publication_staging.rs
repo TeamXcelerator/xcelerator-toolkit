@@ -24,6 +24,10 @@ pub struct PublicationMetadataBundle {
     pub schema_version: u32,
     pub family: String,
     pub manifest: CanonicalArtifactManifest,
+    /// Local admission context, never included in public transaction documents.
+    /// Every schema-2 public transaction revalidates this exact closure on resume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_manifests: Vec<CanonicalArtifactManifest>,
     pub encoding: TransportEncodingRecord,
     pub validation_attestations: Vec<AttestationEnvelope>,
     pub validator_evidence: Vec<ValidatorEvidence>,
@@ -141,6 +145,106 @@ pub fn stage_payload_batch_record(
     )
 }
 
+pub(crate) fn transaction_record(
+    journal: &PublicationTransactionJournal,
+    destination: PublicationDestination,
+    bundle: &PublicationMetadataBundle,
+) -> Result<RemotePublicationTransactionRecord, CacheError> {
+    let target = journal
+        .targets
+        .get(&destination)
+        .ok_or_else(|| CacheError::InvalidManifest("publication target is absent".into()))?;
+    let manifest_digest = bundle.manifest.digest()?;
+    let transport_digest = bundle.encoding.digest()?;
+    let validation_attestation_digests = bundle
+        .validation_attestations
+        .iter()
+        .map(AttestationEnvelope::digest)
+        .collect::<Result<Vec<_>, _>>()?;
+    let validator_evidence_digests = bundle
+        .validator_evidence
+        .iter()
+        .map(|evidence| evidence.evidence_digest.clone())
+        .collect();
+    let transaction_record = RemotePublicationTransactionRecord {
+        schema_version: 1,
+        transaction_id: journal.transaction_id.clone(),
+        idempotency_key: journal.idempotency_key.clone(),
+        destination,
+        principal: target.permission_evidence.principal.clone(),
+        authorized_repository: target.authorized_repository.clone(),
+        repository_permission_evidence_digest: target.permission_evidence.evidence_digest.clone(),
+        shard_id: target.shard_id.clone(),
+        branch: target.branch.clone(),
+        semantic_digest: journal.semantic_digest.clone(),
+        payload_digest: journal.payload_digest.clone(),
+        manifest_digest: manifest_digest.clone(),
+        transport_digest: transport_digest.clone(),
+        policy_digest: journal.policy_digest.clone(),
+        validation_attestation_digests: validation_attestation_digests.clone(),
+        validator_evidence_digests,
+    };
+    transaction_record.digest()?;
+    Ok(transaction_record)
+}
+
+/// Reconstruct exactly the documents authorized by the artifact bundle.
+/// This is also checked on resume, before trusting an existing commit plan.
+pub(crate) fn immutable_metadata_file_plan(
+    journal: &PublicationTransactionJournal,
+    destination: PublicationDestination,
+    bundle: &PublicationMetadataBundle,
+) -> Result<Vec<TransportPart>, CacheError> {
+    let record = transaction_record(journal, destination, bundle)?;
+    let mut documents = vec![
+        (
+            format!(
+                "encodings/{}/{}.json",
+                &journal.payload_digest.0[..2],
+                record.transport_digest.0
+            ),
+            canonical_json_bytes(&bundle.encoding)?,
+        ),
+        (
+            format!(
+                "manifests/{}/{}.json",
+                &journal.semantic_digest.0[..2],
+                record.manifest_digest.0
+            ),
+            canonical_json_bytes(&bundle.manifest)?,
+        ),
+        (
+            format!(
+                "transactions/{}/{}/plan.json",
+                journal.transaction_id,
+                if destination == PublicationDestination::Public {
+                    "public"
+                } else {
+                    "private"
+                }
+            ),
+            canonical_json_bytes(&record)?,
+        ),
+    ];
+    for attestation in &bundle.validation_attestations {
+        documents.push((
+            format!("attestations/validation/{}.json", attestation.digest()?.0),
+            canonical_json_bytes(attestation)?,
+        ));
+    }
+    let mut files = documents
+        .into_iter()
+        .map(|(repository_path, bytes)| TransportPart {
+            sequence: 0,
+            repository_path,
+            size_bytes: bytes.len() as u64,
+            content_digest: ContentDigest::sha256(&bytes),
+        })
+        .collect::<Vec<_>>();
+    canonicalize_file_sequence(&mut files);
+    Ok(files)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn stage_immutable_publication_metadata(
     staging_root: &Path,
@@ -155,10 +259,7 @@ pub fn stage_immutable_publication_metadata(
         .check()
         .map_err(|error| CacheError::Cancelled(error.to_string()))?;
     if destination == PublicationDestination::Public
-        && !crate::artifact_semantics_admitted_to_destination(
-            &bundle.manifest.semantic_key,
-            destination,
-        )
+        && !crate::manifest_admitted_to_destination(&bundle.manifest, destination)
     {
         return Err(CacheError::PermissionDenied(format!(
             "artifact kind {:?} is private-only",
@@ -183,29 +284,7 @@ pub fn stage_immutable_publication_metadata(
         .iter()
         .map(AttestationEnvelope::digest)
         .collect::<Result<Vec<_>, _>>()?;
-    let validator_evidence_digests = bundle
-        .validator_evidence
-        .iter()
-        .map(|evidence| evidence.evidence_digest.clone())
-        .collect::<Vec<_>>();
-    let transaction_record = RemotePublicationTransactionRecord {
-        schema_version: 1,
-        transaction_id: journal.transaction_id.clone(),
-        idempotency_key: journal.idempotency_key.clone(),
-        destination,
-        principal: target.permission_evidence.principal.clone(),
-        authorized_repository: target.authorized_repository.clone(),
-        repository_permission_evidence_digest: target.permission_evidence.evidence_digest.clone(),
-        shard_id: target.shard_id.clone(),
-        branch: target.branch.clone(),
-        semantic_digest: journal.semantic_digest.clone(),
-        payload_digest: journal.payload_digest.clone(),
-        manifest_digest: manifest_digest.clone(),
-        transport_digest: transport_digest.clone(),
-        policy_digest: journal.policy_digest.clone(),
-        validation_attestation_digests: validation_attestation_digests.clone(),
-        validator_evidence_digests,
-    };
+    let transaction_record = transaction_record(journal, destination, bundle)?;
     let transaction_record_digest = transaction_record.digest()?;
     let semantic_prefix = &journal.semantic_digest.0[..2];
     let payload_prefix = &journal.payload_digest.0[..2];
@@ -939,7 +1018,7 @@ pub(crate) fn verify_existing_file(
         }
         hasher.update(&buffer[..count]);
     }
-    let actual = ContentDigest(format!("{:x}", hasher.finalize()));
+    let actual = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
     if &actual != expected_digest {
         return Err(CacheError::DigestMismatch {
             expected: expected_digest.to_string(),
@@ -964,7 +1043,7 @@ fn safe_family(family: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         plan_publication_batches, AuthenticatedGitHubSession, CanonicalPayloadEnvelope,
@@ -976,13 +1055,18 @@ mod tests {
     use std::collections::BTreeMap;
     use xc_core::{AssuranceLevel, PublicationTarget};
 
-    fn fixture(
+    pub(crate) fn fixture(
         destination: PublicationDestination,
     ) -> (PublicationTransactionJournal, PublicationMetadataBundle) {
         let payload_bytes = b"payload-part";
         let semantic_key = SemanticKeyEnvelope {
             schema_version: 1,
-            artifact_kind: "staging_fixture".to_owned(),
+            artifact_kind: if destination == PublicationDestination::Public {
+                "ccm_tau_matrix"
+            } else {
+                "staging_fixture"
+            }
+            .to_owned(),
             mathematical_semantics_version: "fixture-v1".to_owned(),
             resolved_mathematical_parameters: json!({"case": "staging"}),
             normalization: None,
@@ -1028,8 +1112,14 @@ mod tests {
         };
         let transport_digest = encoding.digest().unwrap();
         let manifest = CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
-            artifact_family: "ccm".to_owned(),
+            artifact_family: if destination == PublicationDestination::Public {
+                "ccm-matrices"
+            } else {
+                "ccm"
+            }
+            .to_owned(),
             semantic_key,
             semantic_digest: semantic_digest.clone(),
             canonical_payload,
@@ -1121,8 +1211,14 @@ mod tests {
         (
             journal,
             PublicationMetadataBundle {
+                required_manifests: Vec::new(),
                 schema_version: 1,
-                family: "ccm".to_owned(),
+                family: if destination == PublicationDestination::Public {
+                    "ccm-matrices"
+                } else {
+                    "ccm"
+                }
+                .to_owned(),
                 manifest,
                 encoding,
                 validation_attestations: vec![attestation],

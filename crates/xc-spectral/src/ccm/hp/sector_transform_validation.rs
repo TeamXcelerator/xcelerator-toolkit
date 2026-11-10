@@ -57,7 +57,9 @@ pub(super) fn source_digest(
             hash.update(text.as_bytes());
         }
     }
-    Ok(xc_cache::ContentDigest(format!("{:x}", hash.finalize())))
+    Ok(xc_cache::ContentDigest(xc_core::hex_lower(
+        &hash.finalize(),
+    )))
 }
 
 #[cfg(test)]

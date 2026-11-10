@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ccm_signed_transform_analysis retained observation v2",
+  "description": "Retained observation payload; exact requests and ancestry are authenticated by the manifest. Shape validation is not numerical proof. Separate same-kind finite/cohort/preparation APIs retain their own data validators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "kind",
+    "scope",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "semantics": {
+      "const": "ccm_signed_transform_analysis/value-v1"
+    },
+    "kind": {
+      "const": "ccm_signed_transform_analysis"
+    },
+    "scope": {
+      "const": "finite_point_inputs; no_source_error_enclosure; no_ground_selection_or_convergence_certificate"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostic",
+        "outcome",
+        "reason",
+        "lambda_squared",
+        "n_modes",
+        "source_precision_bits",
+        "working_precision_bits",
+        "convention",
+        "assurance",
+        "values",
+        "rows"
+      ],
+      "properties": {
+        "diagnostic": {
+          "const": "signed_transform"
+        },
+        "outcome": {
+          "enum": [
+            "point_measurement",
+            "partial_unresolved",
+            "unresolved",
+            "missing_input",
+            "rank_or_precision_unresolved",
+            "conditional_bound_expression",
+            "sufficient_bound_unavailable"
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lambda_squared": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "n_modes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "working_precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "convention": {
+          "type": "string"
+        },
+        "assurance": {
+          "const": "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise"
+        },
+        "values": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ordinal",
+              "label",
+              "outcome",
+              "values",
+              "notes"
+            ],
+            "properties": {
+              "ordinal": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "label": {
+                "type": "string"
+              },
+              "outcome": {
+                "enum": [
+                  "point_measurement",
+                  "missing_input",
+                  "budget_limited",
+                  "carrier_or_unresolved",
+                  "unresolved_denominator",
+                  "cancellation_limited",
+                  "unresolved_derivative",
+                  "channels_resolved_budget_unassessed",
+                  "conditional_budget_met",
+                  "conditional_budget_not_met",
+                  "conditional_budget_unresolved"
+                ]
+              },
+              "values": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string",
+                  "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                }
+              },
+              "notes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "enum": [
+                        "point_measurement",
+                        "certified_finite_enclosure"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "values": {
+                      "required": [
+                        "t",
+                        "value_actual",
+                        "derivative_actual",
+                        "value_reference_closure_defect",
+                        "derivative_reference_closure_defect"
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "point_measurement",
+                  "certified_finite_enclosure",
+                  "conditional_bound_expression"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "values": {
+                "required": []
+              }
+            }
+          }
+        }
+      ]
+    },
+    "expected_rows": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "data": {
+            "properties": {
+              "outcome": {
+                "const": "point_measurement"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "values": {
+                "required": [
+                  "arithmetic_precision_bits",
+                  "normalization_precision_bits"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

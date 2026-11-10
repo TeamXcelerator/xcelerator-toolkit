@@ -3221,6 +3221,68 @@ where
             .first_writable(request.write_visibility)
             .ok_or_else(|| CacheError::ReadOnlyLayer(format!("{:?}", request.write_visibility)))?;
         let mut tags = request.tags.clone();
+        // New managed producers use content-only canonical payloads. Existing
+        // cache hits retain their original manifest and wire schema verbatim.
+        if !tags.contains_key(crate::MANIFEST_PROVENANCE_V2_TAG)
+            && request.producer_toolkit_version
+                >= ToolkitVersion::parse(crate::CONTENT_MODEL_V2_MINIMUM_READER)?
+            && crate::artifact_identity_contract(&request.semantic_key.artifact_kind)
+                .is_ok_and(|contract| contract.producer.is_some())
+        {
+            let mut disclosure =
+                if crate::artifact_kind_is_private_only(&request.semantic_key.artifact_kind) {
+                    crate::ArtifactDisclosure::PrivateOnly
+                } else if crate::artifact_semantics_admitted_to_destination(
+                    request.semantic_key,
+                    crate::PublicationDestination::Public,
+                ) {
+                    crate::ArtifactDisclosure::PublicInputs
+                } else {
+                    crate::ArtifactDisclosure::Unclassified
+                };
+            // Metadata lookup only: never reread a large numerical payload to
+            // propagate classification. Public staging revalidates the closure.
+            for dependency in &dependencies {
+                let classification = request
+                    .acceptance
+                    .and_then(|policy| {
+                        resolver
+                            .resolve_exact_manifest(
+                                &dependency.key,
+                                &dependency.content_digest,
+                                policy,
+                            )
+                            .ok()
+                    })
+                    .filter(|(_, manifest)| {
+                        manifest.quality.admissible_rank()
+                            >= dependency.required_quality.admissible_rank()
+                    })
+                    .map(|(_, manifest)| crate::local_artifact_disclosure(&manifest))
+                    .transpose()?
+                    .unwrap_or(crate::ArtifactDisclosure::Unclassified);
+                match classification {
+                    crate::ArtifactDisclosure::PrivateOnly => {
+                        disclosure = crate::ArtifactDisclosure::PrivateOnly
+                    }
+                    crate::ArtifactDisclosure::Unclassified
+                        if disclosure != crate::ArtifactDisclosure::PrivateOnly =>
+                    {
+                        disclosure = crate::ArtifactDisclosure::Unclassified
+                    }
+                    _ => {}
+                }
+            }
+            let provenance = crate::ManifestProvenanceV2 {
+                disclosure,
+                producer_annotations: BTreeMap::new(),
+                producer_receipts: Vec::new(),
+            };
+            tags.insert(
+                crate::MANIFEST_PROVENANCE_V2_TAG.into(),
+                serde_json::to_string(&provenance)?,
+            );
+        }
         tags.insert(
             SEMANTIC_KEY_MANIFEST_TAG.to_owned(),
             String::from_utf8(crate::protocol::canonical_json_bytes(request.semantic_key)?)
@@ -3229,6 +3291,11 @@ where
         // A managed kind is never written below its policy reader floor, so
         // readers released before a format change refuse the artifact.
         let mut minimum_reader_version = request.minimum_reader_version.clone();
+        if tags.contains_key(crate::MANIFEST_PROVENANCE_V2_TAG) {
+            minimum_reader_version = minimum_reader_version.max(ToolkitVersion::parse(
+                crate::CONTENT_MODEL_V2_MINIMUM_READER,
+            )?);
+        }
         if let Some(family) =
             crate::production_staging::family_for_artifact_kind(&request.semantic_key.artifact_kind)
         {

@@ -88,6 +88,8 @@ impl Fixture {
             base_series: None,
             auxiliary_series: None,
             external_profile: Some(ExternalProfileSpec {
+                value_contract: None,
+                execution_provenance: None,
                 lambda_squared: "13".into(),
                 evaluation_precision_bits: 256,
                 provider_sha256: self.digest.clone(),
@@ -167,4 +169,35 @@ fn invalid_purity_is_rejected_before_provider_side_effects() {
     assert_eq!(target.try_value(1.0).unwrap(), 1.0);
     drop(target);
     assert_eq!(fs::read_dir(&stderr).unwrap().count(), 1);
+}
+
+#[test]
+fn declared_value_admission_authenticates_without_launching_provider() {
+    let _lock = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let mut spec = fixture.spec("malformed-once");
+    spec.schema_version = 4;
+    let external = spec.external_profile.as_mut().unwrap();
+    external.value_contract = Some(xc_spectral::target::ExternalTargetValueContract {
+        schema_version: 1,
+        value_semantics: "synthetic-provider-values-v1".into(),
+        normalization: "unit-at-one".into(),
+        numerical_input_digest: xc_cache::canonical_digest(&external.input).unwrap(),
+    });
+    let stderr = fixture.root.join("admission-stderr");
+    fs::create_dir(&stderr).unwrap();
+    std::env::set_var("XC_TARGET_PROVIDER_STDERR_DIR", &stderr);
+    spec.admit_evaluation("13.0", 128).unwrap();
+    assert!(!fixture.counter.exists());
+    assert_eq!(fs::read_dir(&stderr).unwrap().count(), 0);
+    assert!(spec.admit_evaluation("14", 128).is_err());
+    assert!(spec.admit_evaluation("13", 512).is_err());
+    let identity = spec.base_value_digest().unwrap();
+    spec.external_profile.as_mut().unwrap().provider_sha256 = "f".repeat(64);
+    assert_eq!(identity, spec.base_value_digest().unwrap());
+    assert!(
+        spec.admit_evaluation("13", 128).is_err(),
+        "a stable value key never bypasses executable authorization"
+    );
+    assert_eq!(fs::read_dir(&stderr).unwrap().count(), 0);
 }

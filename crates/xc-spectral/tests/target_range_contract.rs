@@ -70,6 +70,8 @@ fn gaussian_and_external_identities_reject_previous_arithmetic_semantics() {
     external.schema_version = 3;
     external.base_series = None;
     external.external_profile = Some(ExternalProfileSpec {
+        value_contract: None,
+        execution_provenance: None,
         lambda_squared: "4".into(),
         evaluation_precision_bits: 256,
         provider_sha256: "a".repeat(64),

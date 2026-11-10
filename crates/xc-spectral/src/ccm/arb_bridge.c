@@ -7,6 +7,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+#include <gmp.h>
 #include <mpfr.h>
 #include <flint/acb.h>
 #include <flint/acb_hypgeom.h>
@@ -28,7 +30,32 @@ size_t xc_arb_slong_size(void)
 
 const char *xc_arb_flint_version(void)
 {
-    return FLINT_VERSION;
+    return flint_version;
+}
+
+const char *xc_arb_flint_header_version(void) { return FLINT_VERSION; }
+
+/* Every Rust entry point checks this before sharing GMP/MPFR objects with
+ * FLINT. Build-time probes alone cannot detect runtime DLL substitutions.
+ * This reads the calling thread's context; it never changes arithmetic state.
+ */
+#define XC_ARB_STRINGIFY_INNER(x) #x
+#define XC_ARB_STRINGIFY(x) XC_ARB_STRINGIFY_INNER(x)
+int xc_arb_native_compatible(size_t rust_mpfr_size, size_t rust_mpq_size,
+    size_t rust_slong_size, int64_t rust_emin, int64_t rust_emax)
+{
+    const char *gmp_headers = XC_ARB_STRINGIFY(__GNU_MP_VERSION) "."
+        XC_ARB_STRINGIFY(__GNU_MP_VERSION_MINOR) "."
+        XC_ARB_STRINGIFY(__GNU_MP_VERSION_PATCHLEVEL);
+    return mpfr_buildopt_tls_p() != 0 &&
+        strcmp(gmp_version, gmp_headers) == 0 &&
+        strcmp(mpfr_get_version(), MPFR_VERSION_STRING) == 0 &&
+        strcmp(flint_version, FLINT_VERSION) == 0 &&
+        sizeof(__mpfr_struct) == rust_mpfr_size &&
+        sizeof(__mpq_struct) == rust_mpq_size &&
+        sizeof(slong) == rust_slong_size &&
+        (int64_t)mpfr_get_emin() == rust_emin &&
+        (int64_t)mpfr_get_emax() == rust_emax;
 }
 
 /* Exact secular numerator only. A node stores integer polynomials A,B with

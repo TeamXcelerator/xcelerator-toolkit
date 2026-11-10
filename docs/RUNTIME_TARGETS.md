@@ -1,17 +1,50 @@
 # Runtime target profiles
 
-`XC_TARGET_SPEC_FILE` names a JSON target specification. A complete specification
-digest and external protocol-policy marker bind target-dependent identities. Changing the target or its
-provider
-creates new derived artifacts; original states and older measurements remain.
+`XC_TARGET_SPEC_FILE` names a JSON target specification. Target-derived artifacts
+remain private. Their cache identity describes the values actually consumed;
+producer attribution and provider authorization are checked separately.
 
-Schema 1 retains the existing Gaussian-polynomial evaluator and canonical digests.
-Schema 3 delegates evaluation to an independently supplied executable. The Toolkit
-does not include that executable or interpret its opaque input.
+Schema 1 uses the built-in Gaussian-polynomial evaluator. Schema 3 delegates to
+an independently supplied executable and retains its conservative full-descriptor
+identity. Schema 4 adds an explicit numerical input contract for callers that can
+separate provider input from execution provenance. The Toolkit contains neither
+the caller's private target function nor its provider implementation.
+
+## Declared values (schema 4)
+
+Schema 4 uses the external fields below and additionally requires
+`external_profile.value_contract`:
+
+- `schema_version`: `1`;
+- `value_semantics`: a stable identifier for the value-affecting provider mathematics;
+- `normalization`: the declared numerical normalization;
+- `numerical_input_digest`: Toolkit canonical SHA-256 of the **entire** `input` value.
+
+Every provider-consumed value must be in `input`. Toolkit does not strip fields
+from opaque JSON. Use decimal strings for precise coefficients. Optional
+`execution_provenance` holds preparation/source attribution and is not sent to
+the numerical provider. Executable hashes, source labels and execution receipts
+are recorded in private manifest annotations, outside the numerical key.
+
+Base and auxiliary target identities are separate. Base-only distances and finite
+samples ignore auxiliary-only changes. Decomposition binds both. Actual consumer
+precision, grid, normalization and coverage remain material; the descriptor's
+maximum authorized precision is an admission ceiling. Changing that ceiling
+alone does not change a schema-4 value identity.
+
+Before lookup, Toolkit validates the contract, requested cutoff and precision,
+and the authorized executable's exact hash. A hit does not launch a provider.
+A changed executable still needs current authorization even when its declared
+mathematical values are unchanged. A miss evaluates and validates the provider
+normally. Warm artifacts retain their original producer attribution.
+
+The schema-3 digest API remains available for legacy descriptors. It cannot infer
+which opaque fields are numerical, so legacy cached keys are not silently mapped
+to schema-4 requests. Existing-cache mapping is a separate operation.
 
 ## External provider
 
-A schema-3 specification has `schema_version`, an opaque `profile_id`, and
+A schema-3 or schema-4 specification has `schema_version`, an opaque `profile_id`, and
 `external_profile` with these fields:
 
 - `lambda_squared`: decimal cutoff squared, greater than one;
@@ -89,7 +122,7 @@ the duration of a run. A precision declaration is not an approximation certifica
 
 Both schemas support the existing optional auxiliary profile, whose scientific
 interpretation remains the caller's responsibility. Schema 2 is no longer accepted;
-prepare a new schema-3 input with the external provider. Existing target-dependent
+prepare a schema-3 input or an explicitly declared schema-4 value contract with the external provider. Existing target-dependent
 artifacts keep their original identities and are not relabeled or replaced.
 
 Distance entry points check the cutoff before warm reuse. Target-independent
@@ -100,8 +133,9 @@ This interface supports target distances and residual diagnostics. It does not
 supply transform jets, atom tables, or proof hypotheses; those require separately
 identified [external reference inputs](ULTRA_COMPLETENESS.md).
 
-`profile_id` is part of the target identity. Renaming it also creates new
-target-dependent identities. Protocol envelopes and precision declarations do
+For legacy opaque schema 3, `profile_id` is part of the target identity, so
+renaming it changes target-dependent identities. Schema 4 keeps the label in
+producer metadata and reuses the same declared target values. Protocol envelopes and precision declarations do
 not upgrade point measurements to certified distances.
 
 The versioned external protocol has a distinct digest domain. Earlier external
@@ -150,5 +184,16 @@ Protocol 2 providers must echo `request_nonce` exactly along with the other
 request fields. A response prepared before receiving its request cannot predict
 this nonce. Unsolicited frames, mismatches, and legacy protocol 1 replies terminate
 the connection. Provider migration requires reading and echoing the nonce; the
-provider executable digest and the target evaluator identity change accordingly.
+provider executable digest changes accordingly. This changes the legacy
+schema-3 evaluator identity; schema 4 retains the value identity when its declared
+value contract is unchanged. Authorization is checked again before reuse.
 OS entropy comes from the workspace's existing pinned `getrandom` dependency.
+
+Finite runtime target preparation uses two private managed artifacts: uniform
+log-coordinate samples, followed by their finite even Fourier projection. Sample
+lookup uses declared base target values, cutoff, precision and grid before an
+evaluator is launched. Projection lookup uses the retained samples, precision
+and mode coverage. Eigenvector values and provider labels do not enter these
+keys. Each selected manifest retains its exact producer metadata; the projection
+retains its selected sample parent. Changes of mode coverage can reuse samples.
+These finite measurements do not supply a quadrature or infinite-tail certificate.

@@ -509,7 +509,7 @@ pub fn execute_local_prune(
         })?;
         hasher.update(&buffer[..read]);
     }
-    let observed_digest = ContentDigest(format!("{:x}", hasher.finalize()));
+    let observed_digest = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
     if observed_size != candidate.local_file_size_bytes
         || observed_digest != candidate.local_file_digest
     {

@@ -1,7 +1,7 @@
 //! One-step, resumable orchestration of a complete publication target.
 
 use crate::{
-    execute_next_finalization_step, execute_next_payload_batch,
+    execute_next_finalization_step_admitted, execute_next_payload_batch_admitted,
     stage_immutable_publication_metadata, stage_publication_discoverability,
     AuthenticatedGitHubSession, CacheError, CapacityLedger, DiscoverabilityStageReport,
     ImmutableMetadataStageReport, PublicSanitizerProfile, PublicationDestination,
@@ -207,6 +207,13 @@ pub fn advance_publication_target(
         .check()
         .map_err(|error| CacheError::Cancelled(error.to_string()))?;
     journal.validate()?;
+    let admission = crate::admit_publication_with_staging(
+        journal,
+        destination,
+        execution.bundle,
+        execution.public_sanitizer,
+        execution.staging_root,
+    )?;
     let target = journal.targets.get(&destination).ok_or_else(|| {
         CacheError::InvalidTransition(format!(
             "transaction has no {destination:?} publication target"
@@ -235,7 +242,7 @@ pub fn advance_publication_target(
         .iter()
         .any(|batch| batch.state != crate::PublicationBatchState::RemoteVerified)
     {
-        let outcome = execute_next_payload_batch(
+        let outcome = execute_next_payload_batch_admitted(
             remote,
             checkpoints,
             cancellation,
@@ -245,6 +252,7 @@ pub fn advance_publication_target(
             execution.resources,
             journal,
             destination,
+            &admission,
         )?;
         return Ok(PublicationAdvanceOutcome::Payload(outcome));
     }
@@ -267,7 +275,7 @@ pub fn advance_publication_target(
         .is_some_and(|commit| commit.state != crate::PublicationCommitState::RemoteVerified)
     {
         return Ok(PublicationAdvanceOutcome::Finalization(
-            execute_next_finalization_step(
+            execute_next_finalization_step_admitted(
                 remote,
                 checkpoints,
                 cancellation,
@@ -275,6 +283,7 @@ pub fn advance_publication_target(
                 execution.finalization_policy,
                 journal,
                 destination,
+                &admission,
             )?,
         ));
     }
@@ -318,7 +327,7 @@ pub fn advance_publication_target(
         return Ok(PublicationAdvanceOutcome::DiscoverabilityStaged(report));
     }
     Ok(PublicationAdvanceOutcome::Finalization(
-        execute_next_finalization_step(
+        execute_next_finalization_step_admitted(
             remote,
             checkpoints,
             cancellation,
@@ -326,6 +335,7 @@ pub fn advance_publication_target(
             execution.finalization_policy,
             journal,
             destination,
+            &admission,
         )?,
     ))
 }
@@ -425,6 +435,7 @@ mod tests {
         };
         let transport_digest = encoding.digest().unwrap();
         let manifest = CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
             artifact_family: "ccm".to_owned(),
             semantic_key,
@@ -443,6 +454,7 @@ mod tests {
         let manifest_digest = manifest.digest().unwrap();
         let evidence_digest = ContentDigest::sha256(b"validator-evidence");
         let bundle = PublicationMetadataBundle {
+            required_manifests: Vec::new(),
             schema_version: 1,
             family: "ccm".to_owned(),
             manifest,

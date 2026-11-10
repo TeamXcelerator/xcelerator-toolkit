@@ -102,10 +102,8 @@ fn capture(s: &RetainedState, i: &ExternalResearchInputs, p: u32) -> ExtendedAna
     let record = capture_extended("tail_operator", s, None, None, Some(i), &o, &[], &context())
         .unwrap()
         .value;
-    assert_eq!(
-        record.semantics,
-        xc_spectral::ccm::retained_evidence::SEMANTICS
-    );
+    assert_eq!(record.schema_version, 2);
+    assert_eq!(record.semantics, "ccm_tail_operator_analysis/value-v1");
     assert_eq!(
         record.request["tail_model_arithmetic"],
         "declared_points_exact_dyadic_recipe_forms_v2"

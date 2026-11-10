@@ -34,7 +34,7 @@ impl ProfileTargets {
         }
         let spec = crate::target::TargetProfileSpec::from_environment()?;
         anyhow::ensure!(
-            spec.digest()? == target.definition_digest(),
+            spec.digest()? == target.base_value_digest(),
             "runtime target specification changed after its semantic identity was fixed"
         );
         let workers = crate::ccm::research_target::sample_workers(&spec, points.len())?
@@ -113,7 +113,7 @@ impl BoundTarget {
         let spec = crate::target::TargetProfileSpec::from_environment()?;
         let target = crate::target::hp::TargetEvaluator::from_spec(&spec, working)?;
         target.validate_lambda(lambda)?;
-        if expected.is_some_and(|value| value != target.definition_digest()) {
+        if expected.is_some_and(|value| value != target.base_value_digest()) {
             anyhow::bail!(
                 "runtime target specification changed after its semantic identity was fixed"
             );

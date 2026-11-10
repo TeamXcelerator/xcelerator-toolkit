@@ -250,7 +250,7 @@ where
             "encoded package must not be empty".to_owned(),
         ));
     }
-    let package_digest = ContentDigest(format!("{:x}", package_hasher.finalize()));
+    let package_digest = ContentDigest(xc_core::hex_lower(&package_hasher.finalize()));
     let unique_paths = ordered_parts
         .iter()
         .map(|part| &part.repository_path)
@@ -1327,7 +1327,13 @@ pub fn build_payload_batch_record(
     let batch = target.batches.get(sequence).ok_or_else(|| {
         CacheError::InvalidTransition(format!("unknown publication batch {sequence}"))
     })?;
-    if batch.state != PublicationBatchState::Committed {
+    if !matches!(
+        batch.state,
+        PublicationBatchState::Committed
+            | PublicationBatchState::PayloadVerified
+            | PublicationBatchState::RecordCommitted
+            | PublicationBatchState::RemoteVerified
+    ) {
         return Err(CacheError::InvalidTransition(
             "payload batch record requires a committed, independently verified payload".to_owned(),
         ));

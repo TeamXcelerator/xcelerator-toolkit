@@ -153,7 +153,7 @@ impl<'a, 'resources, R: Read + Seek> CheckedRead<'a, 'resources, R> {
         })
     }
     fn verify(self, digest: &ContentDigest) -> Result<()> {
-        if self.read != self.expected || format!("{:x}", self.hash.finalize()) != digest.0 {
+        if self.read != self.expected || xc_core::hex_lower(&self.hash.finalize()) != digest.0 {
             bail!("unapproved or invalid retained research source");
         }
         Ok(())

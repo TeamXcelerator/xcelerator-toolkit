@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ccm_indexed_transform_analysis retained observation v2",
+  "description": "Retained observation payload; exact requests and ancestry are authenticated by the manifest. Shape validation is not numerical proof. Separate same-kind finite/cohort/preparation APIs retain their own data validators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "kind",
+    "scope",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "semantics": {
+      "const": "ccm_indexed_transform_analysis/value-v1"
+    },
+    "kind": {
+      "const": "ccm_indexed_transform_analysis"
+    },
+    "scope": {
+      "const": "finite_point_inputs; no_source_error_enclosure; no_ground_selection_or_convergence_certificate"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coordinate",
+        "normalization",
+        "input_role",
+        "source_precision_bits",
+        "working_precision_bits",
+        "finite_support",
+        "physical_tail",
+        "second_derivative_cauchy_schwarz_expression",
+        "rows"
+      ],
+      "properties": {
+        "coordinate": {
+          "type": "string"
+        },
+        "normalization": {
+          "type": "string"
+        },
+        "input_role": {
+          "type": "string"
+        },
+        "source_precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "working_precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "finite_support": {
+          "type": "string"
+        },
+        "physical_tail": {
+          "type": "string"
+        },
+        "second_derivative_cauchy_schwarz_expression": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ordinal",
+              "source_status",
+              "t",
+              "outcome",
+              "value",
+              "derivative",
+              "sum_absolute_terms",
+              "sum_absolute_derivative_terms",
+              "cancellation_digits",
+              "newton_correction",
+              "newton_remainder"
+            ],
+            "properties": {
+              "ordinal": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "source_status": {
+                "type": "string"
+              },
+              "t": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "missing_input",
+                  "point_measurement",
+                  "unresolved_derivative",
+                  "cancellation_limited"
+                ]
+              },
+              "value": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "derivative": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "sum_absolute_terms": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "sum_absolute_derivative_terms": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "cancellation_digits": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "newton_correction": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "newton_remainder": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "expected_rows": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

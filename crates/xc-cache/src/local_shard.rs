@@ -181,10 +181,7 @@ pub fn read_local_shard_json(
         ));
     }
     if descriptor.visibility == CacheVisibility::Public
-        && !artifact_semantics_admitted_to_destination(
-            &canonical.semantic_key,
-            PublicationDestination::Public,
-        )
+        && !crate::manifest_admitted_to_destination(&canonical, PublicationDestination::Public)
     {
         return Err(invalid(
             "artifact semantics are not eligible for the public shard",
@@ -455,6 +452,7 @@ mod tests {
         };
         let version = ToolkitVersion::parse("0.18.0").unwrap();
         let canonical = CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
             artifact_family: "ccm-matrices".into(),
             semantic_digest: semantic.digest().unwrap(),

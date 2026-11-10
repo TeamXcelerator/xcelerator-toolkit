@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "research_reference_dataset retained observation v2",
+  "description": "Retained observation payload; exact requests and ancestry are authenticated by the manifest. Shape validation is not numerical proof. Separate same-kind finite/cohort/preparation APIs retain their own data validators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "kind",
+    "scope",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "semantics": {
+      "const": "research_reference_dataset/value-v1"
+    },
+    "kind": {
+      "const": "research_reference_dataset"
+    },
+    "scope": {
+      "const": "finite_point_inputs; no_source_error_enclosure; no_ground_selection_or_convergence_certificate"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "role",
+        "attribution",
+        "coordinate",
+        "precision_bits",
+        "points"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "role": {
+          "enum": [
+            "known_zeta_ordinates",
+            "evaluation_points",
+            "retained_ccm_roots"
+          ]
+        },
+        "attribution": {
+          "type": "string"
+        },
+        "coordinate": {
+          "const": "mellin_t"
+        },
+        "precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "points": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ordinal",
+              "value",
+              "source_status"
+            ],
+            "properties": {
+              "ordinal": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "value": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "source_status": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "expected_rows": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

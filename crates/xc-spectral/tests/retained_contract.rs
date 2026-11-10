@@ -192,14 +192,31 @@ fn strict_scalar_admission_and_authenticated_definitions_preserve_identity() {
     let reference = retained_reference(&input);
     let mut copy = reference.spec().clone();
     copy.coefficients[1] = "4".into();
-    assert_eq!(reference.spec(), &input);
+    let mut numerical = input.clone();
+    numerical.definition = "finite supplied centered Fourier coefficient values".into();
+    assert_eq!(reference.spec(), &numerical);
     let first = capture_reference(&input, &context()).unwrap().value;
+    let mut relabeled = input.clone();
+    relabeled.definition = "alternate attribution for identical coefficients".into();
+    let alias = capture_reference(&relabeled, &context()).unwrap().value;
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&alias).unwrap()
+    );
     let second = capture_reference(&copy, &context()).unwrap().value;
     assert_ne!(first.request, second.request);
     assert_ne!(first.data.definition_digest, second.data.definition_digest);
-    assert_eq!(first.semantics, SEMANTICS);
-    let mut legacy = serde_json::to_value(first).unwrap();
-    legacy["semantics"] = json!("ccm-retained-research-observations-v1");
+    assert_eq!(first.schema_version, 2);
+    assert_eq!(first.semantics, "ccm_reference_source/value-v1");
+    // Exercise the real legacy wire contract, including its original digest.
+    let mut legacy_record = first;
+    legacy_record.schema_version = 1;
+    legacy_record.semantics = "ccm-retained-research-observations-v1".into();
+    legacy_record.request = serde_json::to_value(&input).unwrap();
+    legacy_record.data.spec = input.clone();
+    legacy_record.data.definition_digest =
+        ContentDigest::sha256(&serde_json::to_vec(&input).unwrap());
+    let mut legacy = serde_json::to_value(legacy_record).unwrap();
     let (m, b) = source("ccm_reference_source", legacy.clone());
     assert!(
         RetainedReference::from_payload(&m, &b, std::slice::from_ref(&m.content_digest)).is_ok()

@@ -9,6 +9,8 @@ fn external(input: serde_json::Value) -> TargetProfileSpec {
         profile_id: "manufactured-exact-provider-input".into(),
         base_series: None,
         external_profile: Some(ExternalProfileSpec {
+            value_contract: None,
+            execution_provenance: None,
             lambda_squared: "13".into(),
             evaluation_precision_bits: 256,
             provider_sha256: "a".repeat(64),

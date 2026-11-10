@@ -3,6 +3,7 @@
 /// Fourier sign shared by retained-root complex and enclosed contour producers.
 pub(crate) const FOURIER_SEMANTICS: &str = "retained_fourier_minus_sign_at_original_coordinates_v1";
 
+use super::sector_gap_certificate::SectorGapCertificateRef;
 use super::{
     extended_research::*, research_completion::CompletionInputs, retained_evidence::*,
     state_geometry::RetainedState,
@@ -333,10 +334,63 @@ mod certified {
         o: &ExtensionOptions,
         c: &super::super::sector_gap_certificate::PortableCcmSectorGapCertificate,
     ) -> Result<I> {
-        if c.lambda_squared != s.cutoff
-            || c.n_modes != s.modes
-            || !c.certifies_finite_ground_state_simple
-            || c.certified_finite_ground_parity != "even"
+        state_error_arithmetic(
+            s,
+            o,
+            &c.lambda_squared,
+            c.n_modes,
+            c.certifies_finite_ground_state_simple,
+            &c.certified_finite_ground_parity,
+            &c.cutoff_free_tau,
+            &c.even_first_excited.lower,
+            &c.odd_ground.lower,
+        )
+    }
+
+    pub(super) fn state_error_ref(
+        s: &RetainedState,
+        o: &ExtensionOptions,
+        c: SectorGapCertificateRef<'_>,
+    ) -> Result<I> {
+        match c {
+            SectorGapCertificateRef::Full(c) => state_error(s, o, c),
+            SectorGapCertificateRef::Compact(c) => {
+                let _stage = Stage::new("compact source certificate replay and reassembly");
+                let verified =
+                    super::super::sector_gap_certificate::compact::retained::reconstruct(c)?;
+                let c = verified.certificate();
+                state_error_arithmetic(
+                    s,
+                    o,
+                    &c.integer_cutoff_c.to_string(),
+                    c.n_modes,
+                    c.certifies_finite_ground_state_simple,
+                    &c.certified_finite_ground_parity,
+                    verified.canonical_tau(),
+                    &c.even_first_excited.lower,
+                    &c.odd_ground.lower,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn state_error_arithmetic(
+        s: &RetainedState,
+        o: &ExtensionOptions,
+        cutoff: &str,
+        n_modes: usize,
+        simple: bool,
+        parity: &str,
+        tau: &[xc_certify::ExactRationalIntervalRecord],
+        next_even_lower: &xc_certify::ExactRationalRecord,
+        next_odd_lower: &xc_certify::ExactRationalRecord,
+    ) -> Result<I> {
+        if cutoff != s.cutoff
+            || n_modes != s.modes
+            || !simple
+            || parity != "even"
+            || s.coefficients.len().checked_mul(s.coefficients.len()) != Some(tau.len())
         {
             bail!("source certificate does not isolate this finite even ground");
         }
@@ -355,9 +409,8 @@ mod certified {
             .map(|x| x.div(&norm))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let e = decimal(&s.eigenvalue, p)?;
-        let next_even =
-            I::from_rational(&xc_certify::exact::parse(&c.even_first_excited.lower)?, p);
-        let next_odd = I::from_rational(&xc_certify::exact::parse(&c.odd_ground.lower)?, p);
+        let next_even = I::from_rational(&xc_certify::exact::parse(next_even_lower)?, p);
+        let next_odd = I::from_rational(&xc_certify::exact::parse(next_odd_lower)?, p);
         let next = if next_even.lower() < next_odd.lower() {
             next_even
         } else {
@@ -367,7 +420,7 @@ mod certified {
         if !gap.is_strictly_positive() {
             bail!("source energy is not below the certified complementary spectrum");
         }
-        let residual = squared_residual(&c.cutoff_free_tau, &v, &e, p)?;
+        let residual = squared_residual(tau, &v, &e, p)?;
         let angle = residual.sqrt()?.div(&gap)?;
         if angle.upper() >= &1 {
             bail!("source residual does not resolve a finite ground angle");
@@ -485,12 +538,12 @@ mod certified {
             },
         )
     }
-    pub(crate) fn analyze(
+    pub(crate) fn analyze_with_certificate_ref(
         s: &RetainedState,
         roots: Option<&RetainedRoots>,
         o: &ExtensionOptions,
         input: Option<&CompletionInputs>,
-        certificate: Option<&super::super::sector_gap_certificate::PortableCcmSectorGapCertificate>,
+        certificate: Option<SectorGapCertificateRef<'_>>,
         source_precision: u32,
     ) -> Result<ExtendedAnalysis> {
         let mut out = report("transform_enclosure", s, o);
@@ -499,11 +552,11 @@ mod certified {
         let half = l.div(&I::from_i64(2, p))?;
         let mut source_error = None;
         if let Some(c) = certificate {
-            match state_error(s, o, c) {
+            match state_error_ref(s, o, c) {
                 Ok(e) => {
                     bounds(&mut out.values, "unit_state_l2_error", &e)?;
                     source_error = Some(e);
-                    out.reason=Some(format!("source certificate replayed; conditional on {} and the certificate's recorded cutoff-free assembly enclosure; no infinite source error claim",c.parity_invariance_premise));
+                    out.reason=Some(format!("source certificate replayed; conditional on {} and the certificate's recorded cutoff-free assembly enclosure; no infinite source error claim",c.parity_invariance_premise()));
                 }
                 Err(e) => {
                     out.outcome = "partial_unresolved".into();
@@ -877,7 +930,52 @@ mod certified {
     }
 }
 #[cfg(feature = "arb")]
-pub(crate) use certified::analyze;
+pub(crate) use certified::analyze_with_certificate_ref;
+
+#[cfg(feature = "arb")]
+pub(crate) fn analyze(
+    s: &RetainedState,
+    roots: Option<&RetainedRoots>,
+    o: &ExtensionOptions,
+    input: Option<&CompletionInputs>,
+    certificate: Option<&super::sector_gap_certificate::PortableCcmSectorGapCertificate>,
+    source_precision: u32,
+) -> Result<ExtendedAnalysis> {
+    analyze_with_certificate_ref(
+        s,
+        roots,
+        o,
+        input,
+        certificate.map(SectorGapCertificateRef::Full),
+        source_precision,
+    )
+}
+
+#[cfg(not(feature = "arb"))]
+pub(crate) fn analyze_with_certificate_ref(
+    s: &RetainedState,
+    roots: Option<&RetainedRoots>,
+    o: &ExtensionOptions,
+    input: Option<&CompletionInputs>,
+    _certificate: Option<SectorGapCertificateRef<'_>>,
+    source_precision: u32,
+) -> Result<ExtendedAnalysis> {
+    analyze(s, roots, o, input, None, source_precision)
+}
+
+#[cfg(feature = "arb")]
+pub(crate) fn verified_state_error_ref(
+    s: &RetainedState,
+    c: SectorGapCertificateRef<'_>,
+    precision: u32,
+) -> Result<xc_numerics::mpfr_interval::MpfrInterval> {
+    if precision < s.precision || precision < c.precision_bits() || precision > 1_000_000 {
+        anyhow::bail!("source-bound transfer requires nondecreasing supported precision");
+    }
+    let mut options = ExtensionOptions::for_source(s);
+    options.working_precision_bits = precision;
+    certified::state_error_ref(s, &options, c)
+}
 
 #[cfg(feature = "arb")]
 pub(crate) fn verified_state_error(

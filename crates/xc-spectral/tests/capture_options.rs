@@ -122,11 +122,18 @@ fn changing_sector_capture_request_must_not_silently_reuse_the_old_request() {
                 "2"
             );
         }
-        assert!(value["source_dependencies"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|d| d["key"]["kind"] == "ccm_weil_eigenpair"));
+        assert!(value.get("source_dependencies").is_none());
+        let reference = &measurement.value_reference.as_ref().unwrap().artifacts[0];
+        let (_, manifest) = resolver
+            .resolve_exact_manifest(&reference.key, &reference.content_digest, &policy)
+            .unwrap();
+        assert!(
+            manifest
+                .dependencies
+                .iter()
+                .any(|d| d.key.kind == "ccm_weil_eigenpair"),
+            "exact producer ancestry belongs in the manifest"
+        );
     }
     // A supplied target gives constrained_l1_fit its automatic reference
     // amplitude baseline, a certified finite enclosure.

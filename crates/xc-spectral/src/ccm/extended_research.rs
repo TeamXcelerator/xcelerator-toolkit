@@ -4,6 +4,7 @@ use super::retained_evidence::{
     managed, matrix_ancestry, point, precision, scalar, solve_gram_checked, transform,
     transform_math, ResearchRecord, RetainedMatrix, RetainedRoots,
 };
+use super::sector_gap_certificate::SectorGapCertificateRef;
 use super::state_geometry::RetainedState;
 use anyhow::{bail, Result};
 use rayon::prelude::*;
@@ -27,6 +28,8 @@ mod compactness_math;
 mod directional_math;
 #[path = "extended_research/energy_math.rs"]
 mod energy_math;
+#[path = "extended_research/input_contract.rs"]
+mod input_contract;
 #[path = "extended_research/weighted_math.rs"]
 mod weighted_math;
 
@@ -259,6 +262,9 @@ pub struct EnergyAllowance {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalResearchInputs {
+    /// Acquisition attribution; excluded by every per-diagnostic numerical input view.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub producer_annotations: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_once: Option<super::convergence_capture::RunOnceInputs>,
     #[doc(hidden)]
@@ -342,8 +348,9 @@ impl ExternalResearchInputs {
             },
             self,
         )?;
-        let key = ContentDigest(format!("{:x}", hash.finalize()));
-        let content = content_validation_key(&ContentDigest(format!("{:x}", content.finalize())));
+        let key = ContentDigest(xc_core::hex_lower(&hash.finalize()));
+        let content =
+            content_validation_key(&ContentDigest(xc_core::hex_lower(&content.finalize())));
         if !VALIDATED_INPUTS.with(|memo| memo.borrow().contains(&key)) {
             self.validate_values()?;
             remember_validated(key);
@@ -651,7 +658,7 @@ fn content_validation_key(digest: &ContentDigest) -> ContentDigest {
     hash.update(rug::float::exp_min().to_le_bytes());
     hash.update(rug::float::exp_max().to_le_bytes());
     hash.update(digest.0.as_bytes());
-    ContentDigest(format!("{:x}", hash.finalize()))
+    ContentDigest(xc_core::hex_lower(&hash.finalize()))
 }
 
 /// Remember a successful validation key (eight inputs, two keys each).
@@ -2346,49 +2353,6 @@ pub(super) fn capture_external_source_with_parents(
         },
     )
 }
-/// The capture adapter needs the source manifest, not another owned input.
-/// All validation operands are named in the memo context; the semantic request
-/// and produced payload are identical to capture_external_source_with_parents.
-pub(super) fn admit_external_source_with_parents(
-    s: &RetainedState,
-    i: &ExternalResearchInputs,
-    parents: &[ArtifactManifest],
-    cache: &ArtifactCacheContext<'_>,
-) -> Result<ArtifactExecutionCacheResult<xc_cache::SharedValidated<()>>> {
-    let _stage =
-        xc_core::performance_stage("ccm.capture.external_input_admission", Default::default());
-    i.matches(s)?;
-    let digest = input_content_digest(i)?;
-    let context = xc_cache::ValidatedValueMemoContext::exact(
-        ContentDigest::sha256_json(&(
-            "external-input-complete-admission-v1",
-            &digest,
-            &s.manifest,
-            &s.cutoff,
-            s.modes,
-            s.precision,
-            rug::float::exp_min(),
-            rug::float::exp_max(),
-        ))?
-        .0,
-    );
-    super::retained_evidence::managed_admission(
-        INPUT_KIND,
-        json!({"input_digest":digest}),
-        &[std::slice::from_ref(&s.manifest), parents].concat(),
-        cache,
-        &context,
-        || Ok(i.clone()),
-        |r| {
-            if r != i {
-                r.matches(s)?;
-                bail!("external research source mismatch");
-            }
-            i.matches(s)
-        },
-    )
-}
-
 /// Number of numeric scalars (strings or numbers) in a JSON value.
 fn json_scalars(value: &serde_json::Value) -> u128 {
     match value {
@@ -2399,10 +2363,19 @@ fn json_scalars(value: &serde_json::Value) -> u128 {
     }
 }
 
-/// True when any part of the diagnostic was left unresolved by the configurable
-/// working-byte budget (`XC_RESEARCH_WORKING_BYTES`).
-fn working_budget_limited(analysis: &ExtendedAnalysis) -> bool {
-    serde_json::to_string(analysis).is_ok_and(|text| text.contains("working-byte budget"))
+/// Execution-budget refusals are retryable outcomes, never reusable observations.
+/// Requested row coverage and mathematical conditional-budget results remain
+/// material evidence; only the producer's explicit execution refusal messages
+/// are classified here.
+fn execution_budget_limited(analysis: &ExtendedAnalysis) -> bool {
+    let limited = |text: &str| {
+        text.contains("working-byte budget") || text.contains("exceeds XC_RESEARCH_BASIS_BYTES")
+    };
+    analysis.reason.as_deref().is_some_and(limited)
+        || analysis
+            .rows
+            .iter()
+            .any(|row| row.notes.iter().any(|note| limited(note)))
 }
 
 /// A finite diagnostic computed from immutable admitted primary sources and
@@ -2466,6 +2439,33 @@ pub fn capture_extended_with_certificate(
     )
 }
 
+/// Capture using the actual full or compact certificate payload and manifest.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_extended_with_certificate_ref(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    input: Option<&ExternalResearchInputs>,
+    sector_certificate: Option<(SectorGapCertificateRef<'_>, &ArtifactManifest)>,
+    options: &ExtensionOptions,
+    parent_manifests: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
+    capture_extended_prepared_ref(
+        id,
+        s,
+        m,
+        roots,
+        input,
+        sector_certificate,
+        options,
+        parent_manifests,
+        cache,
+        None,
+    )
+}
+
 /// Claim of a look-ahead result for the computation step, given the
 /// effective options and whether the computation is plain (no roots,
 /// certificate, directional source or exceeded row budget).
@@ -2501,6 +2501,31 @@ pub(crate) fn extended_compute(
     directional_source: Option<&ExtendedAnalysis>,
     budget_exceeded: bool,
 ) -> Result<ExtendedAnalysis> {
+    extended_compute_with_certificate_ref(
+        id,
+        s,
+        m,
+        roots,
+        options,
+        input,
+        run_certificate.map(SectorGapCertificateRef::Full),
+        directional_source,
+        budget_exceeded,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extended_compute_with_certificate_ref(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    options: &ExtensionOptions,
+    input: Option<&ExternalResearchInputs>,
+    run_certificate: Option<SectorGapCertificateRef<'_>>,
+    directional_source: Option<&ExtendedAnalysis>,
+    budget_exceeded: bool,
+) -> Result<ExtendedAnalysis> {
     let _stage = super::capture_runtime::Stage::new(format!("{id} compute"));
     if budget_exceeded {
         return Ok(unresolved(
@@ -2520,9 +2545,31 @@ pub(crate) fn extended_compute(
         "spectral_cluster" => cluster(s, m, options, input),
         "resolution_budget" => resolution(s, roots, options, input),
         "energy_allowance" => allowance(s, options, input),
-        _ if super::research_completion::DIAGNOSTICS.contains(&id) => {
-            super::research_completion::analyze(id, s, m, roots, options, input, run_certificate)
-        }
+        _ if super::research_completion::DIAGNOSTICS.contains(&id) => match run_certificate {
+            Some(SectorGapCertificateRef::Compact(_)) => {
+                super::research_completion::analyze_with_certificate_ref(
+                    id,
+                    s,
+                    m,
+                    roots,
+                    options,
+                    input,
+                    run_certificate,
+                )
+            }
+            full => super::research_completion::analyze(
+                id,
+                s,
+                m,
+                roots,
+                options,
+                input,
+                full.and_then(|c| match c {
+                    SectorGapCertificateRef::Full(c) => Some(c),
+                    _ => None,
+                }),
+            ),
+        },
         _ => {
             super::convergence_capture::analyze(id, s, m, roots, options, input, directional_source)
         }
@@ -2553,6 +2600,34 @@ pub(crate) fn capture_extended_prepared(
         &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
         &ArtifactManifest,
     )>,
+    options: &ExtensionOptions,
+    parent_manifests: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+    prepared: Option<ExtendedPrepared<'_>>,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
+    capture_extended_prepared_ref(
+        id,
+        s,
+        m,
+        roots,
+        input,
+        sector_certificate.map(|(c, m)| (SectorGapCertificateRef::Full(c), m)),
+        options,
+        parent_manifests,
+        cache,
+        prepared,
+    )
+}
+
+/// Prepared capture with representation-aware, digest-bound source admission.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_extended_prepared_ref(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    input: Option<&ExternalResearchInputs>,
+    sector_certificate: Option<(SectorGapCertificateRef<'_>, &ArtifactManifest)>,
     options: &ExtensionOptions,
     parent_manifests: &[ArtifactManifest],
     cache: &ArtifactCacheContext<'_>,
@@ -2607,10 +2682,7 @@ fn capture_extended_prepared_with_transform_guard(
     m: Option<&RetainedMatrix<'_>>,
     roots: Option<&RetainedRoots>,
     input: Option<&ExternalResearchInputs>,
-    sector_certificate: Option<(
-        &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
-        &ArtifactManifest,
-    )>,
+    sector_certificate: Option<(SectorGapCertificateRef<'_>, &ArtifactManifest)>,
     options: &ExtensionOptions,
     parent_manifests: &[ArtifactManifest],
     cache: &ArtifactCacheContext<'_>,
@@ -2624,7 +2696,12 @@ fn capture_extended_prepared_with_transform_guard(
     let effective_options = effective_options(options, &resource_policy);
     let options = &effective_options;
     options.validate(s)?;
-    let admitted = input.map(AdmittedInput::new).transpose()?;
+    let external_values = input_contract::external_values(id, input)?;
+    // Unused optional sources never enter admission, keying or computation.
+    let input = external_values.as_ref().and(input);
+    let m = m.filter(|_| input_contract::uses_matrix(id));
+    let roots = roots.filter(|_| input_contract::uses_roots(id));
+    let _admitted = input.map(AdmittedInput::new).transpose()?;
     if let Some(i) = input {
         i.matches(s)?;
         if options.working_precision_bits < i.precision_bits {
@@ -2646,13 +2723,33 @@ fn capture_extended_prepared_with_transform_guard(
         }
         sources.extend([r.manifest.clone(), r.secular_manifest.clone()]);
     }
-    let input_digest = if let Some(i) = input {
-        let result = admit_external_source_with_parents(s, i, parent_manifests, cache)?;
-        let manifest = result.produced_manifest.or(result.reused_manifest);
-        if let Some(m) = manifest {
-            sources.push(m);
+    let input_digest = if let (Some(i), Some(values)) = (input, external_values.as_ref()) {
+        let digest = xc_cache::canonical_digest(values)?;
+        let mut annotations = i.producer_annotations.clone();
+        annotations.insert(
+            "acquired_external_input_digest".into(),
+            input_content_digest(i)?.0,
+        );
+        let result = super::retained_evidence::managed_with_input_identities(
+            INPUT_KIND,
+            json!({"consumed_input_contract":"per-diagnostic-values-v1", "values_digest":digest}),
+            std::slice::from_ref(&s.manifest),
+            cache,
+            &annotations,
+            Some(&[]),
+            || Ok(values.clone()),
+            |retained| {
+                if retained == values {
+                    Ok(())
+                } else {
+                    bail!("consumed external values mismatch")
+                }
+            },
+        )?;
+        if let Some(manifest) = result.produced_manifest.or(result.reused_manifest) {
+            sources.push(manifest);
         }
-        admitted.as_ref().map(|admitted| admitted.digest().clone())
+        Some(digest)
     } else {
         None
     };
@@ -2671,13 +2768,27 @@ fn capture_extended_prepared_with_transform_guard(
             if manifest.key.kind != "ccm_sector_gap_certificate" {
                 bail!("sector-gap certificate object does not match its manifest");
             }
-            let Some(admitted) =
-                super::sector_gap_certificate::AdmittedCertificate::bind(certificate, manifest)?
-            else {
-                bail!("sector-gap certificate object does not match its manifest");
+            let admitted = match certificate {
+                SectorGapCertificateRef::Full(certificate) => {
+                    let Some(admitted) = super::sector_gap_certificate::AdmittedCertificate::bind(
+                        certificate,
+                        manifest,
+                    )?
+                    else {
+                        bail!("sector-gap certificate object does not match its manifest");
+                    };
+                    Some(admitted)
+                }
+                SectorGapCertificateRef::Compact(certificate) => {
+                    if ContentDigest::sha256_finite_json(certificate)? != manifest.content_digest {
+                        bail!("compact sector-gap certificate object does not match its manifest");
+                    }
+                    certificate.validate_structure()?;
+                    None
+                }
             };
             sources.push(manifest.clone());
-            (Some(certificate), Some(admitted))
+            (Some(certificate), admitted)
         }
         _ => (None, None),
     };
@@ -2787,16 +2898,20 @@ fn capture_extended_prepared_with_transform_guard(
     // Capture preflight reports the budget itself and keeps it. A result
     // limited by the budget is returned but never retained, so a later run with
     // a larger budget computes it instead of reusing the limited result.
-    let mut identity_options = options.clone();
-    if id != "capture_preflight" {
-        identity_options.maximum_working_bytes = None;
-    }
+    let identity_options =
+        input_contract::numerical_options(id, options, roots.map_or(0, |r| r.dataset.points.len()));
     // The state enters by its label-free identity. Its manifest tags are
     // transport and storage provenance (encoder profile, a remote canonical
     // manifest, the adopting layer) that differ between workstations for the
     // same state; its semantic key is already its parameters digest.
     let request = {
-        let mut request = json!({"semantics":if id == "transform_enclosure" { "extended-retained-diagnostics-v5-minus-fourier-source-error-hull" } else if matches!(id,"band_reconstruction"|"tail_operator"|"weighted_tail") { "extended-retained-diagnostics-v4" } else if id == "resolution_budget" { "extended-retained-diagnostics-v3" } else { "extended-retained-diagnostics-v2" },"expected_rows":if matches!(id,"transform_enclosure"|"operator_cluster"|"finite_section_transfer"|"configuration_comparison"|"weighted_tail"|"band_reconstruction"|"tail_operator") { None } else { Some(estimated_rows) },"diagnostic":id,"options":identity_options,"external_input_digest":input_digest,"state_selection_policy":s.selection_policy,"state_identity":xc_cache::research_identity_dependency(&s.manifest)});
+        let mut request = json!({"semantics":if id == "transform_enclosure" { "extended-retained-diagnostics-v5-minus-fourier-source-error-hull" } else if matches!(id,"band_reconstruction"|"tail_operator"|"weighted_tail") { "extended-retained-diagnostics-v4" } else if id == "resolution_budget" { "extended-retained-diagnostics-v3" } else { "extended-retained-diagnostics-v2" },"expected_rows":if matches!(id,"transform_enclosure"|"operator_cluster"|"finite_section_transfer"|"configuration_comparison"|"weighted_tail"|"band_reconstruction"|"tail_operator") { None } else { Some(estimated_rows) },"diagnostic":id,"options":identity_options,"external_input_digest":input_digest,"state_identity":if id=="capture_preflight" {None} else {Some(xc_cache::numerical_source_identity(&s.manifest, "state", "stored-weil-state-v1"))}});
+        if id == "capture_preflight" {
+            request["preflight_inventory"] = json!({"lambda_squared":s.cutoff,"n_modes":s.modes,
+                "source_precision_bits":s.precision,"coefficient_count":s.coefficients.len(),
+                "matrix_available":m.is_some(),"roots_available":roots.is_some(),
+                "root_count":roots.map_or(0,|r|r.dataset.points.len()),"run_certificate_available":run_certificate.is_some()});
+        }
         if id == "configuration_comparison" {
             request["duplicate_coordinate_policy"] = json!("all_ambiguous_members_withheld_v2");
         }
@@ -2814,10 +2929,6 @@ fn capture_extended_prepared_with_transform_guard(
             request["complement_solve"] = json!("midpoint_preconditioned_verified_solve_v1");
             request["complement_guard_bits"] =
                 json!(super::convergence_capture::cluster_guard_bits());
-        }
-        if id == "complex_transform" {
-            request["maximum_parallel_rows"] = json!(resource_policy.root_block_rows);
-            request["workspace_admission"] = json!("configured_row_block_bound_v1");
         }
         if id == "band_reconstruction" {
             request["exact_contraction_admission"] = json!("all_block_workspace_bound_v1");
@@ -2882,11 +2993,6 @@ fn capture_extended_prepared_with_transform_guard(
             request["signed_band_inverse_arithmetic"] =
                 json!("relative_zero_guard_scaled_directed_sums_v1");
             request["maximum_signed_band_inverse_guard_bits"] = json!(4096);
-            request["basis_disk_budget_bytes"] = json!(super::band_runtime::disk_budget()?);
-            request["checkpoint_block_budget_bytes"] = json!(
-                super::capture_runtime::CaptureResourcePolicy::from_environment()?
-                    .maximum_checkpoint_bytes
-            );
         }
         // Feature-dependent absence and polynomial isolation must not share
         // a cache identity with an Arb-enabled calculation, including legacy
@@ -2999,8 +3105,15 @@ fn capture_extended_prepared_with_transform_guard(
             request["maximum_allowance_guard_bits"] = json!(4096);
             request["allowance_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
         }
-        if let (Some((_, manifest)), Some(_)) = (sector_certificate, run_certificate) {
+        if let (Some((_, manifest)), Some(_)) = (
+            sector_certificate.filter(|_| id != "capture_preflight"),
+            run_certificate,
+        ) {
             request["run_sector_certificate"] = json!(manifest.content_digest);
+            if matches!(run_certificate, Some(SectorGapCertificateRef::Compact(_))) {
+                request["run_sector_certificate_representation"] =
+                    json!("compact_analytic_replay_v1");
+            }
         }
         request
     };
@@ -3036,7 +3149,7 @@ fn capture_extended_prepared_with_transform_guard(
             let _stage = super::capture_runtime::Stage::new("signed_transform compute");
             return signed_transforms(s, options, input, maximum_transform_guard);
         }
-        extended_compute(
+        extended_compute_with_certificate_ref(
             id,
             s,
             m,
@@ -4030,25 +4143,33 @@ fn capture_extended_prepared_with_transform_guard(
         xc_core::validate_secret_free(r, "extended research report")?;
         Ok(())
     };
-    let retain_limited = cache.mode.compares_against_reference();
-    let first = managed(
+    let numerical_inputs =
+        (id == "capture_preflight").then_some(&[] as &[xc_cache::NumericalInputIdentity]);
+    let first = super::retained_evidence::managed_with_input_identities(
         kind,
         request.clone(),
         &sources,
         cache,
+        &BTreeMap::new(),
+        numerical_inputs,
         || {
             let data = compute().inspect_err(|error| {
                 if error.is::<transform::GuardExhausted>() {
                     exhausted.set(true);
                 }
             })?;
-            if !retain_limited && working_budget_limited(&data) {
+            if budget_exceeded || execution_budget_limited(&data) {
                 *budget_limited.borrow_mut() = Some(data);
-                bail!("diagnostic limited by the working-byte budget; result is not retained");
+                bail!("diagnostic limited by an execution budget; result is not retained");
             }
             Ok(data)
         },
-        validate,
+        |data| {
+            if execution_budget_limited(data) {
+                bail!("execution-budget refusal cannot be reused as a retained observation");
+            }
+            validate(data)
+        },
     );
     let limited = budget_limited.borrow_mut().take();
     let result = match (first, limited) {
@@ -4058,18 +4179,26 @@ fn capture_extended_prepared_with_transform_guard(
                 reference_resolver: cache.reference_resolver,
                 acceptance: cache.acceptance,
                 ordered_overlays: cache.ordered_overlays.clone(),
-                mode: cache.mode,
+                // Return the live incomplete result without selecting a previously
+                // rejected cached refusal or writing a new artifact.
+                mode: if cache.mode.fabric_enabled() {
+                    xc_cache::ArtifactExecutionCacheMode::Refresh
+                } else {
+                    xc_cache::ArtifactExecutionCacheMode::Disabled
+                },
                 write_on_miss: false,
                 write_visibility: cache.write_visibility,
                 requested_assurance: cache.requested_assurance,
                 certification_failure_policy: cache.certification_failure_policy,
                 production_sink: None,
             };
-            managed(
+            super::retained_evidence::managed_with_input_identities(
                 kind,
                 request,
                 &sources,
                 &unretained,
+                &BTreeMap::new(),
+                numerical_inputs,
                 move || Ok(data),
                 validate,
             )?

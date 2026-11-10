@@ -381,10 +381,8 @@ fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.write_all(bytes).map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
         drop(file);
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path).map_err(|error| error.to_string())?;
-        }
+        // Rust replaces an existing file on Windows as well as Unix. Keep
+        // the previous complete report available until the rename succeeds.
         fs::rename(&temporary, path).map_err(|error| error.to_string())
     })();
     if result.is_err() {

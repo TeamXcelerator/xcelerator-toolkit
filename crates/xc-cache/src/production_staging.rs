@@ -132,8 +132,8 @@ pub fn build_managed_publication_inventory(
     if target == xc_core::PublicationTarget::Public
         && !drafts.is_empty()
         && drafts.iter().all(|draft| {
-            !artifact_semantics_admitted_to_destination(
-                &draft.manifest.semantic_key,
+            !crate::manifest_admitted_to_destination(
+                &draft.manifest,
                 crate::PublicationDestination::Public,
             )
         })
@@ -151,10 +151,7 @@ pub fn build_managed_publication_inventory(
     for draft in drafts {
         let facts = authenticated_draft_facts(draft)?;
         for destination in &destinations {
-            if !artifact_semantics_admitted_to_destination(
-                &draft.manifest.semantic_key,
-                *destination,
-            ) {
+            if !crate::manifest_admitted_to_destination(&draft.manifest, *destination) {
                 continue;
             }
             let visibility = match destination {
@@ -573,7 +570,7 @@ fn verify_staged_part(
         }
         hasher.update(&buffer[..count]);
     }
-    let actual = ContentDigest(format!("{:x}", hasher.finalize()));
+    let actual = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
     if &actual != expected_digest {
         return Err(CacheError::DigestMismatch {
             expected: expected_digest.to_string(),
@@ -1760,6 +1757,17 @@ fn stage_record(
         .get(REMOTE_CANONICAL_MANIFEST_TAG)
         .map(|encoded| serde_json::from_str::<CanonicalArtifactManifest>(encoded))
         .transpose()?;
+    if retained_remote_manifest.is_none()
+        && crate::artifact_identity_contract(&record.semantic_key.artifact_kind)?
+            .producer
+            .is_none()
+    {
+        return Err(CacheError::InvalidManifest(
+            "registered kind has no active managed producer".into(),
+        ));
+    }
+    let new_provenance = crate::local_manifest_provenance_v2(record.manifest)?;
+    let produced_schema = if new_provenance.is_some() { 2 } else { 1 };
     let canonical_payload = if let Some(remote) = &retained_remote_manifest {
         crate::validate_retained_canonical_binding(
             remote,
@@ -1816,7 +1824,7 @@ fn stage_record(
                 ))
         });
         CanonicalPayloadEnvelope {
-            schema_version: 1,
+            schema_version: produced_schema,
             scalar_backend,
             precision_bits,
             scalar_representation: "canonical-json-utf8-v1".to_owned(),
@@ -2058,33 +2066,41 @@ fn stage_record(
         encoding
     };
     let transport_digest = encoding.digest()?;
-    let manifest = if let Some(remote) = retained_remote_manifest {
-        if remote.payload_digest != payload_digest {
-            return Err(CacheError::InvalidManifest(
-                "retained remote manifest disagrees with the canonical payload".to_owned(),
-            ));
-        }
-        remote
-    } else {
-        CanonicalArtifactManifest {
-            schema_version: 1,
-            artifact_family: family.to_owned(),
-            semantic_key: record.semantic_key.clone(),
-            semantic_digest,
-            canonical_payload,
-            payload_digest,
-            transport_digests: vec![transport_digest],
-            resolved_mathematical_configuration_digest: canonical_digest(
-                &record.semantic_key.resolved_mathematical_parameters,
-            )?,
-            producer_toolkit_version: record.manifest.producer_toolkit_version.clone(),
-            minimum_reader_version: record.manifest.minimum_reader_version.clone(),
-            maximum_reader_version: record.manifest.maximum_reader_version.clone(),
-            requested_assurance: AssuranceLevel::Computed,
-            claim_scope: "validated typed numerical cache artifact".to_owned(),
-            assumptions: Vec::new(),
-        }
-    };
+    let manifest =
+        if let Some(remote) = retained_remote_manifest {
+            if remote.payload_digest != payload_digest {
+                return Err(CacheError::InvalidManifest(
+                    "retained remote manifest disagrees with the canonical payload".to_owned(),
+                ));
+            }
+            remote
+        } else {
+            CanonicalArtifactManifest {
+                provenance: new_provenance,
+                schema_version: produced_schema,
+                artifact_family: family.to_owned(),
+                semantic_key: record.semantic_key.clone(),
+                semantic_digest,
+                canonical_payload,
+                payload_digest,
+                transport_digests: vec![transport_digest],
+                resolved_mathematical_configuration_digest: canonical_digest(
+                    &record.semantic_key.resolved_mathematical_parameters,
+                )?,
+                producer_toolkit_version: record.manifest.producer_toolkit_version.clone(),
+                minimum_reader_version: if produced_schema == 2 {
+                    record.manifest.minimum_reader_version.clone().max(
+                        crate::ToolkitVersion::parse(crate::CONTENT_MODEL_V2_MINIMUM_READER)?,
+                    )
+                } else {
+                    record.manifest.minimum_reader_version.clone()
+                },
+                maximum_reader_version: record.manifest.maximum_reader_version.clone(),
+                requested_assurance: AssuranceLevel::Computed,
+                claim_scope: "validated typed numerical cache artifact".to_owned(),
+                assumptions: Vec::new(),
+            }
+        };
     manifest.validate()?;
     let draft = CanonicalProductionDraft {
         schema_version: 1,
@@ -2269,6 +2285,75 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_staging_reuses_content_across_exact_parent_producers() {
+        let root = crate::test_support::temporary_root("content-model-staging");
+        let mut parent = record();
+        let provenance = crate::ManifestProvenanceV2 {
+            producer_annotations: std::collections::BTreeMap::new(),
+            disclosure: crate::ArtifactDisclosure::PublicInputs,
+            producer_receipts: Vec::new(),
+        };
+        parent.manifest.tags.insert(
+            crate::MANIFEST_PROVENANCE_V2_TAG.into(),
+            serde_json::to_string(&provenance).unwrap(),
+        );
+        let mut child = parent.clone();
+        child.semantic_key.resolved_mathematical_parameters = json!({"role":"child"});
+        child.manifest.key.parameters_digest = child.semantic_key.digest().unwrap();
+        child.manifest.dependencies.push(crate::DependencyRef {
+            key: parent.manifest.key.clone(),
+            content_digest: parent.manifest.content_digest.clone(),
+            required_quality: CacheQuality::Validated,
+        });
+        let stage = |parent: &ProducedArtifactRecord, directory: &str| {
+            let staging = root.join(directory);
+            let parent = stage_produced_artifact(
+                parent,
+                &staging,
+                &TransportPolicy::default(),
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            stage_produced_artifact_with_dependencies(
+                &child,
+                &[parent],
+                &staging,
+                &TransportPolicy::default(),
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        };
+        let first = stage(&parent, "first");
+        parent.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.1").unwrap();
+        parent.manifest.created_unix_seconds += 1;
+        let second = stage(&parent, "second");
+        assert_eq!(first.manifest.schema_version, 2);
+        assert_eq!(
+            first.manifest.semantic_digest,
+            second.manifest.semantic_digest
+        );
+        assert_eq!(
+            first.manifest.payload_digest,
+            second.manifest.payload_digest
+        );
+        assert_eq!(first.encoding, second.encoding);
+        assert_ne!(
+            first.manifest.digest().unwrap(),
+            second.manifest.digest().unwrap()
+        );
+        assert_ne!(
+            first.manifest.canonical_payload.dependencies,
+            second.manifest.canonical_payload.dependencies
+        );
+        let decoded: CanonicalArtifactManifest =
+            serde_json::from_slice(&crate::canonical_json_bytes(&second.manifest).unwrap())
+                .unwrap();
+        assert_eq!(decoded, second.manifest);
+    }
+
+    #[test]
     fn typed_record_stages_as_deterministic_bounded_canonical_draft() {
         let scratch = crate::test_support::TestDir::new("production-stage");
         let first_root = scratch.join("first-root");
@@ -2304,6 +2389,34 @@ mod tests {
         }
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[test]
+    fn unchanged_encoder_preserves_the_numerical_sources_reader_floor() {
+        let scratch = crate::test_support::TestDir::new("production-unchanged-reader-floor");
+        for (index, floor) in ["0.16.0", "0.18.0"].into_iter().enumerate() {
+            let mut source = record();
+            source.manifest.minimum_reader_version = ToolkitVersion::parse(floor).unwrap();
+            let original = source.manifest.clone();
+            let draft = stage_produced_artifact(
+                &source,
+                &scratch.join(format!("source-{index}")),
+                &TransportPolicy::default(),
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                draft.encoding.encoder_profile,
+                DETERMINISTIC_ZIP64_PROFILE_V1
+            );
+            assert_eq!(
+                draft.manifest.minimum_reader_version,
+                original.minimum_reader_version
+            );
+            assert_eq!(source.manifest, original);
+            assert_eq!(draft.source_content_digest, original.content_digest);
+        }
     }
 
     #[test]
@@ -3781,7 +3894,7 @@ mod tests {
         ]);
         let private_head = "a".repeat(40);
         let public_head = "b".repeat(40);
-        let prepared = crate::prepare_managed_artifact_publication(
+        let prepared = crate::prepare_managed_artifact_publication_with_closure(
             &promoted,
             &crate::ManagedPublicationPlanningContext {
                 owner: "example-org".to_owned(),
@@ -3804,6 +3917,12 @@ mod tests {
                 event_unix_seconds: 123,
             },
             &sessions,
+            &sink
+                .drafts()
+                .unwrap()
+                .into_iter()
+                .map(|draft| draft.manifest)
+                .collect::<Vec<_>>(),
         )
         .unwrap();
         assert!(prepared.coordinated.authorized());

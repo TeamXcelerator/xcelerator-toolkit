@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ccm_band_reconstruction retained observation v2",
+  "description": "Retained observation payload; exact requests and ancestry are authenticated by the manifest. Shape validation is not numerical proof. Separate same-kind finite/cohort/preparation APIs retain their own data validators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "kind",
+    "scope",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "semantics": {
+      "const": "ccm_band_reconstruction/value-v1"
+    },
+    "kind": {
+      "const": "ccm_band_reconstruction"
+    },
+    "scope": {
+      "const": "finite_point_inputs; no_source_error_enclosure; no_ground_selection_or_convergence_certificate"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostic",
+        "outcome",
+        "reason",
+        "lambda_squared",
+        "n_modes",
+        "source_precision_bits",
+        "working_precision_bits",
+        "convention",
+        "assurance",
+        "values",
+        "rows"
+      ],
+      "properties": {
+        "diagnostic": {
+          "const": "band_reconstruction"
+        },
+        "outcome": {
+          "enum": [
+            "point_measurement",
+            "partial_unresolved",
+            "unresolved",
+            "missing_input",
+            "rank_or_precision_unresolved",
+            "conditional_bound_expression",
+            "sufficient_bound_unavailable"
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lambda_squared": {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "n_modes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "working_precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "convention": {
+          "type": "string"
+        },
+        "assurance": {
+          "const": "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise"
+        },
+        "values": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ordinal",
+              "label",
+              "outcome",
+              "values",
+              "notes"
+            ],
+            "properties": {
+              "ordinal": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "label": {
+                "type": "string"
+              },
+              "outcome": {
+                "enum": [
+                  "point_measurement",
+                  "missing_input",
+                  "budget_limited",
+                  "carrier_or_unresolved",
+                  "unresolved_denominator",
+                  "cancellation_limited",
+                  "unresolved_derivative",
+                  "channels_resolved_budget_unassessed",
+                  "conditional_budget_met",
+                  "conditional_budget_not_met",
+                  "conditional_budget_unresolved"
+                ]
+              },
+              "values": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string",
+                  "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+                }
+              },
+              "notes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "label": {
+                      "const": "signed_functional_stieltjes_recurrence"
+                    },
+                    "outcome": {
+                      "enum": [
+                        "point_measurement",
+                        "certified_finite_enclosure"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "values": {
+                      "required": [
+                        "jacobi_diagonal",
+                        "next_signed_norm_squared",
+                        "reorthogonalization_correction"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "label": {
+                      "const": "band_cutoff"
+                    },
+                    "outcome": {
+                      "enum": [
+                        "point_measurement",
+                        "certified_finite_enclosure"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "values": {
+                      "required": [
+                        "zero_atom_cutoff",
+                        "first_model_band_root",
+                        "last_model_band_root"
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "point_measurement",
+                  "certified_finite_enclosure",
+                  "conditional_bound_expression"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "values": {
+                "required": [
+                  "signed_mass"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "expected_rows": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "data": {
+            "properties": {
+              "outcome": {
+                "const": "point_measurement"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "values": {
+                "required": [
+                  "band_inverse_moment_one",
+                  "band_inverse_moment_two",
+                  "band_inverse_moment_three",
+                  "band_inverse_moment_root_count"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "allOf": [
+        {
+          "properties": {
+            "data": {
+              "properties": {
+                "rows": {
+                  "items": {
+                    "allOf": [
+                      {
+                        "if": {
+                          "properties": {
+                            "label": {
+                              "const": "arithmetic_model_polynomial_root"
+                            }
+                          }
+                        },
+                        "then": {
+                          "properties": {
+                            "values": {
+                              "required": [
+                                "model_band_root",
+                                "rounded_polynomial_root_lower",
+                                "rounded_polynomial_root_upper"
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

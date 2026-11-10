@@ -21,6 +21,48 @@ use xc_core::{CancellationToken, ResourcePolicy};
 const GIT_REVISION_METADATA_RESERVATION_BYTES: u64 = 512 * 1024;
 const DEFAULT_IMMUTABLE_DIGEST_BLOB_LIMIT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PublicationPackPolicy {
+    #[default]
+    GitDefault,
+    StoredArchives,
+}
+
+impl PublicationPackPolicy {
+    fn for_parts<'a>(parts: impl IntoIterator<Item = &'a TransportPart>) -> Self {
+        let (mut archive_bytes, mut other_bytes) = (0u128, 0u128);
+        for part in parts {
+            let total = if is_archive_part(part) {
+                &mut archive_bytes
+            } else {
+                &mut other_bytes
+            };
+            *total = total.saturating_add(u128::from(part.size_bytes));
+        }
+        // Fresh archive blobs were imported with looseCompression=0. Deflating
+        // their already-compressed payload again during push costs CPU without
+        // useful size savings. Limit this policy to batches whose declared
+        // archive bytes are at least 99% of the payload; ordinary metadata and
+        // coordination pushes keep Git's normal compression. This is transport
+        // encoding only: blob, tree, commit and artifact bytes remain unchanged.
+        if archive_bytes != 0 && archive_bytes / 99 >= other_bytes {
+            Self::StoredArchives
+        } else {
+            Self::GitDefault
+        }
+    }
+
+    fn configure(self, command: &mut Command) {
+        if self == Self::StoredArchives {
+            command.args(["-c", "pack.compression=0"]);
+        }
+    }
+}
+
+fn is_archive_part(part: &TransportPart) -> bool {
+    part.repository_path.starts_with("objects/sha256/") && part.repository_path.ends_with(".part")
+}
+
 #[derive(Clone, Debug)]
 struct GitTreeLeaf {
     mode: String,
@@ -350,13 +392,23 @@ impl GitCliRemoteStore {
         &self,
         session: &Path,
         arguments: Vec<OsString>,
+        pack_policy: PublicationPackPolicy,
     ) -> Result<Output, CacheError> {
         let start = Instant::now();
-        let result = run_git_allow_failure(&self.git_executable, Some(session), arguments, &[]);
+        let result = run_git_allow_failure_with_pack_policy(
+            &self.git_executable,
+            Some(session),
+            arguments,
+            &[],
+            pack_policy,
+        );
         self.publication_event(
             "git_push",
             start.elapsed(),
-            serde_json::json!({"success":result.as_ref().is_ok_and(|o|o.status.success())}),
+            serde_json::json!({
+                "success":result.as_ref().is_ok_and(|o|o.status.success()),
+                "archive_pack_compression_disabled":pack_policy == PublicationPackPolicy::StoredArchives,
+            }),
         );
         result
     }
@@ -375,11 +427,12 @@ impl GitCliRemoteStore {
         arguments: Vec<OsString>,
         expected: &BTreeMap<String, Option<String>>,
         desired: &BTreeMap<String, Option<String>>,
+        pack_policy: PublicationPackPolicy,
     ) -> Result<Option<BTreeMap<String, String>>, CacheError> {
         const MAX_ATTEMPTS: u32 = 5;
         let branches = expected.keys().map(String::as_str).collect::<Vec<_>>();
         for attempt in 1..=MAX_ATTEMPTS {
-            let push = self.observed_push(session, arguments.clone());
+            let push = self.observed_push(session, arguments.clone(), pack_policy);
             if push.as_ref().is_ok_and(|output| output.status.success()) {
                 return Ok(None);
             }
@@ -1496,8 +1549,7 @@ impl GitCliRemoteStore {
                 started.elapsed(),
                 serde_json::json!({"bytes":part.size_bytes,"success":path.is_ok()}),
             );
-            let archive = part.repository_path.starts_with("objects/sha256/")
-                && part.repository_path.ends_with(".part");
+            let archive = is_archive_part(part);
             missing.insert(key.clone(), (path?, archive));
         }
 
@@ -1964,7 +2016,7 @@ impl GitCliRemoteStore {
         size_bytes: u64,
     ) -> Result<ContentDigest, CacheError> {
         validate_revision(object_id)?;
-        let mut child = Command::new(&self.git_executable)
+        let mut child = git_command(&self.git_executable)
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(session)
@@ -2014,7 +2066,7 @@ impl GitCliRemoteStore {
                 "Git blob read {observed} bytes, expected {size_bytes}"
             )));
         }
-        Ok(ContentDigest(format!("{:x}", hasher.finalize())))
+        Ok(ContentDigest(xc_core::hex_lower(&hasher.finalize())))
     }
 
     fn immutable_path_identity(
@@ -2187,7 +2239,7 @@ impl RemoteGitStore for GitCliRemoteStore {
                 "remote path {path:?} requires {size_bytes} bytes above the {effective_maximum}-byte limit"
             )));
         }
-        let mut child = Command::new(&self.git_executable)
+        let mut child = git_command(&self.git_executable)
             .arg("-C")
             .arg(&session)
             .args(["cat-file", "blob"])
@@ -2232,7 +2284,7 @@ impl RemoteGitStore for GitCliRemoteStore {
             }
             Ok((
                 size_bytes,
-                ContentDigest(format!("{:x}", hasher.finalize())),
+                ContentDigest(xc_core::hex_lower(&hasher.finalize())),
             ))
         })();
         if result.is_err() {
@@ -2301,7 +2353,7 @@ impl RemoteGitStore for GitCliRemoteStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         validate_relative_git_path(prefix)?;
         let session = self.fetch_revision(repository, revision)?;
-        let mut child = Command::new(&self.git_executable)
+        let mut child = git_command(&self.git_executable)
             .arg("-C")
             .arg(&session)
             .args(["ls-tree", "-r", "-z", "--name-only"])
@@ -2460,6 +2512,7 @@ impl RemoteGitStore for GitCliRemoteStore {
             ],
             &BTreeMap::from([(request.branch.clone(), Some(request.expected_head.clone()))]),
             &BTreeMap::from([(request.branch.clone(), Some(commit_id.clone()))]),
+            PublicationPackPolicy::for_parts(&request.parts),
         )?;
         match conflict {
             None => Ok(CompareAndSwapResult::Committed { commit_id }),
@@ -2514,6 +2567,7 @@ impl RemoteGitStore for GitCliRemoteStore {
             ],
             &BTreeMap::from([(branch.to_owned(), Some(expected_head.to_owned()))]),
             &BTreeMap::from([(branch.to_owned(), None)]),
+            PublicationPackPolicy::GitDefault,
         )?;
         match conflict {
             None => Ok(DeleteRefResult::Deleted),
@@ -2574,6 +2628,7 @@ impl RemoteGitStore for GitCliRemoteStore {
             ],
             &BTreeMap::from([(request.branch.clone(), None)]),
             &BTreeMap::from([(request.branch.clone(), Some(commit_id.clone()))]),
+            PublicationPackPolicy::for_parts(&request.parts),
         )?;
         match conflict {
             None => Ok(CreateRefResult::Created { commit_id }),
@@ -2681,6 +2736,7 @@ impl RemoteGitStore for GitCliRemoteStore {
             arguments,
             &expected,
             &desired,
+            PublicationPackPolicy::for_parts(request.commits.iter().flat_map(|c| &c.parts)),
         )? {
             None => Ok(AtomicCompareAndSwapResult::Committed { commit_ids }),
             Some(current_heads) => Ok(AtomicCompareAndSwapResult::RefConflict { current_heads }),
@@ -2806,7 +2862,38 @@ fn run_git_allow_failure<I>(
 where
     I: IntoIterator<Item = OsString>,
 {
+    run_git_allow_failure_with_pack_policy(
+        executable,
+        directory,
+        arguments,
+        environment,
+        PublicationPackPolicy::GitDefault,
+    )
+}
+
+// Publication journals contain content-addressed dependency paths. Even an
+// ordinary Windows workspace can exceed MAX_PATH before Git creates its hooks.
+// Apply this to every transport invocation, including init and streaming reads;
+// never depend on or modify the user's global Git configuration.
+fn git_command(executable: &OsStr) -> Command {
     let mut command = Command::new(executable);
+    #[cfg(windows)]
+    command.args(["-c", "core.longpaths=true"]);
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+fn run_git_allow_failure_with_pack_policy<I>(
+    executable: &OsStr,
+    directory: Option<&Path>,
+    arguments: I,
+    environment: &[(&OsStr, &OsStr)],
+    pack_policy: PublicationPackPolicy,
+) -> Result<Output, CacheError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut command = git_command(executable);
     // Public cache reads must never block an unattended consumer run on an
     // interactive credential prompt. Configured credential helpers and PATs
     // continue to work for explicit authenticated operations.
@@ -2830,6 +2917,7 @@ where
         // for deltas between different archives is costly and cannot improve
         // exact-object reuse. Keep this policy local to publication pushes.
         command.args(["-c", "pack.window=0"]);
+        pack_policy.configure(&mut command);
         command.arg("push").arg("--progress").args(&arguments[1..]);
     } else {
         command.args(&arguments);
@@ -3014,8 +3102,7 @@ fn run_git_with_input<I>(
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut command = Command::new(executable);
-    command.env("GIT_TERMINAL_PROMPT", "0");
+    let mut command = git_command(executable);
     if let Some(directory) = directory {
         command.arg("-C").arg(directory);
     }
@@ -3306,7 +3393,7 @@ fn digest_file(path: &Path) -> Result<(ContentDigest, u64), CacheError> {
             .checked_add(count as u64)
             .ok_or_else(|| CacheError::ResourceLimit("staged part exceeds u64".to_owned()))?;
     }
-    Ok((ContentDigest(format!("{:x}", hasher.finalize())), size))
+    Ok((ContentDigest(xc_core::hex_lower(&hasher.finalize())), size))
 }
 
 /// Sum the bytes under `path`. Git sessions in other threads rename and
@@ -3382,6 +3469,65 @@ mod tests {
 
     use crate::test_support::temporary_root;
 
+    #[test]
+    #[cfg(windows)]
+    fn git_transport_initializes_and_reads_beyond_windows_max_path() {
+        let root = temporary_root("git-long-path-publication");
+        let mut repository = root.to_path_buf();
+        // Match a real publication failure: the repository directory fits
+        // MAX_PATH, but hooks, locks and object filenames inside it do not.
+        let padding = 235 - repository.as_os_str().len() - 1 - "/remote.git".len();
+        repository.push("d".repeat(padding));
+        repository.push("remote.git");
+        fs::create_dir_all(repository.parent().unwrap()).unwrap();
+        let git = OsStr::new("git");
+        let output = run_git_allow_failure_with_pack_policy(
+            git,
+            None,
+            [
+                OsString::from("init"),
+                OsString::from("--bare"),
+                repository.clone().into_os_string(),
+            ],
+            &[],
+            PublicationPackPolicy::default(),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = run_git_with_input(
+            git,
+            Some(&repository),
+            [
+                OsString::from("hash-object"),
+                OsString::from("-w"),
+                OsString::from("--stdin"),
+            ],
+            &[],
+            b"long-path publication fixture",
+        )
+        .unwrap();
+        assert!(output.status.success());
+        let object = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        let output = run_git_allow_failure_with_pack_policy(
+            git,
+            Some(&repository),
+            [
+                OsString::from("cat-file"),
+                OsString::from("blob"),
+                OsString::from(object),
+            ],
+            &[],
+            PublicationPackPolicy::default(),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"long-path publication fixture");
+    }
+
     fn test_git(directory: Option<&Path>, arguments: &[&str]) -> bool {
         let mut command = Command::new("git");
         if let Some(directory) = directory {
@@ -3418,6 +3564,155 @@ mod tests {
         } else {
             format!("file://{canonical}")
         }
+    }
+
+    #[test]
+    fn stored_archive_pack_policy_retains_compression_for_metadata_batches() {
+        let part = |path: &str, size_bytes| TransportPart {
+            sequence: 0,
+            repository_path: path.to_owned(),
+            size_bytes,
+            content_digest: ContentDigest::sha256(b"policy fixture"),
+        };
+        let archive = part("objects/sha256/ab/abc.part", 99);
+        let metadata = part("indexes/manifest.json", 1);
+        assert_eq!(
+            PublicationPackPolicy::for_parts([&archive, &metadata]),
+            PublicationPackPolicy::StoredArchives,
+        );
+        for parts in [
+            vec![],
+            vec![metadata.clone()],
+            vec![part("payload.part", 100_000), metadata.clone()],
+            vec![
+                part("objects/sha256/ab/abc.json", 100_000),
+                metadata.clone(),
+            ],
+            vec![part("objects/sha256/ab/abc.part", 98), metadata.clone()],
+            vec![part("objects/sha256/ab/abc.part", 0)],
+        ] {
+            assert_eq!(
+                PublicationPackPolicy::for_parts(&parts),
+                PublicationPackPolicy::GitDefault
+            );
+        }
+        assert_eq!(
+            PublicationPackPolicy::for_parts([
+                &part("objects/sha256/ab/a.part", u64::MAX),
+                &part("objects/sha256/ab/b.part", u64::MAX),
+                &metadata,
+            ]),
+            PublicationPackPolicy::StoredArchives,
+        );
+        let mut command = Command::new("git");
+        PublicationPackPolicy::GitDefault.configure(&mut command);
+        assert_eq!(command.get_args().count(), 0);
+        PublicationPackPolicy::StoredArchives.configure(&mut command);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec!["-c", "pack.compression=0"]
+        );
+    }
+
+    #[test]
+    fn stored_archive_push_roundtrips_exact_blobs_and_does_not_change_later_metadata_policy() {
+        if !test_git(None, &["--version"]) {
+            return;
+        }
+        let root = temporary_root("git-stored-archive-pack");
+        let (repository, expected_head, _) = seeded_remote(&root, "pack", b"existing source");
+        let staging = root.join("staging");
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            &staging,
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap();
+        let metrics = root.join("metrics");
+        store.enable_publication_metrics(&metrics);
+        let archive = (0..1024 * 1024)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        let digest = ContentDigest::sha256(&archive);
+        let path = format!("objects/sha256/{}/{}.part", &digest.0[..2], digest.0);
+        fs::create_dir_all(staging.join(&path).parent().unwrap()).unwrap();
+        fs::write(staging.join(&path), &archive).unwrap();
+        let meta = b"{\"scope\":\"retained immutable artifact\"}\n";
+        fs::write(staging.join("metadata.json"), meta).unwrap();
+        let parts = vec![
+            TransportPart {
+                sequence: 0,
+                repository_path: path,
+                size_bytes: archive.len() as u64,
+                content_digest: digest,
+            },
+            TransportPart {
+                sequence: 1,
+                repository_path: "metadata.json".to_owned(),
+                size_bytes: meta.len() as u64,
+                content_digest: ContentDigest::sha256(meta),
+            },
+        ];
+        let result = store
+            .compare_and_swap_commit(&RemoteCommitRequest {
+                repository: repository.clone(),
+                branch: "main".to_owned(),
+                expected_head,
+                message: "archive publication".to_owned(),
+                parts: parts.clone(),
+                delete_paths: Vec::new(),
+            })
+            .unwrap();
+        let CompareAndSwapResult::Committed { commit_id } = result else {
+            panic!("unexpected ref conflict")
+        };
+        for part in &parts {
+            store
+                .verify_committed_part(&repository, &commit_id, part)
+                .unwrap();
+        }
+        let result = store
+            .compare_and_swap_commit(&RemoteCommitRequest {
+                repository: repository.clone(),
+                branch: "main".to_owned(),
+                expected_head: commit_id,
+                message: "metadata-only follow-up".to_owned(),
+                parts: vec![parts[1].clone()],
+                delete_paths: Vec::new(),
+            })
+            .unwrap();
+        let CompareAndSwapResult::Committed { commit_id } = result else {
+            panic!("unexpected ref conflict")
+        };
+        for part in &parts {
+            store
+                .verify_committed_part(&repository, &commit_id, part)
+                .unwrap();
+        }
+        store.close_publication_metrics();
+        let log = fs::read_dir(&metrics)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let events = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let policies = events
+            .iter()
+            .filter(|event| event["phase"] == "git_push")
+            .map(|event| {
+                event["details"]["archive_pack_compression_disabled"]
+                    .as_bool()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(policies, vec![true, false]);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

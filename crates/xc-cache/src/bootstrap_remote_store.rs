@@ -35,6 +35,10 @@ fn metadata_retention_limit(resources: &ResourcePolicy) -> u64 {
 
 /// Reuse only bytes read from the exact repository/revision/path tuple. A hit
 /// still passes caller limits, cancellation, and the requested serde decoder.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the exact transport identity, resource limits, and cancellation boundary remain explicit"
+)]
 fn read_cached_metadata_json<T: serde::de::DeserializeOwned>(
     remote: &dyn RemoteGitStore,
     documents: &Mutex<MetadataDocumentCache>,
@@ -943,8 +947,8 @@ impl GitHubBootstrapCacheStore {
         // boundary here as the key-based path, including for historical shard
         // entries that predate the restriction.
         if self.visibility == CacheVisibility::Public
-            && !crate::artifact_semantics_admitted_to_destination(
-                &manifest.semantic_key,
+            && !crate::manifest_admitted_to_destination(
+                &manifest,
                 crate::PublicationDestination::Public,
             )
         {
@@ -2456,6 +2460,7 @@ mod tests {
         };
         let semantic_digest = semantic_key.digest().unwrap();
         let manifest = CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
             artifact_family: "ccm-matrices".to_owned(),
             semantic_key,

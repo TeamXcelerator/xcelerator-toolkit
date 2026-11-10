@@ -101,11 +101,17 @@ pub struct CanonicalPayloadEnvelope {
 impl CanonicalPayloadEnvelope {
     pub fn digest(&self) -> Result<ContentDigest, CacheError> {
         self.validate()?;
-        canonical_digest(self)
+        match self.schema_version {
+            1 => canonical_digest(self),
+            2 => crate::LogicalPayloadEnvelopeV2::try_from(self)?.digest(),
+            _ => Err(CacheError::InvalidManifest(
+                "unsupported logical payload schema".into(),
+            )),
+        }
     }
 
     pub fn validate(&self) -> Result<(), CacheError> {
-        if self.schema_version == 0
+        if !matches!(self.schema_version, 1 | 2)
             || self.scalar_backend.trim().is_empty()
             || self.precision_bits == Some(0)
             || self.scalar_representation.trim().is_empty()
@@ -183,8 +189,7 @@ impl CanonicalPayloadEnvelope {
 
 /// Immutable identity-bearing manifest. Event time, actor, location,
 /// disposition, and publication status live in linked state/attestation data.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalArtifactManifest {
     pub schema_version: u32,
     pub artifact_family: String,
@@ -200,6 +205,9 @@ pub struct CanonicalArtifactManifest {
     pub requested_assurance: AssuranceLevel,
     pub claim_scope: String,
     pub assumptions: Vec<String>,
+    /// Schema-2 policy and producer evidence. Never part of numerical identity.
+    /// Schema 1 must leave this absent; its original wire form is unchanged.
+    pub provenance: Option<crate::ManifestProvenanceV2>,
 }
 
 impl CanonicalArtifactManifest {
@@ -209,13 +217,31 @@ impl CanonicalArtifactManifest {
     }
 
     pub fn validate(&self) -> Result<(), CacheError> {
-        if self.schema_version == 0
+        if !matches!(self.schema_version, 1 | 2)
+            || self.canonical_payload.schema_version != self.schema_version
+            || (self.schema_version == 2) != self.provenance.is_some()
             || self.artifact_family.trim().is_empty()
             || self.claim_scope.trim().is_empty()
         {
             return Err(CacheError::InvalidManifest(
                 "canonical manifest requires a schema, artifact family, and claim scope".to_owned(),
             ));
+        }
+        if let Some(provenance) = &self.provenance {
+            provenance.validate()?;
+            let contract = crate::artifact_identity_contract(&self.semantic_key.artifact_kind)?;
+            if contract.family != self.artifact_family {
+                return Err(CacheError::InvalidManifest(
+                    "schema-2 manifest family differs from the registered kind contract".into(),
+                ));
+            }
+            if crate::artifact_kind_is_private_only(&self.semantic_key.artifact_kind)
+                && provenance.disclosure == crate::ArtifactDisclosure::PublicInputs
+            {
+                return Err(CacheError::InvalidManifest(
+                    "private-only kind cannot assert public disclosure".into(),
+                ));
+            }
         }
         let semantic_digest = self.semantic_key.digest()?;
         let payload_digest = self.canonical_payload.digest()?;
@@ -719,7 +745,9 @@ impl ArtifactLinkSet {
     }
 }
 
-pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<ContentDigest, CacheError> {
+/// Hash the protocol's canonical JSON encoding, independent of struct field
+/// declaration order. Useful for explicit cross-language value contracts.
+pub fn canonical_digest<T: Serialize>(value: &T) -> Result<ContentDigest, CacheError> {
     Ok(ContentDigest::sha256(&canonical_json_bytes(value)?))
 }
 
@@ -907,6 +935,7 @@ mod tests {
             dependencies: Vec::new(),
         };
         let mut manifest = CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
             artifact_family: "ccm".to_owned(),
             semantic_digest: semantic_key.digest().unwrap(),
@@ -964,6 +993,7 @@ mod tests {
             dependencies: Vec::new(),
         };
         let manifest = CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
             artifact_family: "ccm".to_owned(),
             semantic_digest: semantic_key.digest().unwrap(),

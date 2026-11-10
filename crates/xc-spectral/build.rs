@@ -1,3 +1,7 @@
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn main() {
     checkpoint_build_id();
     println!("cargo:rerun-if-changed=src/ccm/arb_bridge.c");
@@ -5,11 +9,47 @@ fn main() {
         return;
     }
 
-    cc::Build::new()
+    let mut bridge = cc::Build::new();
+    configure_native_arb(&mut bridge);
+    bridge
         .file("src/ccm/arb_bridge.c")
         .warnings(true)
         .compile("xc_spectral_arb_bridge");
     println!("cargo:rustc-link-lib=dylib=flint");
+}
+
+// Keep this prefix contract aligned with xc-numerics: its executed MPFR probe
+// and both C bridges must select the same installed GMP/MPFR/FLINT headers.
+fn configure_native_arb(build: &mut cc::Build) {
+    println!("cargo:rerun-if-env-changed=XC_NATIVE_PREFIX");
+    let prefix = std::env::var_os("XC_NATIVE_PREFIX").map(std::path::PathBuf::from);
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    assert!(
+        !windows || prefix.is_some(),
+        "Windows Arb builds require XC_NATIVE_PREFIX set to the absolute native GMP/MPFR/FLINT prefix"
+    );
+    if let Some(prefix) = &prefix {
+        assert!(prefix.is_absolute(), "XC_NATIVE_PREFIX must be absolute");
+        for header in ["gmp.h", "mpfr.h", "flint/flint.h"] {
+            let path = prefix.join("include").join(header);
+            assert!(path.is_file(), "missing native header: {}", path.display());
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        let lib = prefix.join("lib");
+        assert!(
+            lib.is_dir(),
+            "missing native library directory: {}",
+            lib.display()
+        );
+        if windows {
+            assert!(
+                prefix.join("bin").is_dir(),
+                "XC_NATIVE_PREFIX must contain the native DLL bin directory"
+            );
+        }
+        build.include(prefix.join("include"));
+        println!("cargo:rustc-link-search=native={}", lib.display());
+    }
 }
 
 // Invalidate local execution state across releases AND amendments of one release.
@@ -98,5 +138,8 @@ fn checkpoint_build_id() {
     let target = std::env::var("TARGET").unwrap();
     h.update((target.len() as u64).to_le_bytes());
     h.update(target.as_bytes());
-    println!("cargo:rustc-env=XC_CHECKPOINT_BUILD_ID={:x}", h.finalize());
+    println!(
+        "cargo:rustc-env=XC_CHECKPOINT_BUILD_ID={}",
+        hex_lower(&h.finalize())
+    );
 }

@@ -14,7 +14,7 @@ pub struct ArtifactFamilyCompatibilityPolicy {
     pub accepted_manifest_schema_versions: &'static [u32],
 }
 
-const SCHEMA_V1: &[u32] = &[1];
+const MANIFEST_SCHEMAS: &[u32] = &[1, 2];
 
 /// Producer and reader floor for every managed family and kind. Toolkit 0.16.0
 /// started the artifact repositories from a clean slate: artifacts produced by
@@ -37,23 +37,23 @@ pub fn artifact_family_compatibility_policy(
     // Keep every family in its own arm even while floors coincide. A defect in
     // one family can then raise only that producer floor in a patch release.
     let (minimum_producer, minimum_reader, maximum_reader, schemas) = match family {
-        "quadrature" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
-        "ccm-components" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
-        "ccm-matrices" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
-        "weil-states" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
-        "prolate" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "quadrature" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
+        "ccm-components" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
+        "ccm-matrices" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
+        "weil-states" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
+        "prolate" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
         // Reserved schema support; numerical producers remain separately opt-in.
-        "maynard-tao" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
-        "ccm-roots" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
-        "ccm-evidence" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "maynard-tao" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
+        "ccm-roots" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
+        "ccm-evidence" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
         // Eigenfunction profiles and target-distance measurements.
-        "ccm-distance" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "ccm-distance" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
         // Canonical protocol fixtures exercise backend-neutral mechanics with
         // synthetic families. They remain explicit rather than receiving a
         // permissive unknown-family fallback.
-        "ccm" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
-        "fixture" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
-        "research_evidence" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "ccm" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
+        "fixture" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
+        "research_evidence" => (CLEAN_SLATE, CLEAN_SLATE, None, MANIFEST_SCHEMAS),
         _ => {
             return Err(CacheError::InvalidManifest(format!(
                 "artifact family {family:?} has no explicit compatibility policy"

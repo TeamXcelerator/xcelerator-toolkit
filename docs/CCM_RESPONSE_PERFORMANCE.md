@@ -81,6 +81,18 @@ verification, and higher assurance bypass them. They preserve
 work across a later failure under the same build; they cannot recover vectors
 lost by an older process or promise reuse after a code update.
 
+Standalone prime-power response capture also checkpoints each fully completed
+event after its bordered-residual and root-response gates. A resumed run loads
+the contiguous completed prefix and computes the remaining events in their
+original order. It stops reuse at the first missing or invalid event. The exact
+source graph, state, eigenvalue, precision, root selection, build, MPFR exponent
+range, and response/backend policies bind these files. They use
+`XC_RESEARCH_CHECKPOINT_DIR` (or the managed-cache default) and the existing
+per-checkpoint byte limit; unavailable storage or admission causes ordinary
+computation. Only computed-assurance `reuse` runs can use them. This protects
+completed work without changing scientific artifacts or promoting assurance;
+it does not checkpoint a partially finished event or accelerate its arithmetic.
+
 U-flow and standalone prime-power response reuse exact coefficient rows and their directed interval conversions
 across bounded prime-power event batches. `XC_RESPONSE_EVENT_BATCH` is a positive
 integer (default `8`); `1` selects single-event storage. The declared working
@@ -167,6 +179,48 @@ performance changes. Consumers pinned to an older implementation continue to use
 that implementation until their Git dependency and lockfile are updated.
 
 ## Verification and measurement
+
+U-flow reuses per-worker MPFR integral term buffers and lazily retains directed
+root geometry across its four fixed-pole channels and two moving-pole passes.
+The integral products retain their corner order, precision, directed rounding,
+signed zeros, and final `Float::sum`. Root evaluation still visits the original
+guard ladder in the original root order. Optional geometry can be released on
+workspace refusal; numerical failures and cancellation remain failures. Cached
+payload validation retains its independent cold calculation.
+
+Explicit CUDA response batches finish independent rows using at most the
+already admitted GPU host-worker count. Each row keeps its original event
+order, interval operations, signed-zero fallback, and rounding checks. Results
+and fatal errors are reduced in original row order after workers join.
+Additional simultaneous reference-row scratch is charged to the active run
+ledger while the contraction reservation remains live. If that extra storage
+does not fit, the completed contraction is finished serially. It is not
+recomputed and its backend is not changed. The GPU maximum-bytes option still
+limits contraction workspace; the run budget also covers this separately
+reserved finishing scratch. Cancellation and backend failures remain failures.
+
+The opt-in GL root schedule also supports the qualified native Windows
+GNU/UCRT lane described in [Windows setup](WINDOWS.md). It uses the same root
+kernel and fresh-rule validation as the serial schedule. Cold-table timings
+must be distinguished from warm-cache behavior and total claim time.
+
+Computed/prefer-reuse u-flow runs can also resume completed integral blocks and
+the last complete canonical prime-event prefix. These private execution records
+bind the build, exact source, loaded quadrature values, guard precision, backend
+policy, and MPFR exponent range. A damaged or incompatible record is ignored.
+Only a contiguous completed prefix is accepted, and remaining work keeps its
+original arithmetic order. The final action rounding and response validation
+gates still execute. Refresh and higher-assurance replay bypass these records.
+They do not change portable artifact schemas or certify mathematical results.
+
+U-flow logs now distinguish source admission, exact source conversion,
+quadrature, checkpoint binding, coefficient preparation, integrals, assembly,
+and individual prime batches. Each phase records completion or an incomplete
+exit. `XC_RESPONSE_TIMING=1` additionally separates GPU row preparation,
+contraction, and finishing. Contraction time includes host packing and
+reconstruction; it is not device-only time. All timing remains outside payloads
+and artifact identities. Checkpoints improve restart cost; their write/hash
+overhead is part of uninterrupted execution and must be measured separately.
 
 Regressions compare complete response JSON with the frozen prior scalar
 implementation, check root responses at 128 through 6708 bits and across worker

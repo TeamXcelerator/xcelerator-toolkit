@@ -788,6 +788,52 @@ pub fn execute_next_finalization_step(
     journal: &mut PublicationTransactionJournal,
     destination: PublicationDestination,
 ) -> Result<PublicationFinalizationOutcome, CacheError> {
+    crate::publication_admission::require_private_unadmitted(destination)?;
+    execute_next_finalization_step_inner(
+        remote,
+        checkpoints,
+        cancellation,
+        authenticated_session,
+        policy,
+        journal,
+        destination,
+    )
+}
+
+/// Artifact-bound entry point for public or private metadata publication.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_next_finalization_step_admitted(
+    remote: &dyn RemoteGitStore,
+    checkpoints: &PublicationJournalStore,
+    cancellation: &CancellationToken,
+    authenticated_session: &AuthenticatedGitHubSession,
+    policy: &PublicationFinalizationPolicy,
+    journal: &mut PublicationTransactionJournal,
+    destination: PublicationDestination,
+    admission: &crate::PublicationAdmission,
+) -> Result<PublicationFinalizationOutcome, CacheError> {
+    admission.check(journal, destination)?;
+    execute_next_finalization_step_inner(
+        remote,
+        checkpoints,
+        cancellation,
+        authenticated_session,
+        policy,
+        journal,
+        destination,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_next_finalization_step_inner(
+    remote: &dyn RemoteGitStore,
+    checkpoints: &PublicationJournalStore,
+    cancellation: &CancellationToken,
+    authenticated_session: &AuthenticatedGitHubSession,
+    policy: &PublicationFinalizationPolicy,
+    journal: &mut PublicationTransactionJournal,
+    destination: PublicationDestination,
+) -> Result<PublicationFinalizationOutcome, CacheError> {
     cancellation
         .check()
         .map_err(|error| CacheError::Cancelled(error.to_string()))?;

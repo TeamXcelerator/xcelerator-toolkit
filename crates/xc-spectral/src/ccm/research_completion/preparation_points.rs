@@ -280,6 +280,7 @@ impl Promotion {
         input: &mut crate::ccm::extended_research::ExternalResearchInputs,
     ) -> Result<()> {
         let crate::ccm::extended_research::ExternalResearchInputs {
+            producer_annotations: _,
             run_once,
             finite_diagnostics: _,
             schema_version: _,

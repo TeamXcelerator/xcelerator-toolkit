@@ -15,6 +15,7 @@ mod bootstrap_topology;
 mod bundle;
 mod cache_provenance;
 mod compatibility;
+mod content_model;
 mod coordinator;
 mod cost_governance;
 mod dedup_governance;
@@ -27,6 +28,7 @@ mod git_transport;
 mod github_auth;
 mod governance;
 mod governance_records;
+mod identity_contract;
 mod large_corpus_acceptance;
 mod live_github_acceptance;
 mod local_shard;
@@ -41,6 +43,7 @@ mod private_temp_tests;
 mod production_staging;
 mod protocol;
 mod publication;
+mod publication_admission;
 mod publication_metrics;
 mod publication_orchestrator;
 mod publication_recovery;
@@ -66,6 +69,7 @@ pub use bootstrap_remote_store::*;
 pub use bundle::*;
 pub use cache_provenance::*;
 pub use compatibility::*;
+pub use content_model::*;
 pub use coordinator::*;
 pub use cost_governance::*;
 pub use dedup_governance::*;
@@ -77,6 +81,7 @@ pub use git_transport::*;
 pub use github_auth::*;
 pub use governance::*;
 pub use governance_records::*;
+pub use identity_contract::*;
 pub use large_corpus_acceptance::*;
 pub use live_github_acceptance::*;
 pub use local_shard::*;
@@ -89,6 +94,7 @@ pub use private_coordination::*;
 pub use production_staging::*;
 pub use protocol::*;
 pub use publication::*;
+pub use publication_admission::*;
 pub use publication_orchestrator::*;
 pub use publication_recovery::*;
 pub use publication_staging::*;
@@ -510,6 +516,13 @@ pub struct ArtifactManifest {
 impl ArtifactManifest {
     pub fn validate(&self) -> Result<(), CacheError> {
         self.key.validate()?;
+        if let Some(provenance) = crate::local_manifest_provenance_v2(self)? {
+            if self.visibility == CacheVisibility::Public
+                && provenance.disclosure != crate::ArtifactDisclosure::PublicInputs
+            {
+                return Err(CacheError::PermissionDenied("withheld_private_only".into()));
+            }
+        }
         self.producer_toolkit_version.validate()?;
         self.minimum_reader_version.validate()?;
         if let Some(maximum) = &self.maximum_reader_version {
@@ -3787,7 +3800,7 @@ fn private_sibling_candidate(parent: &Path, prefix: &str) -> Result<PathBuf, Cac
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let sequence = NEXT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| CacheError::Io("private staging sequence exhausted".to_owned()))?;
@@ -4161,6 +4174,7 @@ mod tests {
         };
         let payload_digest = canonical_payload.digest().unwrap();
         let canonical = CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
             artifact_family: "ccm-matrices".to_owned(),
             semantic_key: semantic_key.clone(),
@@ -4911,6 +4925,7 @@ mod tests {
         };
         let payload_digest = canonical_payload.digest().unwrap();
         let canonical = CanonicalArtifactManifest {
+            provenance: None,
             schema_version: 1,
             artifact_family: "ccm-matrices".to_owned(),
             semantic_key: semantic_key.clone(),

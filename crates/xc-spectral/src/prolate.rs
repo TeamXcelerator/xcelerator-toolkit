@@ -3426,6 +3426,11 @@ pub mod hp {
 
         #[test]
         fn prolate_spectrum_round_trips_through_common_cache_fabric() {
+            // Output validation owns a process-global run, shared with the
+            // other HP verification/cache tests in this test executable.
+            let _lock = crate::TEST_CWD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             use xc_cache::{
                 ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheQuality, CacheResolver,
                 CacheVisibility, CertificationFailurePolicy, FilesystemCacheStore,

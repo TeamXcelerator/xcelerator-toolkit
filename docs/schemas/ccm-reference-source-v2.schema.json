@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ccm_reference_source retained observation v2",
+  "description": "Retained observation payload; exact requests and ancestry are authenticated by the manifest. Shape validation is not numerical proof. Separate same-kind finite/cohort/preparation APIs retain their own data validators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "kind",
+    "scope",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "semantics": {
+      "const": "ccm_reference_source/value-v1"
+    },
+    "kind": {
+      "const": "ccm_reference_source"
+    },
+    "scope": {
+      "const": "finite_point_inputs; no_source_error_enclosure; no_ground_selection_or_convergence_certificate"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "spec",
+        "definition_digest",
+        "basis",
+        "certification"
+      ],
+      "properties": {
+        "spec": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "definition",
+            "lambda_squared",
+            "precision_bits",
+            "coefficients",
+            "approximation_scope"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": 1
+            },
+            "definition": {
+              "type": "string"
+            },
+            "lambda_squared": {
+              "type": "string",
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+            },
+            "precision_bits": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "coefficients": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+              }
+            },
+            "approximation_scope": {
+              "type": "string"
+            }
+          }
+        },
+        "definition_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+        },
+        "basis": {
+          "type": "string"
+        },
+        "certification": {
+          "type": "string"
+        }
+      }
+    },
+    "expected_rows": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

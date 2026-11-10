@@ -56,6 +56,7 @@ pub fn published(mut m: ArtifactManifest, parents: &[&ArtifactManifest]) -> Arti
         dependencies,
     };
     let canonical = CanonicalArtifactManifest {
+        provenance: None,
         schema_version: 1,
         artifact_family: family_for_artifact_kind(&m.key.kind).unwrap().into(),
         semantic_digest: semantic.digest().unwrap(),

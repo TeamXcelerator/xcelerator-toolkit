@@ -800,14 +800,6 @@ pub fn analyze_retained_prefixes_via_cache(
     if cache.requested_assurance != xc_core::AssuranceLevel::Computed {
         bail!("prefix diagnostics are computed evidence, not certified outputs");
     }
-    if cache.write_visibility == CacheVisibility::Public
-        && (matrix.manifest.visibility != CacheVisibility::Public
-            || eigenpairs
-                .iter()
-                .any(|e| e.manifest.visibility != CacheVisibility::Public))
-    {
-        bail!("public prefix diagnostics require public source manifests");
-    }
     let mut dependencies = vec![dependency(&matrix.manifest)];
     dependencies.extend(eigenpairs.iter().map(|e| dependency(&e.manifest)));
     dependencies.sort_by(|a, b| {
@@ -825,25 +817,35 @@ pub fn analyze_retained_prefixes_via_cache(
             ))
     });
     dependencies.dedup();
-    // The identity binds each parent's label-free identity; the manifest keeps
-    // its resolvable key (see `xc_cache::research_identity_dependency`).
-    let mut identities = std::iter::once(&matrix.manifest)
-        .chain(eigenpairs.iter().map(|e| &e.manifest))
-        .map(xc_cache::research_identity_dependency)
+    let parents_for_policy = std::iter::once(matrix.manifest.clone())
+        .chain(eigenpairs.iter().map(|e| e.manifest.clone()))
         .collect::<Vec<_>>();
-    identities.sort_by(|a, b| {
-        (&a.key.kind, &a.key.parameters_digest, &a.content_digest).cmp(&(
-            &b.key.kind,
-            &b.key.parameters_digest,
-            &b.content_digest,
-        ))
-    });
-    identities.dedup();
+    let provenance = xc_cache::provenance_for_numerical_inputs(
+        PREFIX_ARTIFACT_KIND,
+        &parents_for_policy,
+        vec![],
+    )?;
+    if cache.write_visibility == CacheVisibility::Public
+        && provenance.disclosure != xc_cache::ArtifactDisclosure::PublicInputs
+    {
+        bail!("public prefix diagnostics require independently public-admissible sources");
+    }
+    let identities = std::iter::once(&matrix.manifest)
+        .chain(eigenpairs.iter().map(|e| &e.manifest))
+        .enumerate()
+        .map(|(index, manifest)| {
+            xc_cache::numerical_source_identity(
+                manifest,
+                format!("source_{index}"),
+                "stored-prefix-input-v1",
+            )
+        })
+        .collect::<Vec<_>>();
     let semantic = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: PREFIX_ARTIFACT_KIND.into(),
         mathematical_semantics_version: prefix_semantics(options).into(),
-        resolved_mathematical_parameters: serde_json::json!({"source_dependencies":identities,"options":options,"source_parents_are_public":matrix.manifest.visibility == CacheVisibility::Public && eigenpairs.iter().all(|e| e.manifest.visibility == CacheVisibility::Public)}),
+        resolved_mathematical_parameters: serde_json::json!({"source_dependencies":identities,"options":options}),
         normalization: Some(EVEN_BASIS.into()),
         target: Some("parent_derived_prefix_moments_and_checkpoint_exports".into()),
         subspace: Some("even".into()),
@@ -893,6 +895,10 @@ pub fn analyze_retained_prefixes_via_cache(
         tags: BTreeMap::from([
             ("domain".into(), "ccm".into()),
             ("assurance".into(), "computed_not_certified".into()),
+            (
+                xc_cache::MANIFEST_PROVENANCE_V2_TAG.into(),
+                serde_json::to_string(&provenance)?,
+            ),
         ]),
         provenance_digest: None,
         production_sink: cache.production_sink,
@@ -1242,11 +1248,6 @@ pub fn check_retained_reduction_via_cache(
     if tolerance <= 0 || tolerance >= 1 {
         bail!("invalid reduction tolerance");
     }
-    if cache.write_visibility == CacheVisibility::Public
-        && matrix.manifest.visibility != CacheVisibility::Public
-    {
-        bail!("public reduction diagnostics require a public source manifest");
-    }
     let estimated_bytes = 2
         * matrix.dimension() as u128
         * matrix.dimension() as u128
@@ -1254,13 +1255,23 @@ pub fn check_retained_reduction_via_cache(
     if estimated_bytes > 16 * 1024_u128.pow(3) {
         bail!("retained reduction exceeds matrix-storage budget");
     }
+    let provenance = xc_cache::provenance_for_numerical_inputs(
+        "ccm_retained_reduction_check",
+        std::slice::from_ref(&matrix.manifest),
+        vec![],
+    )?;
+    if cache.write_visibility == CacheVisibility::Public
+        && provenance.disclosure != xc_cache::ArtifactDisclosure::PublicInputs
+    {
+        bail!("public reduction diagnostics require independently public-admissible sources");
+    }
     let dependencies = vec![dependency(&matrix.manifest)];
     let semantic = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_retained_reduction_check".into(),
         mathematical_semantics_version: RETAINED_REDUCTION_SEMANTICS.into(),
         resolved_mathematical_parameters: serde_json::json!({
-            "source_dependencies": [xc_cache::research_identity_dependency(&matrix.manifest)], "source_parents_are_public": matrix.manifest.visibility == CacheVisibility::Public, "working_precision_bits": working_precision_bits,
+            "source_dependencies": [xc_cache::numerical_source_identity(&matrix.manifest, "matrix", "stored-even-matrix-v1")], "working_precision_bits": working_precision_bits,
             "maximum_dimension": maximum_dimension, "relative_tolerance": relative_tolerance,
         }),
         normalization: Some(EVEN_BASIS.into()),
@@ -1307,7 +1318,13 @@ pub fn check_retained_reduction_via_cache(
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
         minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
-        tags: BTreeMap::from([("assurance".into(), "computed_not_certified".into())]),
+        tags: BTreeMap::from([
+            ("assurance".into(), "computed_not_certified".into()),
+            (
+                xc_cache::MANIFEST_PROVENANCE_V2_TAG.into(),
+                serde_json::to_string(&provenance)?,
+            ),
+        ]),
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
@@ -1994,6 +2011,11 @@ mod exhaustive_retained_prefix {
     }
     #[test]
     fn ordinary_prefix_and_reduction_hits_do_not_repeat_dense_calculations() {
+        // Its later VerifyAgainstReference session is process-global, just
+        // like the prolate and finite-Dirichlet verification fixtures.
+        let _lock = crate::TEST_CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use xc_cache::*;
         let directory = xc_core::test_support::TestDir::new("retained-warm-sanity");
         let resolver = CacheResolver::new(vec![CacheLayer {

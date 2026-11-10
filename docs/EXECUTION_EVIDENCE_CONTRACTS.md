@@ -209,6 +209,15 @@ same-thread nested waits fail instead of deadlocking.
 
 ## Arithmetic and checkpoints
 
+`XC_KRYLOV_TIMING=1` emits one operational wall-time summary for each
+high-precision shift-invert Krylov call, including basis/orthogonalization,
+shifted applications, projected matrix/eigensolve, Ritz construction, and
+validation. The phases partition that call's elapsed time; they are not CPU
+seconds and do not include a factorization prepared before entry. Reports also
+include phase visit counts. Numerical reports, acceptance gates, and artifact
+payloads are unchanged. Scheduling uses precision-aware chunks over the caller's
+available Rayon pool while retaining each rounded operation and ordered sum.
+
 `XC_CONTINUOUS_MAX_OPERATIONS` sets the continuous finite-interpolant energy
 evaluator's work ceiling. It defaults to 32000000 and accepts a positive canonical
 decimal `u64`. Admission counts the knots of all five forms times the sum of

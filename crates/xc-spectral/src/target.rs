@@ -20,7 +20,7 @@ mod external;
 mod input;
 #[cfg(feature = "hp")]
 pub(crate) use external::provider_declared_pure;
-pub use external::ExternalProfileSpec;
+pub use external::{ExternalProfileSpec, ExternalTargetValueContract};
 pub use input::{read_target_specification, target_maximum_bytes, TARGET_MAXIMUM_BYTES_ENV};
 
 /// Environment variable naming the private target-profile specification.
@@ -186,7 +186,7 @@ pub struct TargetProfileSpec {
 
 impl TargetProfileSpec {
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.schema_version, 1 | 3) {
+        if !matches!(self.schema_version, 1 | 3 | 4) {
             anyhow::bail!("unsupported target-profile schema {}", self.schema_version);
         }
         if self.profile_id.trim().is_empty()
@@ -209,8 +209,16 @@ impl TargetProfileSpec {
                     anyhow::bail!("base_series cannot contain a solved parameter");
                 }
             }
-            (None, Some(source), 3) => source.validate()?,
-            _ => anyhow::bail!("use schema 1 with base_series or schema 3 with external_profile"),
+            (None, Some(source), 3) => {
+                source.validate()?;
+                anyhow::ensure!(source.value_contract.is_none() && source.execution_provenance.is_none(),
+                    "opaque schema 3 must keep its conservative legacy identity");
+            }
+            (None, Some(source), 4) => {
+                source.validate()?;
+                anyhow::ensure!(source.value_contract.is_some(), "schema 4 requires an explicit numerical input contract");
+            }
+            _ => anyhow::bail!("use schema 1 with base_series, schema 3 with opaque external input, or schema 4 with a declared value contract"),
         }
         if let Some(auxiliary) = &self.auxiliary_series {
             auxiliary.validate("auxiliary_series")?;
@@ -257,6 +265,40 @@ impl TargetProfileSpec {
 
     /// Stable identity used in semantic keys. The specification itself is not
     /// persisted outside the private runtime input.
+    /// Exact producer attribution, separate from the target's value identity.
+    /// These annotations belong only on private target-derived manifests.
+    pub fn producer_annotations(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        self.validate()?;
+        let mut annotations = std::collections::BTreeMap::from([
+            ("target_descriptor_digest".into(), self.digest()?),
+            ("target_profile_id".into(), self.profile_id.clone()),
+        ]);
+        if let Some(external) = &self.external_profile {
+            annotations.insert(
+                "target_provider_sha256".into(),
+                external.provider_sha256.clone(),
+            );
+            if let Some(receipt) = &external.execution_provenance {
+                annotations.insert(
+                    "target_execution_provenance".into(),
+                    serde_json::to_string(receipt)?,
+                );
+            }
+        }
+        Ok(annotations)
+    }
+
+    pub(crate) fn manifest_provenance_tag(&self) -> Result<(String, String)> {
+        Ok((
+            xc_cache::MANIFEST_PROVENANCE_V2_TAG.into(),
+            serde_json::to_string(&xc_cache::ManifestProvenanceV2 {
+                disclosure: xc_cache::ArtifactDisclosure::PrivateOnly,
+                producer_annotations: self.producer_annotations()?,
+                producer_receipts: Vec::new(),
+            })?,
+        ))
+    }
+
     pub fn digest(&self) -> Result<String> {
         self.validate()?;
         // The external protocol is part of the measurement semantics: a cached
@@ -280,6 +322,81 @@ impl TargetProfileSpec {
             serde_json::to_vec(&("gaussian-series-exponent-floor-and-zero-tail-v5", self))?
         };
         Ok(xc_cache::ContentDigest::sha256(&bytes).0)
+    }
+
+    /// Mathematical identity of the base value alone. Opaque schema-3 input
+    /// retains its legacy identity until an explicit adapter is supplied.
+    pub fn base_value_digest(&self) -> Result<String> {
+        self.validate()?;
+        if self.schema_version == 3 {
+            return self.digest();
+        }
+        if let Some(external) = &self.external_profile {
+            return Ok(xc_cache::canonical_digest(&serde_json::json!({
+                "evaluation_semantics": "external-target-working-precision-and-unit-at-one-v1",
+                "contract": external.value_contract,
+                "lambda_squared": xc_core::DecimalLiteral::new(&external.lambda_squared)?.canonical()?.as_str(),
+            }))?.0);
+        }
+        Ok(xc_cache::canonical_digest(&(
+            "gaussian-series-exponent-floor-and-zero-tail-v5",
+            &self.base_series,
+        ))?
+        .0)
+    }
+
+    pub fn auxiliary_value_digest(&self) -> Result<Option<String>> {
+        self.validate()?;
+        self.auxiliary_series
+            .as_ref()
+            .map(|auxiliary| {
+                Ok(xc_cache::canonical_digest(&(
+                    "gaussian-series-exponent-floor-and-zero-tail-v5",
+                    auxiliary,
+                    "auxiliary-parameter-vanishes-at-one-v1",
+                ))?
+                .0)
+            })
+            .transpose()
+    }
+
+    /// For measurements that actually consume both base and auxiliary values.
+    pub fn combined_value_digest(&self) -> Result<String> {
+        if self.schema_version == 3 {
+            return self.digest();
+        }
+        Ok(xc_cache::canonical_digest(&(
+            self.base_value_digest()?,
+            self.auxiliary_value_digest()?,
+        ))?
+        .0)
+    }
+
+    pub fn admit_declared_values(&self) -> Result<()> {
+        self.validate()?;
+        if let Some(profile) = &self.external_profile {
+            external::admit_declared_values(profile)?;
+        }
+        Ok(())
+    }
+
+    /// Authenticate the numerical input and execution policy without evaluating
+    /// the target. A warm cache hit must not start a provider just for admission.
+    pub fn admit_evaluation(&self, lambda_squared: &str, precision_bits: u32) -> Result<()> {
+        self.admit_declared_values()?;
+        if let Some(profile) = &self.external_profile {
+            anyhow::ensure!(
+                precision_bits <= profile.evaluation_precision_bits,
+                "external target requires regeneration at the requested precision"
+            );
+            anyhow::ensure!(
+                xc_core::DecimalLiteral::new(lambda_squared)?
+                    .cmp_numeric(&xc_core::DecimalLiteral::new(&profile.lambda_squared)?)?
+                    .is_eq(),
+                "runtime target cutoff does not match the configuration"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -530,6 +647,8 @@ impl CompiledSeriesF64 {
 pub struct TargetEvaluatorF64 {
     profile_id: String,
     definition_digest: String,
+    base_value_digest: String,
+    combined_value_digest: String,
     base: Option<CompiledSeriesF64>,
     external: Option<external::CompiledF64>,
     base_at_one: f64,
@@ -577,6 +696,8 @@ impl TargetEvaluatorF64 {
         Ok(Self {
             profile_id: spec.profile_id.clone(),
             definition_digest: spec.digest()?,
+            base_value_digest: spec.base_value_digest()?,
+            combined_value_digest: spec.combined_value_digest()?,
             base,
             external,
             base_at_one,
@@ -594,6 +715,13 @@ impl TargetEvaluatorF64 {
 
     pub fn definition_digest(&self) -> &str {
         &self.definition_digest
+    }
+
+    pub fn base_value_digest(&self) -> &str {
+        &self.base_value_digest
+    }
+    pub fn combined_value_digest(&self) -> &str {
+        &self.combined_value_digest
     }
 
     /// Reject use of a cutoff-specific source in a different configuration.
@@ -1002,6 +1130,8 @@ pub mod hp {
         requested_precision: u32,
         profile_id: String,
         definition_digest: String,
+        base_value_digest: String,
+        combined_value_digest: String,
         base: Option<CompiledSeries>,
         external: Option<super::external::hp::Compiled>,
         base_at_one: Float,
@@ -1059,6 +1189,8 @@ pub mod hp {
                 requested_precision: precision_bits,
                 profile_id: spec.profile_id.clone(),
                 definition_digest: spec.digest()?,
+                base_value_digest: spec.base_value_digest()?,
+                combined_value_digest: spec.combined_value_digest()?,
                 base,
                 external,
                 base_at_one,
@@ -1076,6 +1208,13 @@ pub mod hp {
 
         pub fn definition_digest(&self) -> &str {
             &self.definition_digest
+        }
+
+        pub fn base_value_digest(&self) -> &str {
+            &self.base_value_digest
+        }
+        pub fn combined_value_digest(&self) -> &str {
+            &self.combined_value_digest
         }
 
         pub(crate) fn uses_external_provider(&self) -> bool {
@@ -1164,6 +1303,60 @@ mod tests {
     }
 
     #[test]
+    fn declared_target_values_exclude_provenance_and_unrelated_auxiliary() {
+        let mut spec = benign_spec();
+        let input = serde_json::json!({"coefficients":["1","0.25"]});
+        spec.schema_version = 4;
+        spec.base_series = None;
+        spec.external_profile = Some(ExternalProfileSpec {
+            lambda_squared: "4".into(),
+            evaluation_precision_bits: 256,
+            provider_sha256: "a".repeat(64),
+            value_contract: Some(ExternalTargetValueContract {
+                schema_version: 1,
+                value_semantics: "synthetic-polynomial-v1".into(),
+                normalization: "unit-at-one".into(),
+                numerical_input_digest: xc_cache::canonical_digest(&input).unwrap(),
+            }),
+            input,
+            execution_provenance: Some(serde_json::json!({"source":"first.pdf"})),
+        });
+        let base = spec.base_value_digest().unwrap();
+        let combined = spec.combined_value_digest().unwrap();
+        let receipt = spec.digest().unwrap();
+        spec.profile_id = "another-label".into();
+        let external = spec.external_profile.as_mut().unwrap();
+        external.provider_sha256 = "b".repeat(64);
+        external.execution_provenance =
+            Some(serde_json::json!({"source":"second.pdf","build":"new"}));
+        assert_eq!(base, spec.base_value_digest().unwrap());
+        assert_ne!(receipt, spec.digest().unwrap());
+        spec.auxiliary_series.as_mut().unwrap().minimum_terms += 1;
+        assert_eq!(base, spec.base_value_digest().unwrap());
+        assert_ne!(combined, spec.combined_value_digest().unwrap());
+        let external = spec.external_profile.as_mut().unwrap();
+        external.input["coefficients"][1] = "0.5".into();
+        assert!(
+            spec.base_value_digest().is_err(),
+            "tampered input must fail admission"
+        );
+        let external = spec.external_profile.as_mut().unwrap();
+        external
+            .value_contract
+            .as_mut()
+            .unwrap()
+            .numerical_input_digest = xc_cache::canonical_digest(&external.input).unwrap();
+        assert_ne!(base, spec.base_value_digest().unwrap());
+        let changed = spec.base_value_digest().unwrap();
+        spec.external_profile
+            .as_mut()
+            .unwrap()
+            .evaluation_precision_bits += 1;
+        assert_eq!(changed, spec.base_value_digest().unwrap(),
+            "the authorization ceiling is operational; each consumer keys its actual evaluation precision");
+    }
+
+    #[test]
     fn generic_f64_target_normalizes_and_binds_specification() {
         let spec = benign_spec();
         let target = TargetEvaluatorF64::from_spec(&spec).unwrap();
@@ -1187,6 +1380,8 @@ mod tests {
         );
         spec.schema_version = 3;
         spec.external_profile = Some(ExternalProfileSpec {
+            value_contract: None,
+            execution_provenance: None,
             lambda_squared: "4".into(),
             evaluation_precision_bits: 256,
             provider_sha256: "a".repeat(64),

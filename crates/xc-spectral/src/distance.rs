@@ -969,7 +969,7 @@ pub mod hp {
         let working = prec.saturating_add(GUARD_BITS);
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
         target.validate_lambda(lambda)?;
-        if expected_target_digest.is_some_and(|expected| expected != target.definition_digest()) {
+        if expected_target_digest.is_some_and(|expected| expected != target.base_value_digest()) {
             anyhow::bail!(
                 "runtime target specification changed after its semantic identity was fixed"
             );
@@ -1010,7 +1010,7 @@ pub mod hp {
         let working = prec.saturating_add(GUARD_BITS);
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
         target.validate_lambda(lambda)?;
-        if expected_target_digest.is_some_and(|expected| expected != target.definition_digest()) {
+        if expected_target_digest.is_some_and(|expected| expected != target.base_value_digest()) {
             anyhow::bail!(
                 "runtime target specification changed after its semantic identity was fixed"
             );
@@ -2134,7 +2134,7 @@ pub mod hp {
 
         Ok(PortableDeviationDecomposition {
             schema_version: 3,
-            target_definition_digest: target.definition_digest().to_owned(),
+            target_definition_digest: target.combined_value_digest().to_owned(),
             lambda_squared: profile.lambda_squared.clone(),
             n_modes: profile.n_modes,
             precision_bits: prec,
@@ -3830,7 +3830,7 @@ pub mod hp {
         let working = source.precision_bits.saturating_add(GUARD_BITS);
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
         target.validate_lambda(source.lambda)?;
-        if target.definition_digest() != source.target_definition_digest {
+        if target.base_value_digest() != source.target_definition_digest {
             anyhow::bail!(
                 "runtime target specification changed after its semantic identity was fixed"
             );
@@ -4663,8 +4663,10 @@ pub mod hp {
         // The opaque digest is safe to retain; the private specification and
         // its coefficients never enter a semantic envelope or payload.
         let target_spec = crate::target::TargetProfileSpec::from_environment()?;
-        let target_definition_digest = target_spec.digest()?;
+        let target_definition_digest = target_spec.base_value_digest()?;
+        let decomposition_target_digest = target_spec.combined_value_digest()?;
         let lambda_sq_identity = lambda_squared_identity(params);
+        target_spec.admit_evaluation(&lambda_sq_identity, working)?;
         let lambda_sq = crate::ccm::hp::lambda_squared_value_hp(params, working)?;
         if lambda_sq <= 1u32 {
             anyhow::bail!(
@@ -4673,11 +4675,6 @@ pub mod hp {
             );
         }
         let lambda = lambda_sq.sqrt();
-        if target_spec.external_profile.is_some() {
-            crate::target::hp::TargetEvaluator::from_spec(&target_spec, working)?
-                .validate_lambda(&lambda)?;
-            // Validate a finite source before any warm target-derived artifact can be reused.
-        }
         let variable = rules[0].variable();
         let canonical_state =
             crate::ccm::hp::resolve_canonical_even_eigenstate_via_cache(params, cfg, cache)?;
@@ -5010,6 +5007,7 @@ pub mod hp {
             minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
+                target_spec.manifest_provenance_tag()?,
                 ("domain".to_owned(), "ccm".to_owned()),
                 ("artifact".to_owned(), "target_distance".to_owned()),
             ]),
@@ -5095,6 +5093,7 @@ pub mod hp {
             minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
+                target_spec.manifest_provenance_tag()?,
                 ("domain".to_owned(), "ccm".to_owned()),
                 (
                     "artifact".to_owned(),
@@ -5164,6 +5163,7 @@ pub mod hp {
             minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
+                target_spec.manifest_provenance_tag()?,
                 ("domain".to_owned(), "ccm".to_owned()),
                 ("artifact".to_owned(), "target_residual_analysis".to_owned()),
             ]),
@@ -5178,7 +5178,7 @@ pub mod hp {
                 .to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
                 "uniform_grid_arithmetic": xc_numerics::grid_integral::UNIFORM_GRID_SEMANTICS,
-                "target_definition_digest": target_definition_digest,
+                "target_definition_digest": decomposition_target_digest,
                 "lambda_squared": lambda_sq_identity,
                 "n_modes": params.n_modes,
                 "precision_bits": prec,
@@ -5225,6 +5225,7 @@ pub mod hp {
             minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
+                target_spec.manifest_provenance_tag()?,
                 ("domain".to_owned(), "ccm".to_owned()),
                 ("artifact".to_owned(), "deviation_decomposition".to_owned()),
             ]),
@@ -5410,7 +5411,7 @@ pub mod hp {
                         prec,
                         variable,
                         expected_samples,
-                        &target_definition_digest,
+                        &decomposition_target_digest,
                     )
                 };
                 let resolved_decomposition = resolve_or_compute_json_artifact_with_dependencies(
@@ -5597,7 +5598,7 @@ pub mod hp {
                     prec,
                     variable,
                     expected_samples,
-                    &target_definition_digest,
+                    &decomposition_target_digest,
                 )
             };
             let resolved_decomposition = resolve_or_compute_json_artifact_with_dependencies(
@@ -6739,7 +6740,7 @@ mod tests {
         fn test_target_digest() -> String {
             crate::target::TargetProfileSpec::from_environment()
                 .unwrap()
-                .digest()
+                .base_value_digest()
                 .unwrap()
         }
 

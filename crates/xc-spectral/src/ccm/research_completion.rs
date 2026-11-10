@@ -1421,21 +1421,61 @@ pub(crate) fn analyze(
     i: Option<&ExternalResearchInputs>,
     run_certificate: Option<&super::sector_gap_certificate::PortableCcmSectorGapCertificate>,
 ) -> Result<ExtendedAnalysis> {
+    analyze_with_certificate_ref(
+        id,
+        s,
+        m,
+        roots,
+        o,
+        i,
+        run_certificate.map(super::sector_gap_certificate::SectorGapCertificateRef::Full),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analyze_with_certificate_ref(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    o: &ExtensionOptions,
+    i: Option<&ExternalResearchInputs>,
+    run_certificate: Option<super::sector_gap_certificate::SectorGapCertificateRef<'_>>,
+) -> Result<ExtendedAnalysis> {
     match id {
         "capture_preflight" => preflight(s, m, roots, o, i, run_certificate.is_some()),
         "consistency" => consistency_math::analyze(s, o, i),
         "configuration_comparison" => comparisons(s, m, roots, o, i),
         "band_reconstruction" => super::atom_research::band_report(s, o, i),
-        "transform_enclosure" => super::transform_enclosure::analyze(
-            s,
-            roots,
-            o,
-            completion(i),
-            completion(i)
+        "transform_enclosure" => {
+            let certificate = completion(i)
                 .and_then(|c| c.sector_certificate.as_ref())
-                .or(run_certificate),
-            i.map_or(s.precision, |i| i.precision_bits),
-        ),
+                .map(super::sector_gap_certificate::SectorGapCertificateRef::Full)
+                .or(run_certificate);
+            match certificate {
+                Some(super::sector_gap_certificate::SectorGapCertificateRef::Compact(_)) => {
+                    super::transform_enclosure::analyze_with_certificate_ref(
+                        s,
+                        roots,
+                        o,
+                        completion(i),
+                        certificate,
+                        i.map_or(s.precision, |i| i.precision_bits),
+                    )
+                }
+                full => super::transform_enclosure::analyze(
+                    s,
+                    roots,
+                    o,
+                    completion(i),
+                    full.and_then(|c| match c {
+                        super::sector_gap_certificate::SectorGapCertificateRef::Full(c) => Some(c),
+                        _ => None,
+                    }),
+                    i.map_or(s.precision, |i| i.precision_bits),
+                ),
+            }
+        }
         _ => bail!("unknown completion diagnostic"),
     }
 }

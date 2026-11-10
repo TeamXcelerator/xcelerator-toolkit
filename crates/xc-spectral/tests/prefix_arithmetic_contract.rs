@@ -221,7 +221,7 @@ fn prefix_explicit_verification_replays_every_numerical_row_and_export_field() {
     assert_eq!(semantic.mathematical_semantics_version, PREFIX_SEMANTICS);
     assert_eq!(
         manifest.minimum_reader_version,
-        ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
+        ToolkitVersion::parse(xc_cache::CONTENT_MODEL_V2_MINIMUM_READER).unwrap()
     );
     context.mode = ArtifactExecutionCacheMode::RequireReuse;
     context.write_on_miss = false;
@@ -360,7 +360,7 @@ fn retained_reduction_explicit_verification_replays_spectrum_norms_and_residuals
     );
     assert_eq!(
         manifest.minimum_reader_version,
-        ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
+        ToolkitVersion::parse(xc_cache::CONTENT_MODEL_V2_MINIMUM_READER).unwrap()
     );
     context.mode = ArtifactExecutionCacheMode::RequireReuse;
     context.write_on_miss = false;
