@@ -16,35 +16,36 @@ members = [
 exclude = ["tests/external-consumer"]
 
 [workspace.package]
-version = "0.17.0"
+version = "0.17.1"
 edition = "2021"
 authors = ["Ronnie Andrews, Jr. <5178942+TeamXceleratorDev@users.noreply.github.com>"]
 license-file = "LICENSE"
 publish = false
 repository = "https://github.com/TeamXcelerator/xcelerator-toolkit"
-rust-version = "1.98"
+rust-version = "1.99"
 
 [workspace.dependencies]
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["float_roundtrip"] }
-sha2 = "0.10"
-nalgebra = "0.33"
-rayon = "1.10"
-fs2 = "0.4"
-getrandom = "=0.3.4"
-rug = { version = "1.30", default-features = false, features = ["std", "float", "integer", "rational"] }
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+sha2 = "0.11.1"
+nalgebra = "=0.33.3"
+matrixmultiply = "=0.3.10"
+rayon = "1.12.0"
+fs2 = "0.4.3"
+getrandom = "0.4.3"
+rug = { version = "1.30.0", default-features = false, features = ["std", "float", "integer", "rational"] }
 zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
-xc-core = { version = "0.17.0", path = "crates/xc-core" }
-xc-numerics = { version = "0.17.0", path = "crates/xc-numerics" }
-xc-operator = { version = "0.17.0", path = "crates/xc-operator" }
-xc-solver = { version = "0.17.0", path = "crates/xc-solver" }
-xc-root = { version = "0.17.0", path = "crates/xc-root" }
-xc-cache = { version = "0.17.0", path = "crates/xc-cache" }
-xc-certify = { version = "0.17.0", path = "crates/xc-certify" }
-xc-variational = { version = "0.17.0", path = "crates/xc-variational" }
-xc-zeta = { version = "0.17.0", path = "crates/xc-zeta" }
-xc-spectral = { version = "0.17.0", path = "crates/xc-spectral" }
+xc-core = { version = "0.17.1", path = "crates/xc-core" }
+xc-numerics = { version = "0.17.1", path = "crates/xc-numerics" }
+xc-operator = { version = "0.17.1", path = "crates/xc-operator" }
+xc-solver = { version = "0.17.1", path = "crates/xc-solver" }
+xc-root = { version = "0.17.1", path = "crates/xc-root" }
+xc-cache = { version = "0.17.1", path = "crates/xc-cache" }
+xc-certify = { version = "0.17.1", path = "crates/xc-certify" }
+xc-variational = { version = "0.17.1", path = "crates/xc-variational" }
+xc-zeta = { version = "0.17.1", path = "crates/xc-zeta" }
+xc-spectral = { version = "0.17.1", path = "crates/xc-spectral" }
 
 [profile.release]
 opt-level = 3

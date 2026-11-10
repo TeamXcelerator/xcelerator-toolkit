@@ -573,7 +573,7 @@ fn verify_staged_part(
         }
         hasher.update(&buffer[..count]);
     }
-    let actual = ContentDigest(format!("{:x}", hasher.finalize()));
+    let actual = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
     if &actual != expected_digest {
         return Err(CacheError::DigestMismatch {
             expected: expected_digest.to_string(),
@@ -2304,6 +2304,34 @@ mod tests {
         }
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[test]
+    fn unchanged_encoder_preserves_the_numerical_sources_reader_floor() {
+        let scratch = crate::test_support::TestDir::new("production-unchanged-reader-floor");
+        for (index, floor) in ["0.16.0", "0.18.0"].into_iter().enumerate() {
+            let mut source = record();
+            source.manifest.minimum_reader_version = ToolkitVersion::parse(floor).unwrap();
+            let original = source.manifest.clone();
+            let draft = stage_produced_artifact(
+                &source,
+                &scratch.join(format!("source-{index}")),
+                &TransportPolicy::default(),
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                draft.encoding.encoder_profile,
+                DETERMINISTIC_ZIP64_PROFILE_V1
+            );
+            assert_eq!(
+                draft.manifest.minimum_reader_version,
+                original.minimum_reader_version
+            );
+            assert_eq!(source.manifest, original);
+            assert_eq!(draft.source_content_digest, original.content_digest);
+        }
     }
 
     #[test]

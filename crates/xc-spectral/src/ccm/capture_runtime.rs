@@ -184,7 +184,7 @@ fn identity_digest<T: Serialize>(value: &T) -> Result<ContentDigest> {
             value,
         ),
     )?;
-    Ok(ContentDigest(format!("{:x}", w.0.finalize())))
+    Ok(ContentDigest(xc_core::hex_lower(&w.0.finalize())))
 }
 /// Checkpoints are trusted local execution data, integrity-checked on reuse.
 /// They are not portable mathematical certificates. Source digests bind every key.
@@ -274,7 +274,7 @@ impl Checkpoints {
             let value = serde_json::from_reader(&mut reader)?;
             let reader = reader.into_inner();
             if reader.bytes != seal.bytes
-                || format!("{:x}", reader.digest.finalize()) != seal.payload.0
+                || xc_core::hex_lower(&reader.digest.finalize()) != seal.payload.0
             {
                 bail!("checkpoint hash mismatch");
             }
@@ -333,7 +333,7 @@ impl Checkpoints {
         let seal = Seal {
             schema_version: 1,
             identity: self.identity.clone(),
-            payload: ContentDigest(format!("{:x}", writer.digest.finalize())),
+            payload: ContentDigest(xc_core::hex_lower(&writer.digest.finalize())),
             bytes: writer.bytes,
         };
         drop(writer.writer);

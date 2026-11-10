@@ -63,7 +63,32 @@ fn managed_auto_polishes_krylov_and_replays_the_retained_route() {
         diagnostics.algorithm_semantics,
         "ccm_even_zero_shift_krylov_budgeted_count_polish_resolution_v7"
     );
-    assert!(diagnostics.polishing_candidate_adopted);
+    // Polishing must keep the better directed-residual state. A guarded
+    // Krylov vector can already be better than its ordinary-precision
+    // polishing candidate, so adoption alone is not an accuracy criterion.
+    let (replayed_residual, residual) = state_residual_bounds::relative_residual(
+        &source.tau,
+        params.matrix_size(),
+        &auto.xi,
+        &auto.weil_min_eigenvalue,
+        cfg.precision_bits,
+    )
+    .unwrap();
+    assert_eq!(
+        replayed_residual,
+        auto.inverse_iteration_diagnostics
+            .final_relative_residual_norm
+    );
+    assert_eq!(
+        replayed_residual.to_string(),
+        diagnostics.final_relative_tau_residual
+    );
+    let floor =
+        eigenstate_accuracy::residual_floor(&source.tau, params.matrix_size(), cfg.precision_bits)
+            .unwrap();
+    assert!(residual.eigenvalue_error_upper <= floor);
+    assert!(auto.inverse_iteration_diagnostics.unshifted_steps > 0);
+    assert!(auto.inverse_iteration_diagnostics.unshifted_steps <= cfg.inverse_iter_steps);
     assert_eq!(
         payload.inverse_iteration.configured_step_limit,
         cfg.inverse_iter_steps
@@ -146,8 +171,17 @@ fn polynomially_separated_tiny_state_is_polished_against_exact_diagonal_oracle()
             Float::with_val(p, 1) >> 10u32,
             Float::with_val(p, 0),
         ];
+        let before = state_residual_bounds::evaluate(&matrix, &vector, &a0, p)
+            .unwrap()
+            .eigenvalue_error_upper;
         let polished =
             eigenstate_accuracy::polish(&matrix, &factors, &a0, &vector, p, 100).unwrap();
+        assert!(polished.candidate_adopted);
+        let after = state_residual_bounds::evaluate(&matrix, &polished.vector, &polished.value, p)
+            .unwrap()
+            .eigenvalue_error_upper;
+        assert!(after < before);
+        assert!(after <= eigenstate_accuracy::residual_floor(&matrix, 3, p).unwrap());
         assert_eq!(polished.value, a0);
         assert!(polished.vector[1].clone().abs() < (Float::with_val(p, 1) >> (p / 2)));
         assert_eq!(polished.diagnostics.configured_step_limit, 100);

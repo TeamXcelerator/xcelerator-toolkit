@@ -31,7 +31,7 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    xc_core::hex_lower(&Sha256::digest(bytes))
 }
 fn valid_digest(value: &str) -> bool {
     value.len() == 64

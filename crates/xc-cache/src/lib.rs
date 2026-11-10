@@ -3787,7 +3787,7 @@ fn private_sibling_candidate(parent: &Path, prefix: &str) -> Result<PathBuf, Cac
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let sequence = NEXT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| CacheError::Io("private staging sequence exhausted".to_owned()))?;

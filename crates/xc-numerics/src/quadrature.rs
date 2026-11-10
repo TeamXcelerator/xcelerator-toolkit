@@ -1945,8 +1945,9 @@ mod hp {
         let eps_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 8));
         // Root construction remains serial by default. An owning HP batch may
         // opt into this single-table exception after selecting exactly one
-        // parallel level. WSL remains excluded from supported qualification
-        // because concurrent GMP allocation has failed there nondeterministically.
+        // parallel level on native Linux or the qualified Windows UCRT lane.
+        // WSL remains excluded because concurrent GMP allocation has failed
+        // there nondeterministically.
         let mut combined = if let Some(min_task_len) = root_schedule.parallel_min_task_len() {
             use rayon::prelude::*;
             (0..n)
@@ -2923,7 +2924,7 @@ mod tests {
             .num_threads(4)
             .build()
             .unwrap();
-        for (order, precision) in [(8, 256), (8, 3386), (8, 6708)] {
+        for (order, precision) in [(8, 256), (8, 3386), (8, 6708), (65, 729), (257, 3386)] {
             let serial = gauss_legendre_nodes(order, precision, CacheMode::Off);
             let one = one_worker.install(|| {
                 gauss_legendre_nodes_scheduled(
@@ -2947,17 +2948,207 @@ mod tests {
                     table
                         .0
                         .iter()
-                        .map(rug::Float::to_string)
+                        .map(|v| (v.prec(), v.is_sign_negative(), v.to_integer_exp()))
                         .collect::<Vec<_>>(),
                     table
                         .1
                         .iter()
-                        .map(rug::Float::to_string)
+                        .map(|v| (v.prec(), v.is_sign_negative(), v.to_integer_exp()))
                         .collect::<Vec<_>>(),
                 )
             };
             assert_eq!(serialize(&one), serialize(&serial));
             assert_eq!(serialize(&four), serialize(&serial));
+        }
+    }
+
+    #[cfg(feature = "hp")]
+    fn assert_gl_exact(
+        expected: &(Vec<rug::Float>, Vec<rug::Float>),
+        actual: &(Vec<rug::Float>, Vec<rug::Float>),
+    ) {
+        for (left, right) in [(&expected.0, &actual.0), (&expected.1, &actual.1)] {
+            assert_eq!(left.len(), right.len());
+            for (a, b) in left.iter().zip(right) {
+                assert!(a.is_finite() && b.is_finite());
+                assert_eq!(a.prec(), b.prec());
+                assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+                assert_eq!(a.to_integer_exp(), b.to_integer_exp());
+            }
+        }
+        assert!(actual.0.windows(2).all(|v| v[0] < v[1]));
+        assert!(actual.1.iter().all(|v| v > &0));
+    }
+
+    #[cfg(feature = "hp")]
+    #[test]
+    fn scheduled_gl_roots_reject_mixed_worker_exponents_without_mutation() {
+        use crate::hp_runtime::GlRootSchedule;
+        unsafe extern "C" {
+            fn mpfr_set_emin(value: std::os::raw::c_long) -> i32;
+        }
+        let normal = rug::float::exp_min();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .start_handler(|index| {
+                if index == 0 {
+                    assert_eq!(unsafe { mpfr_set_emin(-1000) }, 0);
+                }
+            })
+            .build()
+            .unwrap();
+        let before = pool.broadcast(|_| rug::float::exp_min());
+        assert_eq!(before[0], -1000);
+        assert!(before[1..].iter().all(|value| *value == normal));
+        let error = pool.install(|| {
+            try_gauss_legendre_nodes_scheduled(
+                257,
+                3386,
+                CacheMode::Off,
+                GlRootSchedule::parallel_for_test(1),
+            )
+            .unwrap_err()
+        });
+        assert!(error
+            .to_string()
+            .contains("workers do not share the caller's exponent range"));
+        assert_eq!(pool.broadcast(|_| rug::float::exp_min()), before);
+        assert_eq!(rug::float::exp_min(), normal);
+    }
+
+    #[cfg(feature = "hp")]
+    #[test]
+    fn scheduled_gl_roots_preserve_uniform_restricted_context_and_domain_errors() {
+        use crate::hp_runtime::GlRootSchedule;
+        unsafe extern "C" {
+            fn mpfr_set_emin(value: std::os::raw::c_long) -> i32;
+        }
+        let original = rug::float::exp_min();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .start_handler(|_| {
+                assert_eq!(unsafe { mpfr_set_emin(-1000) }, 0);
+            })
+            .build()
+            .unwrap();
+        pool.install(|| {
+            assert_eq!(rug::float::exp_min(), -1000);
+            let serial = gauss_legendre_nodes(33, 128, CacheMode::Off);
+            let parallel = gauss_legendre_nodes_scheduled(
+                33,
+                128,
+                CacheMode::Off,
+                GlRootSchedule::parallel_for_test(1),
+            );
+            assert_gl_exact(&serial, &parallel);
+            for (order, precision) in [(0, 128), (3, 15), (3, 1_000_001)] {
+                let serial = try_gauss_legendre_nodes(order, precision, CacheMode::Off)
+                    .unwrap_err()
+                    .to_string();
+                let parallel = try_gauss_legendre_nodes_scheduled(
+                    order,
+                    precision,
+                    CacheMode::Off,
+                    GlRootSchedule::parallel_for_test(1),
+                )
+                .unwrap_err()
+                .to_string();
+                assert_eq!(serial, parallel);
+            }
+            assert_eq!(rug::float::exp_min(), -1000);
+        });
+        assert!(pool
+            .broadcast(|_| rug::float::exp_min())
+            .iter()
+            .all(|v| *v == -1000));
+        assert_eq!(rug::float::exp_min(), original);
+    }
+
+    #[cfg(feature = "hp")]
+    #[test]
+    #[ignore = "bounded production-policy GL qualification on a supported native platform"]
+    fn public_gl_policy_realistic_identity_stress() {
+        use crate::hp_runtime::{
+            map_gl_precompute_planned, plan_gl_precompute, run_hp_with_policy, HpRuntimePolicy,
+        };
+        let policy = HpRuntimePolicy {
+            parallel_gl_roots: true,
+            ..Default::default()
+        };
+        // Fail explicitly if invoked on an unqualified platform; do not use
+        // the test-only schedule to evade the public production admission.
+        run_hp_with_policy(&policy, || ()).unwrap();
+        let available = std::thread::available_parallelism().unwrap().get().min(32);
+        let mut workers = vec![1, 4, 8, available];
+        workers.sort_unstable();
+        workers.dedup();
+        let repeat_reference = gauss_legendre_nodes(257, 3386, CacheMode::Off);
+        for (order, precision) in [(257, 3386), (257, 6708), (1025, 3386), (1025, 6708)] {
+            let reference = gauss_legendre_nodes(order, precision, CacheMode::Off);
+            for &count in &workers {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(count)
+                    .build()
+                    .unwrap();
+                let resources = xc_core::RunResources::with_worker_limit(2 << 30, count).unwrap();
+                let started = std::time::Instant::now();
+                let table = pool.install(|| {
+                    let _scope = resources.enter();
+                    run_hp_with_policy(&policy, || {
+                        let plan = plan_gl_precompute(&[order], precision);
+                        assert_eq!(plan.root_schedule(order).is_parallel(), count > 1);
+                        let mut tables =
+                            map_gl_precompute_planned(&[order], plan, |n, schedule| {
+                                assert_eq!(
+                                    xc_core::RunResources::current().unwrap().maximum_bytes(),
+                                    2 << 30
+                                );
+                                try_gauss_legendre_nodes_scheduled(
+                                    n,
+                                    precision,
+                                    CacheMode::Off,
+                                    schedule,
+                                )
+                            });
+                        tables.pop().unwrap().unwrap()
+                    })
+                    .unwrap()
+                });
+                assert_gl_exact(&reference, &table);
+                println!("PUBLIC_GL_IDENTITY order={order} precision={precision} workers={count} seconds={:.6} exact=true full_validation=true", started.elapsed().as_secs_f64());
+                // Repeated allocation and owner cancellation are bounded and
+                // use the same public policy. Cancellation between rules must
+                // refuse before beginning another arithmetic callback.
+                pool.install(|| {
+                    let _scope = resources.enter();
+                    run_hp_with_policy(&policy, || {
+                        for _ in 0..2 {
+                            crate::hp_runtime::with_admitted_worker_pool(count, || {
+                                let plan = plan_gl_precompute(&[257], 3386);
+                                let mut tables =
+                                    map_gl_precompute_planned(&[257], plan, |n, schedule| {
+                                        try_gauss_legendre_nodes_scheduled(
+                                            n,
+                                            3386,
+                                            CacheMode::Off,
+                                            schedule,
+                                        )
+                                    });
+                                assert_gl_exact(&repeat_reference, &tables.pop().unwrap().unwrap());
+                            })
+                            .unwrap();
+                        }
+                        resources.cancel();
+                        assert!(crate::hp_runtime::with_admitted_worker_pool(count, || {
+                            panic!("cancelled owner must not dispatch another rule")
+                        })
+                        .is_err());
+                    })
+                    .unwrap();
+                });
+                assert_eq!(resources.usage().working_bytes, 0);
+                pool.broadcast(|_| assert!(xc_core::RunResources::current().is_none()));
+            }
         }
     }
 }

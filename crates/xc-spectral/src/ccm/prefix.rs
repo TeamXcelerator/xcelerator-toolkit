@@ -1994,6 +1994,11 @@ mod exhaustive_retained_prefix {
     }
     #[test]
     fn ordinary_prefix_and_reduction_hits_do_not_repeat_dense_calculations() {
+        // Its later VerifyAgainstReference session is process-global, just
+        // like the prolate and finite-Dirichlet verification fixtures.
+        let _lock = crate::TEST_CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use xc_cache::*;
         let directory = xc_core::test_support::TestDir::new("retained-warm-sanity");
         let resolver = CacheResolver::new(vec![CacheLayer {

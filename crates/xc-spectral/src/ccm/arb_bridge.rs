@@ -12,6 +12,15 @@ type FlintSLong = isize;
 unsafe extern "C" {
     fn xc_arb_flint_version() -> *const c_char;
     #[cfg(test)]
+    fn xc_arb_flint_header_version() -> *const c_char;
+    fn xc_arb_native_compatible(
+        rust_mpfr_size: usize,
+        rust_mpq_size: usize,
+        rust_slong_size: usize,
+        rust_emin: i64,
+        rust_emax: i64,
+    ) -> c_int;
+    #[cfg(test)]
     fn xc_arb_slong_size() -> usize;
     fn xc_arb_complex_digamma_interval(
         out_re_lower: *mut c_void,
@@ -49,6 +58,24 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+fn ensure_native_compatible() -> Result<()> {
+    // Rug's Float and Rational are repr(transparent) over their native structs.
+    // Check every calling thread, including evaluation of prepared contexts.
+    let compatible = unsafe {
+        xc_arb_native_compatible(
+            std::mem::size_of::<Float>(),
+            std::mem::size_of::<rug::Rational>(),
+            std::mem::size_of::<FlintSLong>(),
+            i64::from(rug::float::exp_min()),
+            i64::from(rug::float::exp_max()),
+        )
+    };
+    if compatible != 1 {
+        bail!("Arb requires matching loaded FLINT/GMP/MPFR versions, compatible native object sizes, thread-safe MPFR, and the caller's MPFR exponent context");
+    }
+    Ok(())
+}
+
 // Numerator construction has a separate ABI from transform evaluation. GMP
 // rationals cross this boundary exactly, using the same system GMP already
 // required by the MPFR/FLINT bridge; no decimal conversion or rounding occurs.
@@ -72,6 +99,7 @@ pub(in crate::ccm) fn exact_secular_numerator(
     weight_denominator_bits: u128,
     total_denominator_bits: u128,
 ) -> Result<Vec<rug::Rational>> {
+    ensure_native_compatible()?;
     if poles.len() != weights.len()
         || poles.is_empty()
         || poles.len() > 8193
@@ -124,6 +152,7 @@ pub fn rational_polynomial_root_count(
     lower: &rug::Rational,
     upper: &rug::Rational,
 ) -> Result<(usize, bool)> {
+    ensure_native_compatible()?;
     if coefficients_ascending.len() < 2
         || lower >= upper
         || coefficients_ascending.iter().skip(1).all(|x| x == &0)
@@ -193,6 +222,7 @@ pub fn rational_polynomial_real_roots(
     upper: &rug::Rational,
     precision_bits: u32,
 ) -> Result<(Vec<MpfrInterval>, bool)> {
+    ensure_native_compatible()?;
     if coefficients_ascending.len() < 2
         || lower >= upper
         || !(65..=1_000_000).contains(&precision_bits)
@@ -261,6 +291,7 @@ fn evaluate(
     imaginary: &MpfrInterval,
     trigamma: bool,
 ) -> Result<(MpfrInterval, MpfrInterval)> {
+    ensure_native_compatible()?;
     real.validate()?;
     imaginary.validate()?;
     if real.precision() != imaginary.precision() {
@@ -299,7 +330,7 @@ pub fn backend_version() -> &'static str {
     unsafe {
         CStr::from_ptr(xc_arb_flint_version())
             .to_str()
-            .expect("FLINT_VERSION is static ASCII")
+            .expect("the loaded FLINT version is static ASCII")
     }
 }
 
@@ -320,6 +351,75 @@ pub fn complex_trigamma(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_native_runtime_matches_headers_and_rejects_foreign_layout_or_context() {
+        ensure_native_compatible().unwrap();
+        let header = unsafe { CStr::from_ptr(xc_arb_flint_header_version()) };
+        assert_eq!(backend_version(), header.to_str().unwrap());
+        let sizes = [
+            std::mem::size_of::<Float>(),
+            std::mem::size_of::<rug::Rational>(),
+            std::mem::size_of::<FlintSLong>(),
+        ];
+        let range = [
+            i64::from(rug::float::exp_min()),
+            i64::from(rug::float::exp_max()),
+        ];
+        for position in 0..sizes.len() {
+            let mut wrong = sizes;
+            wrong[position] += 1;
+            assert_eq!(
+                unsafe {
+                    xc_arb_native_compatible(wrong[0], wrong[1], wrong[2], range[0], range[1])
+                },
+                0
+            );
+        }
+        for position in 0..range.len() {
+            let mut wrong = range;
+            wrong[position] += 1;
+            assert_eq!(
+                unsafe {
+                    xc_arb_native_compatible(sizes[0], sizes[1], sizes[2], wrong[0], wrong[1])
+                },
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn spectral_bridge_observes_rug_thread_local_mpfr_context() {
+        unsafe extern "C" {
+            fn mpfr_set_emin(value: std::os::raw::c_long) -> c_int;
+            fn mpfr_get_emin() -> std::os::raw::c_long;
+        }
+        struct Restore(std::os::raw::c_long);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { mpfr_set_emin(self.0) }, 0);
+            }
+        }
+        let original = unsafe { mpfr_get_emin() };
+        let _restore = Restore(original);
+        assert_eq!(unsafe { mpfr_set_emin(-100_003) }, 0);
+        assert_eq!(rug::float::exp_min(), -100_003);
+        // A separately loaded MPFR copy could match the normal defaults but
+        // would not see this change in Rug's calling-thread exponent range.
+        ensure_native_compatible().unwrap();
+        assert_eq!(
+            unsafe {
+                xc_arb_native_compatible(
+                    std::mem::size_of::<Float>(),
+                    std::mem::size_of::<rug::Rational>(),
+                    std::mem::size_of::<FlintSLong>(),
+                    original as i64,
+                    i64::from(rug::float::exp_max()),
+                )
+            },
+            0
+        );
+    }
 
     #[test]
     fn rust_count_width_matches_compiled_flint_slong() {
@@ -436,6 +536,7 @@ impl Drop for PreparedFiniteTransform {
 
 impl PreparedFiniteTransform {
     pub(crate) fn new(cutoff: &str, coefficients: &[Float], precision: u32) -> Result<Self> {
+        ensure_native_compatible()?;
         if coefficients.iter().any(|value| !value.is_finite()) {
             bail!("finite transform coefficients must be finite");
         }
@@ -483,6 +584,7 @@ impl PreparedFiniteTransform {
         re: &MpfrInterval,
         im: &MpfrInterval,
     ) -> Result<(MpfrInterval, MpfrInterval, MpfrInterval, MpfrInterval)> {
+        ensure_native_compatible()?;
         re.validate()?;
         im.validate()?;
         if re.precision() != im.precision() || re.precision() != self.precision {
@@ -541,6 +643,7 @@ pub(crate) fn finite_transform(
     re: &MpfrInterval,
     im: &MpfrInterval,
 ) -> Result<(MpfrInterval, MpfrInterval, MpfrInterval, MpfrInterval)> {
+    ensure_native_compatible()?;
     re.validate()?;
     im.validate()?;
     if coefficients.iter().any(|value| !value.is_finite()) {
@@ -594,6 +697,7 @@ pub(crate) fn finite_transform(
     ))
 }
 pub(crate) fn argument(re: &MpfrInterval, im: &MpfrInterval) -> Result<MpfrInterval> {
+    ensure_native_compatible()?;
     re.validate()?;
     im.validate()?;
     if re.contains_zero() && im.contains_zero() {

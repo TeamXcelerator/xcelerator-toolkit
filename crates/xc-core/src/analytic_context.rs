@@ -191,7 +191,7 @@ impl AnalyticProblemContext {
         let bytes = serde_json::to_vec(self).map_err(|error| {
             ConfigError::new(format!("analytic context serialization failed: {error}"))
         })?;
-        Ok(format!("{:x}", Sha256::digest(bytes)))
+        Ok(crate::hex_lower(&Sha256::digest(bytes)))
     }
 }
 

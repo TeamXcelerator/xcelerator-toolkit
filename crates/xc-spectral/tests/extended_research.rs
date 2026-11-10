@@ -3365,12 +3365,10 @@ fn profile_preflight_preserves_compact_request_identity_without_evaluation() {
         refused["failure_predicates"],
         serde_json::json!(["basis_id"])
     );
-    assert!(
-        f::analyze_profiles(&invalid)
-            .unwrap_err()
-            .to_string()
-            .contains("basis_id")
-    );
+    assert!(f::analyze_profiles(&invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("basis_id"));
 }
 #[test]
 fn profile_preflight_identifies_work_refusal_and_does_not_relax_it() {

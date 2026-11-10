@@ -496,6 +496,145 @@ impl<'a> PreparedRootResponses<'a> {
     }
 }
 
+// U-flow historically reaches roots serially, after solving each channel.
+// Preparing all roots up front would change both failure order and admission.
+// This owner therefore retains only geometry actually reached by that route.
+// Source references are immutable for its entire lifetime. Moving-pole terms
+// are evaluated by the same directed kernel, never combined after rounding.
+pub(super) struct LazyUFlowRootResponses<'a> {
+    unit: &'a [Float],
+    poles: &'a [Float],
+    roots: &'a [EigenvalueResult],
+    precision_bits: u32,
+    geometry:
+        std::sync::Mutex<std::collections::BTreeMap<usize, root_response_math::GeometryCache>>,
+}
+
+impl<'a> LazyUFlowRootResponses<'a> {
+    pub(super) fn new(
+        unit: &'a [Float],
+        poles: &'a [Float],
+        roots: &'a [EigenvalueResult],
+        precision_bits: u32,
+    ) -> Self {
+        Self {
+            unit,
+            poles,
+            roots,
+            precision_bits,
+            geometry: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    pub(super) fn clear_optional(&self) -> bool {
+        let mut entries = self
+            .geometry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut released = false;
+        for entry in entries.values_mut() {
+            released |= entry.clear();
+        }
+        entries.clear();
+        released
+    }
+
+    pub(super) fn values(
+        &self,
+        tangent: &[Float],
+        motions: Option<&[Float]>,
+    ) -> Result<Vec<Option<String>>> {
+        self.roots
+            .iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                outcome
+                    .value()
+                    .map(|root| {
+                        // Read the guard policy exactly when the original
+                        // scalar route did, including for each successive root.
+                        let policy =
+                            root_response_math::GuardPolicy::configured(self.precision_bits)?;
+                        self.value(index, root, tangent, motions, policy)
+                            .map(|value| lossless_hp_decimal(&value))
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
+
+    pub(super) fn with_workspace<T>(&self, mut work: impl FnMut() -> Result<T>) -> Result<T> {
+        let result = work();
+        if result.as_ref().is_err_and(Self::workspace_refusal) && self.clear_optional() {
+            return work();
+        }
+        result
+    }
+
+    fn workspace_refusal(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<xc_core::ConfigError>()
+            .is_some_and(|error| error.message().starts_with("run memory budget exceeded:"))
+    }
+
+    fn value(
+        &self,
+        index: usize,
+        root: &Float,
+        tangent: &[Float],
+        motions: Option<&[Float]>,
+        policy: root_response_math::GuardPolicy,
+    ) -> Result<Float> {
+        let cold = || {
+            root_response_math::evaluate_with_policy(
+                self.unit, tangent, self.poles, motions, root, policy, None,
+            )
+        };
+        let Some(resources) = xc_core::RunResources::current() else {
+            return cold();
+        };
+        // This new optional optimization must not reject a legacy u-flow
+        // calculation for a setting it did not previously consume. Invalid
+        // optional storage settings disable reuse; numerical policies do not.
+        let budget = configured_geometry_budget(resources.maximum_bytes()).unwrap_or(0);
+        let per_root = u64::try_from(budget / self.roots.len().max(1) as u128).unwrap_or(0);
+        if per_root == 0 {
+            return cold();
+        }
+        let result = {
+            let mut entries = match self.geometry.lock() {
+                Ok(entries) => entries,
+                Err(error) => {
+                    drop(error.into_inner());
+                    self.clear_optional();
+                    return cold();
+                }
+            };
+            let cache = entries
+                .entry(index)
+                .or_insert_with(|| root_response_math::GeometryCache::new(per_root));
+            root_response_math::evaluate_with_cache(
+                self.unit,
+                tangent,
+                self.poles,
+                motions,
+                root,
+                policy,
+                None,
+                Some(cache),
+            )
+        };
+        if result.as_ref().is_err_and(Self::workspace_refusal) {
+            // Optional persistent geometry cannot consume the workspace of a
+            // previously admitted scalar attempt. Retry the same guard ladder
+            // cold only for resource refusal, never for a numerical failure.
+            self.clear_optional();
+            return cold();
+        }
+        result
+    }
+}
+
 fn configured_geometry_budget(run_bytes: u64) -> Result<u128> {
     match std::env::var("XC_ROOT_RESPONSE_GEOMETRY_BYTES") {
         Ok(text) => {
@@ -588,10 +727,12 @@ impl ResponsePhaseTimings {
     }
 }
 
-/// A process-local seal for the exact freshly computed response. Its producer
-/// already ran spectral-isolation and bordered-residual gates. Cache reads never
-/// receive this seal and must replay the numerical validator. Stream JSON so an
-/// additional multi-gigabyte copy is never needed just to bind this witness.
+/// A process-local seal for the exact response returned by this producer. Its
+/// spectral-isolation and bordered-residual gates already passed, either in the
+/// current execution or in a source/build-bound private execution checkpoint.
+/// Portable artifact cache reads never receive this seal; they use the requested
+/// assurance's validation route. Stream JSON so an additional multi-gigabyte
+/// copy is never needed just to bind this witness.
 #[derive(Default)]
 pub(super) struct FreshResponseSeal(RefCell<Option<ContentDigest>>);
 impl FreshResponseSeal {
@@ -617,7 +758,7 @@ impl FreshResponseSeal {
         let hash = output
             .into_inner()
             .map_err(|error| CacheError::Serialization(error.to_string()))?;
-        Ok(ContentDigest(format!("{:x}", hash.0.finalize())))
+        Ok(ContentDigest(xc_core::hex_lower(&hash.0.finalize())))
     }
     pub(super) fn record(&self, value: &impl Serialize) -> std::result::Result<(), CacheError> {
         self.0.replace(Some(Self::digest(value)?));
@@ -639,6 +780,10 @@ impl FreshResponseSeal {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+#[path = "uflow_root_geometry_tests.rs"]
+mod uflow_root_geometry_tests;
 
 #[cfg(test)]
 mod tests {

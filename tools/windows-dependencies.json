@@ -1,0 +1,455 @@
+{
+    "schema_version":  1,
+    "toolkit_version":  "0.17.1",
+    "target":  "x86_64-pc-windows-gnu",
+    "rust_version":  "1.99.1",
+    "package_base_url":  "https://repo.msys2.org/mingw/ucrt64/",
+    "bootstrap":  {
+                      "file":  "msys2-base-x86_64-20260927.tar.zst",
+                      "sha256":  "8a2095647afbf799d113d0cae35f7544589d059819042635504e75bd2179bd02",
+                      "url":  "https://repo.msys2.org/distrib/x86_64/msys2-base-x86_64-20260927.tar.zst"
+                  },
+    "packages":  [
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-binutils",
+                         "version":  "2.47-4",
+                         "file":  "mingw-w64-ucrt-x86_64-binutils-2.47-4-any.pkg.tar.zst",
+                         "sha256":  "c18a40b871bfddb5da030f015003479ca85625afde1cb89f7313945e6151397d",
+                         "signature_sha256":  "36326260428a8567fcb936b3c3fa80c6cd5e59083c8a34f9464718b5b0f586dd"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-bzip2",
+                         "version":  "1.0.8-4",
+                         "file":  "mingw-w64-ucrt-x86_64-bzip2-1.0.8-4-any.pkg.tar.zst",
+                         "sha256":  "f03a2174034ddd2d96cecd34f617c5f8e2ef86c812b8d2bb3b8875257f2c8bfa",
+                         "signature_sha256":  "fa2198d8b839edad658a38a364a90036439ccade817f450085be2a65c0f7fe5b"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-ca-certificates",
+                         "version":  "20260816-3",
+                         "file":  "mingw-w64-ucrt-x86_64-ca-certificates-20260816-3-any.pkg.tar.zst",
+                         "sha256":  "037d3bf0b4eb004e2b3586baa29e526db70013dfe3118a2a86748acb46ee07b4",
+                         "signature_sha256":  "8d2d70ee2af05b9b8125ed9a82d08a9a54cd7c3c0b52b228c25f92a4369866b4"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-cc-libs",
+                         "version":  "16.2.0-6",
+                         "file":  "mingw-w64-ucrt-x86_64-cc-libs-16.2.0-6-any.pkg.tar.zst",
+                         "sha256":  "d8fff9e62443168bcda8ce746697243519c4f090ea607357ce94feac0bd10a50",
+                         "signature_sha256":  "7a166a9b5ecc5cee55f113637abf554686cfa6cc796d2b462758c98bdb6a1e97"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-crt",
+                         "version":  "14.0.0.r598.ge3d18511f-1",
+                         "file":  "mingw-w64-ucrt-x86_64-crt-14.0.0.r598.ge3d18511f-1-any.pkg.tar.zst",
+                         "sha256":  "e863d0d1c5cef1269738f23dcc155b9b0d161d198b93d9d5aa481cb3a2f2cf53",
+                         "signature_sha256":  "e07e780cc941d59e5be81fd4bdd16d52933c92018483611cbdb9996c6fd915b7"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-flint",
+                         "version":  "3.6.0-3",
+                         "file":  "mingw-w64-ucrt-x86_64-flint-3.6.0-3-any.pkg.tar.zst",
+                         "sha256":  "f0d9ee145432bf393db5a3b20d93df0bfd97be123d50e1db653c9183ac0e59af",
+                         "signature_sha256":  "a0618c874918428731c59cdbbf5a0a8adf5cb12240093f82b7e0e309f8cad5cb"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-gcc",
+                         "version":  "16.2.0-6",
+                         "file":  "mingw-w64-ucrt-x86_64-gcc-16.2.0-6-any.pkg.tar.zst",
+                         "sha256":  "0290e91f5a9a8a3699bcea6221a899403bb9bd5d6f7dbd98c883d74e2ef36338",
+                         "signature_sha256":  "b5222c79f95692ab08aebda10781c01e2a1816d6a500eaa3ce0edd33721a4185"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-gettext-runtime",
+                         "version":  "1.0-1",
+                         "file":  "mingw-w64-ucrt-x86_64-gettext-runtime-1.0-1-any.pkg.tar.zst",
+                         "sha256":  "ba693dda4ac375af76ce481ff3a6e7481286546cc7dc6d56c7021dae34084157",
+                         "signature_sha256":  "4754e870d55cacb5e7e3707313b68edb29d2598cc7a1ee399c74715007f38c4d"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-gmp",
+                         "version":  "6.3.0-2",
+                         "file":  "mingw-w64-ucrt-x86_64-gmp-6.3.0-2-any.pkg.tar.zst",
+                         "sha256":  "e82a75968a556484a50084578238a84eb60fb93e34986fd6695c537975bd39ea",
+                         "signature_sha256":  "99d2b95269ef099bdc8f3dd0e3db8a9171346e4076bfe0c0c58855d7b97220ff"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-headers",
+                         "version":  "14.0.0.r598.ge3d18511f-1",
+                         "file":  "mingw-w64-ucrt-x86_64-headers-14.0.0.r598.ge3d18511f-1-any.pkg.tar.zst",
+                         "sha256":  "b3cec87298555a7c6694bd4d421d586d08a1cb47bc5bc76e79602cbf4421d3c9",
+                         "signature_sha256":  "33d47c93b1157c238fcae5789e78106d7199b94b1c9a4767ebfb3dd74b4757e0"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-http-parser",
+                         "version":  "2.9.4-3",
+                         "file":  "mingw-w64-ucrt-x86_64-http-parser-2.9.4-3-any.pkg.tar.zst",
+                         "sha256":  "375263e3835677b4390872cd2cb280b1f0691b89f9b79c56c6b921eddc8615ce",
+                         "signature_sha256":  "9836c1042b140d2c841fc6f4f3161eed7baeb964673c6c6c88817586b5c4309a"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-isl",
+                         "version":  "0.28-1",
+                         "file":  "mingw-w64-ucrt-x86_64-isl-0.28-1-any.pkg.tar.zst",
+                         "sha256":  "8594e01a253d5a72646c586cf5a1626c1b1c2be7c30060fe67abd9bebe3fe223",
+                         "signature_sha256":  "7154a96c9936f5d00504ae012c74a82cd15f094d925e0cf1a17b7a2bf1be11a6"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libffi",
+                         "version":  "3.8.0-1",
+                         "file":  "mingw-w64-ucrt-x86_64-libffi-3.8.0-1-any.pkg.tar.zst",
+                         "sha256":  "99ad12f4ecfa00a889ef9c5c0188592368a5bac109d0c508ce4e04f29ea95a76",
+                         "signature_sha256":  "a49e13cb3d5030cfcf47b3dc911f4a0937c1e2fb20ee9ec3244a8732047193a8"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libgcc",
+                         "version":  "16.2.0-6",
+                         "file":  "mingw-w64-ucrt-x86_64-libgcc-16.2.0-6-any.pkg.tar.zst",
+                         "sha256":  "80b2497f019977dd9528b1abc8621b1328a0115ab1f724047ccbb56bf323f11d",
+                         "signature_sha256":  "47722822a5d94a7d2e5ec9daaa02dc1f6b7f420765efaa8fd8a86bd3012788db"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libgfortran",
+                         "version":  "16.2.0-6",
+                         "file":  "mingw-w64-ucrt-x86_64-libgfortran-16.2.0-6-any.pkg.tar.zst",
+                         "sha256":  "34406a0c721e44655c3971ce131efd81652d5f6fa5381eb5700b288bc9a780ab",
+                         "signature_sha256":  "82f78c9f53920dc38f647f3b34033b258b2fc913b3d1aed3227c54c1db3f9e4b"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libgit2",
+                         "version":  "1.9.7-2",
+                         "file":  "mingw-w64-ucrt-x86_64-libgit2-1.9.7-2-any.pkg.tar.zst",
+                         "sha256":  "cab5079ccbe0a9c953f758cd95441f48669bdf17eb523a45175a8361eae16855",
+                         "signature_sha256":  "6b9a0d6f419d4d549563745e1e128bb925b5817f64862305c76f61ac88930dc2"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libgomp",
+                         "version":  "16.2.0-6",
+                         "file":  "mingw-w64-ucrt-x86_64-libgomp-16.2.0-6-any.pkg.tar.zst",
+                         "sha256":  "809b95086d8d3ba145e041bb36d5756b4407d1d97c0524ef731d3b94548faa69",
+                         "signature_sha256":  "409cba0147544a5cdc3d4e271733951a9bb89f0f9b41589e90d2957f899517ea"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libiconv",
+                         "version":  "1.19.1-1",
+                         "file":  "mingw-w64-ucrt-x86_64-libiconv-1.19.1-1-any.pkg.tar.zst",
+                         "sha256":  "8a45dc317a285a036bddd79e01505d67b79e44ff49fc3f6e7177a5ea98d098cf",
+                         "signature_sha256":  "2090df1911c3adbe74fc01b5cb200c07c5fe44f14984450ced85f1dec84ad7fe"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libquadmath",
+                         "version":  "16.2.0-6",
+                         "file":  "mingw-w64-ucrt-x86_64-libquadmath-16.2.0-6-any.pkg.tar.zst",
+                         "sha256":  "7b553c0b6dd9cf2f676c0c6812aa359495940dbdd7347f47be1dbd75d29cd611",
+                         "signature_sha256":  "a675f0d12e1ee1f34edf828e966cbe3c29886700c050ca447ac7a28681f861e1"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libssh2",
+                         "version":  "1.11.1-2",
+                         "file":  "mingw-w64-ucrt-x86_64-libssh2-1.11.1-2-any.pkg.tar.zst",
+                         "sha256":  "0e91316dfa4979dcabbfa9e71528ec9882ece619ce549cb25312089b4754fa65",
+                         "signature_sha256":  "900621b47c451e8d4607ecbdb34b7d963a79c927a5bb9b267533bee92fe48d29"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libstdc++",
+                         "version":  "16.2.0-6",
+                         "file":  "mingw-w64-ucrt-x86_64-libstdc++-16.2.0-6-any.pkg.tar.zst",
+                         "sha256":  "33c5e58a85a538cf843a8672991cce591f0231d66da3b66a57629712d64be17f",
+                         "signature_sha256":  "f2855b4509de406b931fe69ddac645285824cb2330375843f504e97d0ce35848"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libtasn1",
+                         "version":  "4.21.0-1",
+                         "file":  "mingw-w64-ucrt-x86_64-libtasn1-4.21.0-1-any.pkg.tar.zst",
+                         "sha256":  "d098b27834c3b25142b6f5aa9a0ca5731a8e4334c232786406cb149dd8bde2ba",
+                         "signature_sha256":  "9816772585dd35c1b2e272e1d868be44b4c51d82116f403b66525ef02ff79346"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libwinpthread",
+                         "version":  "14.0.0.r598.ge3d18511f-1",
+                         "file":  "mingw-w64-ucrt-x86_64-libwinpthread-14.0.0.r598.ge3d18511f-1-any.pkg.tar.zst",
+                         "sha256":  "c35d6be83d141c8cfbb61f1637dd4b53aac8f5562d766aa26d0741c40bad4e4d",
+                         "signature_sha256":  "2206794e8de4f33a271a0c3e78dac769f09e7093c23e0572dde317bcda6b62b9"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-libxml2",
+                         "version":  "2.15.4-3",
+                         "file":  "mingw-w64-ucrt-x86_64-libxml2-2.15.4-3-any.pkg.tar.zst",
+                         "sha256":  "e774c85139c004ce9b4085474d6b3450526c718d2e8c555a87e47adc11f376b1",
+                         "signature_sha256":  "359b4bc76b15a906b472d82532fde99defcb531abf50fa8f9cf23171c92f6987"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-llvm-libs",
+                         "version":  "23.1.5-1",
+                         "file":  "mingw-w64-ucrt-x86_64-llvm-libs-23.1.5-1-any.pkg.tar.zst",
+                         "sha256":  "1739a965f2c3f8f306dfed2575fc30693d3bd0d17fe6e8d6ad99f71b3636e309",
+                         "signature_sha256":  "d41c7a8d27300bbfff7af87a02b39e10fb1b2048c2d664ae5fd3896933fb40eb"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-mpc",
+                         "version":  "1.4.1-1",
+                         "file":  "mingw-w64-ucrt-x86_64-mpc-1.4.1-1-any.pkg.tar.zst",
+                         "sha256":  "f06556e811c711ce91609484e31d358e4f495811ba29813bf2284a3b236d82ce",
+                         "signature_sha256":  "c6816cce004dfe57f976a60bdac037a52c7dbf29a4ee0f8085acca13b26cb5a0"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-mpfr",
+                         "version":  "4.2.2-3",
+                         "file":  "mingw-w64-ucrt-x86_64-mpfr-4.2.2-3-any.pkg.tar.zst",
+                         "sha256":  "6b70a275d2ec75c70aa50a236c218e6b7ee9a5ab4c6d52cb0b580267b7d200fe",
+                         "signature_sha256":  "6eb04885039d85bbf17a932840fc54aca8b871545711347c04309dcc840e11cd"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-openblas",
+                         "version":  "0.3.34-1",
+                         "file":  "mingw-w64-ucrt-x86_64-openblas-0.3.34-1-any.pkg.tar.zst",
+                         "sha256":  "d9e14c9440d9aa70b6d09cdf0b8117995d181ced9c3d233ad7b62a907982add5",
+                         "signature_sha256":  "c375ffc90467642f43c45a94288013e0d2abf994e0fd9141bc62e354cc2c4b86"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-openssl",
+                         "version":  "3.6.5-1",
+                         "file":  "mingw-w64-ucrt-x86_64-openssl-3.6.5-1-any.pkg.tar.zst",
+                         "sha256":  "773e021ebad83f14b5c103db467411e8ff064663e1c7e7f730e2be72f4117064",
+                         "signature_sha256":  "77e1f439fbd7e0b6d8bdc372c12ec92d91f643a98393f5271b9b90692c819703"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-p11-kit",
+                         "version":  "0.26.5-1",
+                         "file":  "mingw-w64-ucrt-x86_64-p11-kit-0.26.5-1-any.pkg.tar.zst",
+                         "sha256":  "6e1645f0afa669f3e3325abb891d79c58dacf0bb5f9bb1ea719d22da1d754e62",
+                         "signature_sha256":  "f55114289b2e0ef0dc3b4edacc70462711addb3ef33aa404c3940a3788d60035"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-pcre2",
+                         "version":  "10.49-1",
+                         "file":  "mingw-w64-ucrt-x86_64-pcre2-10.49-1-any.pkg.tar.zst",
+                         "sha256":  "63172179db724ac71e2439a7981134c1bcab8049bdddfd349b32b8f76ed52d1e",
+                         "signature_sha256":  "929b46a140c6a9c4459f14c476a071aa2225ae4e8c7d32be80c5c14163a9ac5f"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-pkgconf",
+                         "version":  "1~3.0.10-1",
+                         "file":  "mingw-w64-ucrt-x86_64-pkgconf-1~3.0.10-1-any.pkg.tar.zst",
+                         "sha256":  "c234b9f8280f1e931efe8e4350085f544e4a6081ffcbd2caa3e81834e72e4688",
+                         "signature_sha256":  "70641da78e2a18a7c278b206dfa2acf47794589bba7679a4d49905c44256d86c"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-rust",
+                         "version":  "1.99.1-1",
+                         "file":  "mingw-w64-ucrt-x86_64-rust-1.99.1-1-any.pkg.tar.zst",
+                         "sha256":  "f30b909b7e0a03d87864d54e96e5b1d5ee668848297cb943d9988538142fe9cb",
+                         "signature_sha256":  "ed9506643ff92a9289c1e93e8177b13ad3f857de38af66694b350bb26f7d8c86"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-sqlite",
+                         "version":  "3.54.1-2",
+                         "file":  "mingw-w64-ucrt-x86_64-sqlite-3.54.1-2-any.pkg.tar.zst",
+                         "sha256":  "be8941784d708ddd25b8702b32b194704233edb859ba4e6e6e109a51a3836c10",
+                         "signature_sha256":  "9f8c11938b929becbd8612e5d02252d8c2fd2b1fc1e0999c9933c6e1da99d8f7"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-tcl",
+                         "version":  "8.6.18-1",
+                         "file":  "mingw-w64-ucrt-x86_64-tcl-8.6.18-1-any.pkg.tar.zst",
+                         "sha256":  "0c3a50ea5be8c5190e58a1fdc46c09f8113ad1b855745875646b7a78a02215df",
+                         "signature_sha256":  "8371e770940696421ba337a12a409e31f811a8a3503556a87969c7b42687ada6"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-tzdata",
+                         "version":  "2026f-1",
+                         "file":  "mingw-w64-ucrt-x86_64-tzdata-2026f-1-any.pkg.tar.zst",
+                         "sha256":  "dd8af2f770b3241d8c299343c12cd4d7e3b94c47195608158d28788a01575323",
+                         "signature_sha256":  "bb37a04bfccf491f157a3d3e5a80f16347d79cf95a54781c27f1dc89f6b729f9"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-windows-default-manifest",
+                         "version":  "20260815-1",
+                         "file":  "mingw-w64-ucrt-x86_64-windows-default-manifest-20260815-1-any.pkg.tar.zst",
+                         "sha256":  "b39039f754a600cc0dec49df7d675a59a3cb2b63691d91b4ae60735ee7075eca",
+                         "signature_sha256":  "e3d5eeee4fc45230c973bb8f08bd1fb3e0cd97846ffbe0a34c4ca54cc09a84fb"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-wineditline",
+                         "version":  "2.208-1",
+                         "file":  "mingw-w64-ucrt-x86_64-wineditline-2.208-1-any.pkg.tar.zst",
+                         "sha256":  "b07b34de1669e16cfd6743691914f5a66ad4013500bbf0e4c7a7644046ae7b1c",
+                         "signature_sha256":  "cc5cf21469088fd975b540e0c66db5eb46d96d012a90998caf27dcee8d700d1f"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-winpthreads",
+                         "version":  "14.0.0.r598.ge3d18511f-1",
+                         "file":  "mingw-w64-ucrt-x86_64-winpthreads-14.0.0.r598.ge3d18511f-1-any.pkg.tar.zst",
+                         "sha256":  "282485a1e453e972b86639cedcf43686e0000dfe5eff0421e47a4405ecdd85ce",
+                         "signature_sha256":  "d7e1bff1e9b6997fbeef324a8039a174d3cec5e21c5cf709c8e2d40b76021545"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-zlib",
+                         "version":  "1.4-2",
+                         "file":  "mingw-w64-ucrt-x86_64-zlib-1.4-2-any.pkg.tar.zst",
+                         "sha256":  "172541cf5e2391a402f092104988699b0163129d22be1d6b4b201bfb84af6fcf",
+                         "signature_sha256":  "b0567f5c3451e7bb855d385b18916d683f6f31e30f2821db6892211193644891"
+                     },
+                     {
+                         "name":  "mingw-w64-ucrt-x86_64-zstd",
+                         "version":  "1.5.7-2",
+                         "file":  "mingw-w64-ucrt-x86_64-zstd-1.5.7-2-any.pkg.tar.zst",
+                         "sha256":  "dbdb8427280046a2b41697780aa4c52983b708082b0da4755951dc3bea96ca89",
+                         "signature_sha256":  "97b4fe48e37ed32bc8a952c01737b6263dceb5a9c2c6f6b3a2def8e22f4e8b35"
+                     }
+                 ],
+    "native_files":  [
+                         {
+                             "path":  "bin/cargo.exe",
+                             "sha256":  "82fe4c3afdd89168d1da1a99a90ba83c53f7a22b16a682c42a201311fa0152a7"
+                         },
+                         {
+                             "path":  "bin/gcc.exe",
+                             "sha256":  "70325d325c126905fc04c5bc57727969f4529173a139c129e3ff92b7adc2941e"
+                         },
+                         {
+                             "path":  "bin/libcrypto-3-x64.dll",
+                             "sha256":  "97308feea369b305e562c0098638a1b02a06f52ee9fcc4b8cf3da362ff563cf4"
+                         },
+                         {
+                             "path":  "bin/libffi-8.dll",
+                             "sha256":  "f96cf79b75f33a10023d001673b564538023395c94b3c58e1db53114976a7c25"
+                         },
+                         {
+                             "path":  "bin/libflint-24.dll",
+                             "sha256":  "97c6b46b1031f9d03f71b44d4414c0d39ea8387d5665498fcb4bdfc72f287c52"
+                         },
+                         {
+                             "path":  "bin/libgcc_s_seh-1.dll",
+                             "sha256":  "791ebf66e99c7c1b4ed3666468cec45a0172b4c8942ac6c84c3e9cab3e1b5270"
+                         },
+                         {
+                             "path":  "bin/libgfortran-5.dll",
+                             "sha256":  "c6efba147926b0897a791d081cbc3c266967e7d63c5b325df5f8f14a3e91b62f"
+                         },
+                         {
+                             "path":  "bin/libgit2-1.9.dll",
+                             "sha256":  "6bbe991554fb370e2b3d73dba5f6672ee8df5386eb6f979e394879e5d8da9a89"
+                         },
+                         {
+                             "path":  "bin/libgmp-10.dll",
+                             "sha256":  "c2567ccf3f410c3411ba7cd4b7ba14f393a0e70a1d0c0593297df6706b5fba96"
+                         },
+                         {
+                             "path":  "bin/libgomp-1.dll",
+                             "sha256":  "ccaf59dc8cff15ace88ab47acd68a5b014167cad8f960e7683466a4c821e41c4"
+                         },
+                         {
+                             "path":  "bin/libhttp_parser-2.dll",
+                             "sha256":  "c87633a813476f796b6b96a8f253a14e839e61c4a3c588df31023eed5e2644ab"
+                         },
+                         {
+                             "path":  "bin/libiconv-2.dll",
+                             "sha256":  "9824e9f78e76ad513e5ba0d697c60de2fb24a21c20922bc2f918c86998a08cab"
+                         },
+                         {
+                             "path":  "bin/libintl-8.dll",
+                             "sha256":  "0e5a178731e6be6d115442a6ade3df7f03265cd1fc4338f8b6f86a8001cbf582"
+                         },
+                         {
+                             "path":  "bin/libisl-23.dll",
+                             "sha256":  "2b51430c1c61a6e4dfaeb177217261e83787f86bbad66adaba2783c41bae9fca"
+                         },
+                         {
+                             "path":  "bin/libLLVM-23.dll",
+                             "sha256":  "2a1f1a780f82e105a2a2cb8b4b7962a4b504165c8321cc359e8cf3efd3b5ade4"
+                         },
+                         {
+                             "path":  "bin/libmpc-3.dll",
+                             "sha256":  "1b1f6f1de1136abf89dd1aa1d2e29e38e2fa9385f09e864dc9f2aa03bc1abe2d"
+                         },
+                         {
+                             "path":  "bin/libmpfr-6.dll",
+                             "sha256":  "b881beb5ed7e3413283ab94f24ab25cd47ed27127774867ae105642ff2fc2e47"
+                         },
+                         {
+                             "path":  "bin/libopenblas.dll",
+                             "sha256":  "4b5cbee2aba54a599a031023dcc0d99ebd24988954fe094cf59ed76c004781f6"
+                         },
+                         {
+                             "path":  "bin/libpcre2-8-0.dll",
+                             "sha256":  "1f609cde2ce432efb7d2b0c7b84a14a6dbfc9622d1ac1a3cbadf51c5b0b4dada"
+                         },
+                         {
+                             "path":  "bin/libquadmath-0.dll",
+                             "sha256":  "802010365378b7421a7c3d61dabf2a46d8a3c8b71950ddeb4b5fefb32f117f4c"
+                         },
+                         {
+                             "path":  "bin/libsqlite3-0.dll",
+                             "sha256":  "0b8ecbefff0fda8c6f8562f896df0935842396bff20bb746602b115172f3d526"
+                         },
+                         {
+                             "path":  "bin/libssh2-1.dll",
+                             "sha256":  "7c9b4edb678b738b919950492c4a390482fdd644d1276d4728990fdd3c3ea989"
+                         },
+                         {
+                             "path":  "bin/libssl-3-x64.dll",
+                             "sha256":  "8b71cd694f8edfbddc76674111278db6bcdcde0dcd63b99238420193848e6dbf"
+                         },
+                         {
+                             "path":  "bin/libstdc++-6.dll",
+                             "sha256":  "4e4822dc4aaa99383f581dae7ab9464ae89346c5ca742f7efbcdebe20b0fe7b5"
+                         },
+                         {
+                             "path":  "bin/libwinpthread-1.dll",
+                             "sha256":  "94a9a4e2fe27b4bc827a4b209e9deb4cc3dc34bc025df06b849144f9d4c588f8"
+                         },
+                         {
+                             "path":  "bin/libxml2-16.dll",
+                             "sha256":  "2c971559c9bedb5459b35043de25886c9b36fc07536b6d84dfb84d938c46d5a4"
+                         },
+                         {
+                             "path":  "bin/libzstd.dll",
+                             "sha256":  "48368ab0ca622d0ec12f41ce85d91f22866bf5da92c77a69a06483564c93816c"
+                         },
+                         {
+                             "path":  "bin/rustc.exe",
+                             "sha256":  "bdab53d55eb2c34bee8b35ab5ef1090bf3b1f713201833647d8b4a9d1153fee4"
+                         },
+                         {
+                             "path":  "bin/rustc_driver-1744323744c1171a.dll",
+                             "sha256":  "bc76800062a30b4cf0e8bd56c09bb83055fb9a37eec0881b438845023d86f5c9"
+                         },
+                         {
+                             "path":  "bin/std-a4b788336475b2b8.dll",
+                             "sha256":  "7ddf08d03974b8796e9baf54e215202f2ad8b42ade35834628ae1071dac4d6cd"
+                         },
+                         {
+                             "path":  "bin/zlib1.dll",
+                             "sha256":  "aa658771fb152b095eda1614d8bde798efb92324b6f4a0c99c743cd96b67ac90"
+                         },
+                         {
+                             "path":  "include/flint/flint.h",
+                             "sha256":  "24175acc48386c252cae1f76b695e10f936b895566e476bbc3c141f5347004f9"
+                         },
+                         {
+                             "path":  "include/gmp.h",
+                             "sha256":  "178db66910305eed62d2d3fdd1f203a45febaa2aaa64690b608c7d95f2a1a3cc"
+                         },
+                         {
+                             "path":  "include/mpfr.h",
+                             "sha256":  "588c2bd606cba060afb49cd024f9119e996089a341a99d1dc7e0367622335a13"
+                         },
+                         {
+                             "path":  "lib/gcc/x86_64-w64-mingw32/16.2.0/cc1.exe",
+                             "sha256":  "271909382f0b22b2f9e6e1179152e36ac3f23ffa57466af91e11756494183017"
+                         },
+                         {
+                             "path":  "lib/gcc/x86_64-w64-mingw32/16.2.0/collect2.exe",
+                             "sha256":  "cc319b6989b0f58b148d052ad6d626fa7f30aa49317e65b7606f96e788191e66"
+                         },
+                         {
+                             "path":  "x86_64-w64-mingw32/bin/as.exe",
+                             "sha256":  "a608bd29d15d7cad470567070c7362191881f238d6e8525f4c3ab908cf36fcc5"
+                         },
+                         {
+                             "path":  "x86_64-w64-mingw32/bin/ld.exe",
+                             "sha256":  "a279cc83f198a606f255a597b3a067b51f11a9bbf8fe46de2a0dc8bb71b47f4f"
+                         }
+                     ]
+}

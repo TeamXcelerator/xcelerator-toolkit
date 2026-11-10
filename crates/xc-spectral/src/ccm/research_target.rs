@@ -893,7 +893,7 @@ fn main(){
  }
 }
 "#).unwrap();
-        let executable = root.join("provider");
+        let executable = root.join(format!("provider{}", std::env::consts::EXE_SUFFIX));
         let output = Command::new("rustc")
             .arg("--edition=2021")
             .arg(&source)

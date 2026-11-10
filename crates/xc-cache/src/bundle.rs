@@ -976,7 +976,7 @@ fn verify_package_digest(
             hasher.update(&buffer[..read]);
         }
     }
-    let digest = ContentDigest(format!("{:x}", hasher.finalize()));
+    let digest = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
     if size != encoding.package_size_bytes || digest != encoding.package_digest {
         return Err(CacheError::DigestMismatch {
             expected: format!(
@@ -1031,7 +1031,7 @@ fn copy_verified_part(
     }
     output.flush()?;
     output.get_ref().sync_all()?;
-    let digest = ContentDigest(format!("{:x}", hasher.finalize()));
+    let digest = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
     if size != part.size_bytes || digest != part.content_digest {
         drop(output);
         let _ = fs::remove_file(destination);
@@ -1071,7 +1071,7 @@ fn verify_part_file(
             .ok_or_else(|| CacheError::ResourceLimit("bundle part size exceeds u64".to_owned()))?;
         hasher.update(&buffer[..read]);
     }
-    let digest = ContentDigest(format!("{:x}", hasher.finalize()));
+    let digest = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
     if size != part.size_bytes || digest != part.content_digest {
         return Err(CacheError::DigestMismatch {
             expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),

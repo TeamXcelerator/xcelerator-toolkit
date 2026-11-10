@@ -8067,7 +8067,7 @@ pub mod weighted_l1 {
     fn hash<T: Serialize>(value: &T) -> Result<String, SolverError> {
         let bytes =
             serde_json::to_vec(value).map_err(|_| invalid("identity serialization failed"))?;
-        Ok(format!("{:x}", Sha256::digest(bytes)))
+        Ok(xc_core::hex_lower(&Sha256::digest(bytes)))
     }
 
     /// Wrap an externally proposed witness in a replayable Toolkit record.
@@ -8602,7 +8602,7 @@ pub mod trial_energy {
     }
     pub(super) fn hash<T: Serialize>(x: &T) -> Result<String, SolverError> {
         let bytes = serde_json::to_vec(x).map_err(|_| invalid("identity serialization"))?;
-        Ok(format!("{:x}", Sha256::digest(bytes)))
+        Ok(xc_core::hex_lower(&Sha256::digest(bytes)))
     }
     pub(super) struct Work<'a> {
         pub(super) options: &'a TrialEnergyOptions,
@@ -9536,7 +9536,7 @@ pub mod trial_energy {
             if record.entries != count {
                 return Err(invalid("incomplete symmetric form stream"));
             }
-            record.sha256 = format!("{:x}", sha.finalize());
+            record.sha256 = xc_core::hex_lower(&sha.finalize());
             Ok(record)
         }
         /// Import-time digest. Keep the result in a source manifest before
@@ -11740,7 +11740,7 @@ pub mod convergence {
         let writer = writer
             .into_inner()
             .map_err(|_| invalid("identity serialization"))?;
-        Ok(format!("{:x}", writer.0.finalize()))
+        Ok(xc_core::hex_lower(&writer.0.finalize()))
     }
     pub fn analyze(
         problem: &Problem,

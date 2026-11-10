@@ -1,7 +1,6 @@
-# Development builds use the stable channel. The minimum compiler version is
-# declared in Cargo.toml.
-# For reproducible experiments, record rustc -Vv and set RUSTUP_TOOLCHAIN to
-# the exact installed version used for the run.
+# Pinned current stable compiler. Record rustc -Vv with research results.
+# Native Windows UCRT builds use the matching packaged GNU host toolchain;
+# see docs/WINDOWS.md and tools/windows-env.ps1.
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]

@@ -15,5 +15,5 @@ xc-certify = { path = "../../crates/xc-certify" }
 xc-core = { path = "../../crates/xc-core" }
 xc-operator = { path = "../../crates/xc-operator" }
 xc-solver = { path = "../../crates/xc-solver" }
-rug = { version = "1.30", default-features = false, features = ["std", "integer", "rational"], optional = true }
+rug = { version = "1.30.0", default-features = false, features = ["std", "integer", "rational"], optional = true }
 xc-numerics = { path = "../../crates/xc-numerics", optional = true, features = ["hp"] }

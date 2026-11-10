@@ -14,6 +14,10 @@ use xc_cache::{ArtifactProductionSink, CapturedDiagnostic, ProducedArtifactRecor
 pub struct RetainedCcmRun {
     resources: xc_core::RunResources,
     validated_values: xc_cache::ValidatedValueMemo,
+    #[cfg(feature = "arb")]
+    compact_proofs: crate::ccm::sector_gap_certificate::compact::retained::Memo,
+    #[cfg(feature = "arb")]
+    _compact_proof_eviction: std::sync::Arc<dyn Fn() + Send + Sync>,
     bordered_response_memo: BorderedResponseMemo,
     _bordered_response_eviction: std::sync::Arc<dyn Fn() + Send + Sync>,
     source_admissions: std::sync::Arc<Mutex<admissions::Sources>>,
@@ -47,9 +51,16 @@ pub struct RetainedCcmRun {
             crate::ccm::sector_gap_certificate::PortableCcmSectorGapCertificate,
         >,
     >,
+    compact_sector_certificate: Option<
+        xc_cache::ArtifactExecutionCacheResult<
+            crate::ccm::sector_gap_certificate::compact::CompactCcmSectorGapCertificate,
+        >,
+    >,
     sector_certificate_error: Option<String>,
-    sector_certificate_options:
-        Option<crate::ccm::sector_gap_certificate::CcmSectorGapCertificationOptions>,
+    sector_certificate_options: Option<(
+        crate::ccm::sector_gap_certificate::CcmSectorGapCertificationOptions,
+        CcmSectorGapCertificateFormat,
+    )>,
     /// Diagnostics computed ahead of their turn; see `start_lookahead`.
     lookahead: Option<crate::ccm::convergence_capture::lookahead::Lane>,
     lookahead_enabled: bool,
@@ -469,9 +480,20 @@ impl RetainedCcmRun {
         let bordered_response_memo = BorderedResponseMemo::default();
         let bordered_response_eviction = bordered_response_memo.eviction_callback();
         validated_values.register_eviction(&bordered_response_eviction);
+        #[cfg(feature = "arb")]
+        let compact_proofs =
+            crate::ccm::sector_gap_certificate::compact::retained::Memo::new(resources.clone());
+        #[cfg(feature = "arb")]
+        let compact_proof_eviction = compact_proofs.eviction_callback();
+        #[cfg(feature = "arb")]
+        validated_values.register_eviction(&compact_proof_eviction);
         Ok(Self {
             resources,
             validated_values,
+            #[cfg(feature = "arb")]
+            compact_proofs,
+            #[cfg(feature = "arb")]
+            _compact_proof_eviction: compact_proof_eviction,
             bordered_response_memo,
             _bordered_response_eviction: bordered_response_eviction,
             source_admissions,
@@ -501,6 +523,7 @@ impl RetainedCcmRun {
             sector_error: None,
             sector_options: None,
             sector_certificate: None,
+            compact_sector_certificate: None,
             sector_certificate_error: None,
             sector_certificate_options: None,
             lookahead: None,
@@ -1394,24 +1417,47 @@ impl RetainedCcmRun {
         let certification = options
             .sector_gap_certification
             .ok_or_else(|| anyhow::anyhow!("sector certification not requested"))?;
+        let request = (certification, options.sector_gap_certificate_format.clone());
         if self
             .sector_certificate_options
-            .is_some_and(|prior| prior != certification)
+            .as_ref()
+            .is_some_and(|prior| prior != &request)
         {
             bail!(
-                "sector-gap certification options changed after capture; create a new retained run"
+                "sector-gap certification options changed after capture (including format/source provenance); create a new retained run"
             );
         }
         // Also rejects a changed sector request before any memoized result is used.
         self.sectors(options, cache)?;
-        self.sector_certificate_options = Some(certification);
-        if self.sector_certificate.is_some() {
+        self.sector_certificate_options = Some(request);
+        if self.sector_certificate.is_some() || self.compact_sector_certificate.is_some() {
             return Ok(());
         }
         if let Some(error) = &self.sector_certificate_error {
             bail!("sector-gap certificate unavailable: {error}");
         }
         let sectors = self.sectors.as_ref().expect("resolved sectors");
+        if let CcmSectorGapCertificateFormat::Compact(source) =
+            &options.sector_gap_certificate_format
+        {
+            return match certify_compact_sector_gap_from_resolution(
+                &self.params,
+                &self.cfg,
+                certification,
+                sectors,
+                source.clone(),
+                Some(cache),
+            ) {
+                Ok(resolved) => {
+                    self.compact_sector_certificate = Some(resolved);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.sector_certificate_error = Some(format!("{error:#}"));
+                    Err(error)
+                }
+            };
+        }
         let resolved = certify_sector_gap_from_resolution(
             &self.params,
             &self.cfg,
@@ -1431,6 +1477,30 @@ impl RetainedCcmRun {
         }
     }
 
+    fn sector_certificate_ref(
+        &self,
+    ) -> Option<(
+        crate::ccm::sector_gap_certificate::SectorGapCertificateRef<'_>,
+        &ArtifactManifest,
+    )> {
+        use crate::ccm::sector_gap_certificate::SectorGapCertificateRef;
+        if let Some(resolved) = &self.compact_sector_certificate {
+            resolved
+                .produced_manifest
+                .as_ref()
+                .or(resolved.reused_manifest.as_ref())
+                .map(|manifest| (SectorGapCertificateRef::Compact(&resolved.value), manifest))
+        } else {
+            self.sector_certificate.as_ref().and_then(|resolved| {
+                resolved
+                    .produced_manifest
+                    .as_ref()
+                    .or(resolved.reused_manifest.as_ref())
+                    .map(|manifest| (SectorGapCertificateRef::Full(&resolved.value), manifest))
+            })
+        }
+    }
+
     /// Attempt one primary diagnostic. Callers convert errors to explicit
     /// receipt outcomes and continue other independent requests. Measurements
     /// include exact authenticated artifact manifests, on fresh and warm runs.
@@ -1447,6 +1517,8 @@ impl RetainedCcmRun {
         self.resources.check_workers(rayon::current_num_threads())?;
         let _resources = self.resources.enter();
         let _memo = self.validated_values.enter();
+        #[cfg(feature = "arb")]
+        let _compact_proofs = self.compact_proofs.enter();
         let result = xc_numerics::hp_runtime::run_hp(|| self.capture_inner(id, options, cache));
         // A cache hit never claims its prefetched value. Release that slot so
         // the bounded lane can advance and its unused allocations can drop.
@@ -1954,7 +2026,8 @@ impl RetainedCcmRun {
             if matches!(
                 id,
                 "capture_preflight" | "transform_enclosure" | "finite_root_budget"
-            ) && options.sector_gap_certification.is_some()
+            ) && (options.sector_gap_certification.is_some()
+                || self.sector_certificate_options.is_some())
             {
                 if let Err(error) = self.ensure_sector_certificate(options, cache) {
                     certificate_error = Some(format!("{error:#}"));
@@ -2078,26 +2151,18 @@ impl RetainedCcmRun {
             let _input_admission = input.map(|i| i.admit()).transpose()?;
             let input = input.map(std::ops::Deref::deref);
             let certificate = self
-                .sector_certificate
-                .as_ref()
+                .sector_certificate_ref()
                 .filter(|_| certificate_error.is_none())
                 .filter(|_| {
                     matches!(
                         id,
                         "capture_preflight" | "transform_enclosure" | "finite_root_budget"
                     )
-                })
-                .and_then(|resolved| {
-                    resolved
-                        .produced_manifest
-                        .as_ref()
-                        .or(resolved.reused_manifest.as_ref())
-                        .map(|manifest| (&resolved.value, manifest))
                 });
             use crate::ccm::convergence_capture::lookahead;
             let (captured, produced) = if crate::ccm::capture::FINITE_DIAGNOSTICS.contains(&id) {
                 use crate::ccm::convergence_capture::finite_capture::{
-                    capture_with_prepared, ExecutionContext, Prepared,
+                    capture_with_prepared_ref, ExecutionContext, Prepared,
                 };
                 let execution = ExecutionContext {
                     policy: crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?,
@@ -2121,7 +2186,7 @@ impl RetainedCcmRun {
                         )
                     })
                 });
-                let result = capture_with_prepared(
+                let result = capture_with_prepared_ref(
                     id,
                     &state,
                     matrix.as_ref(),
@@ -2144,7 +2209,7 @@ impl RetainedCcmRun {
                         )
                     })
                 });
-                let result = capture_extended_prepared(
+                let result = capture_extended_prepared_ref(
                     id,
                     &state,
                     matrix.as_ref(),
@@ -2348,6 +2413,29 @@ impl RetainedCcmRun {
                         .as_ref()
                         .map(|record| record.sources.clone())
                         .unwrap_or_default(),
+                );
+            }
+            if let Some(resolved) = &self.compact_sector_certificate {
+                return Ok(
+                    match resolved
+                        .produced_manifest
+                        .as_ref()
+                        .or(resolved.reused_manifest.as_ref())
+                    {
+                        Some(manifest) => CapturedDiagnostic::by_reference_omitting(
+                            &resolved.value,
+                            &[],
+                            manifest.clone(),
+                            vec![manifest.clone()],
+                        )?,
+                        None => CapturedDiagnostic::new(
+                            &resolved.value,
+                            self.sector_record
+                                .as_ref()
+                                .map(|record| record.sources.clone())
+                                .unwrap_or_default(),
+                        )?,
+                    },
                 );
             }
             let resolved = self
@@ -4463,13 +4551,30 @@ mod tests {
         fn untimed(text: &str) -> String {
             let mut out = String::new();
             let mut rest = text;
-            while let Some(at) = rest.find("manifests/") {
-                let (head, tail) = rest.split_at(at + "manifests/".len());
+            while let Some(at) = rest.find("manifests") {
+                let (head, tail) = rest.split_at(at + "manifests".len());
                 out.push_str(head);
-                let name = tail.split(['"', '\\']).next().unwrap_or_default();
+                // JSON contains escaped backslashes on Windows, while file
+                // names below are normalized component by component. Preserve
+                // every separator and replace only a complete timed manifest
+                // basename, never arbitrary payload text or digest bytes.
+                let separators = tail
+                    .bytes()
+                    .take_while(|byte| matches!(byte, b'/' | b'\\'))
+                    .count();
+                if separators == 0 {
+                    rest = tail;
+                    continue;
+                }
+                out.push_str(&tail[..separators]);
+                let tail = &tail[separators..];
+                let name = tail.split(['"', '\\', '/']).next().unwrap_or_default();
                 let timed = name.strip_suffix(".json").and_then(|n| n.split_once('-'));
                 if timed.is_some_and(|(time, digest)| {
-                    time.bytes().all(|b| b.is_ascii_digit()) && digest.len() == 64
+                    !time.is_empty()
+                        && time.bytes().all(|b| b.is_ascii_digit())
+                        && digest.len() == 64
+                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                 }) {
                     out.push_str("<manifest>.json");
                     rest = &tail[name.len()..];
@@ -4511,7 +4616,13 @@ mod tests {
                     }
                     Err(_) => ContentDigest::sha256(&bytes).0,
                 };
-                let mut name = path.strip_prefix(root).unwrap().display().to_string();
+                let mut name = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .iter()
+                    .map(|component| component.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 if name.starts_with("publication/drafts/") {
                     // drafts/<semantic>/<payload>/<source manifest digest>/...
                     let mut parts = name.split('/').map(str::to_owned).collect::<Vec<_>>();
@@ -4525,6 +4636,46 @@ mod tests {
         }
         files.sort();
         files
+    }
+
+    #[test]
+    fn cache_snapshot_normalizes_manifest_paths_but_keeps_all_payload_bytes() {
+        let roots = [
+            xc_core::test_support::TestDir::new("snapshot-first"),
+            xc_core::test_support::TestDir::new("snapshot-second"),
+        ];
+        for (index, root) in roots.iter().enumerate() {
+            let digest = if index == 0 { "a" } else { "b" }.repeat(64);
+            let manifest = format!("{}-{digest}.json", 100 + index);
+            let cache = root.join("cache").join("manifests");
+            let draft = root
+                .join("publication")
+                .join("drafts")
+                .join("semantic")
+                .join("payload")
+                .join(&digest);
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::create_dir_all(&draft).unwrap();
+            let metadata = serde_json::json!({
+                "created_unix_seconds": 100 + index,
+                "source_manifest_digest": digest,
+                "staged_parts_root": draft,
+                "windows_manifest_path": format!(r"cache\manifests\{manifest}"),
+                "mathematical_value": "1.234567890123456789",
+            });
+            std::fs::write(cache.join(manifest), metadata.to_string()).unwrap();
+            std::fs::write(draft.join("draft.json"), metadata.to_string()).unwrap();
+            std::fs::write(root.join("payload.bin"), [0, 1, 128, 255]).unwrap();
+            std::fs::write(root.join("measurement.json"), br#"{"value":"1.25"}"#).unwrap();
+        }
+        let reference = cache_snapshot(&roots[0]);
+        assert_eq!(reference.len(), 4, "every fixture file remains compared");
+        assert_eq!(reference, cache_snapshot(&roots[1]));
+        std::fs::write(roots[1].join("measurement.json"), br#"{"value":"1.26"}"#).unwrap();
+        assert_ne!(reference, cache_snapshot(&roots[1]));
+        std::fs::write(roots[1].join("measurement.json"), br#"{"value":"1.25"}"#).unwrap();
+        std::fs::write(roots[1].join("payload.bin"), [0, 1, 128, 254]).unwrap();
+        assert_ne!(reference, cache_snapshot(&roots[1]));
     }
 
     /// One cold capture through the receipt collector, as an application
@@ -4987,3 +5138,7 @@ mod unresolved_certificate_contract {
             .contains("remained inconclusive"));
     }
 }
+
+#[cfg(all(test, feature = "arb"))]
+#[path = "compact_capture_tests.rs"]
+mod compact_capture_tests;

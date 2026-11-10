@@ -551,7 +551,7 @@ fn verify_local_part(
         size = size.saturating_add(count as u64);
         hasher.update(&buffer[..count]);
     }
-    let digest = ContentDigest(format!("{:x}", hasher.finalize()));
+    let digest = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
     if size != expected_size || &digest != expected_digest {
         return Err(CacheError::DigestMismatch {
             expected: format!("{expected_digest} ({expected_size} bytes)"),

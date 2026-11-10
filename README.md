@@ -7,15 +7,25 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-## Retained research with v0.17.0
+## Native Windows and retained research with v0.17.1
 
-Version 0.17.0 improves large-run execution and retained-artifact reuse.
+Version 0.17.1 adds a native Windows high-precision build lane and updates
+Rust and selected library dependencies. The qualified Windows and Linux
+comparison reproduces numerical payloads and complete cache ZIP objects byte
+for byte. Numerical and compression upgrades that changed those bytes are
+excluded. It preserves the retained-research execution and recovery
+capabilities introduced in 0.17.0.
+Optional [compact sector certificates](docs/CCM_COMPACT_SECTOR_CERTIFICATES.md)
+retain exact results and reconstruction recipes while omitting dense proof
+matrices. Optional [explicit cohorts](docs/CCM_EXPLICIT_COHORTS.md) compare
+selected retained sources; the numerical comparison opens matrix payloads only
+for requested residuals. Publication staging may separately read dependencies.
+Both extensions remain off by default, including with Ultra.
 See the [release notes](docs/RELEASE_NOTES.md)
 for compatibility details and public API changes.
 
-The `v0.17.0` tag includes the response-acceleration and retained-recovery
-updates described in the release notes. Record the exact Git revision when
-identifying a build.
+Record the exact Git revision, compiler, and native library versions when
+identifying a research build.
 
 Xcelerator Toolkit supplies high-precision numerical libraries and reusable,
 source-bound research data. Applications can retain a primary calculation once
@@ -46,8 +56,8 @@ sums and searchable scalar exports are described in the
 
 ## Getting started
 
-The minimum supported Rust version is 1.98. Development uses the stable
-channel selected by `rust-toolchain.toml`. Record the exact compiler version
+The minimum supported Rust version is 1.99. Development pins stable Rust
+1.99.1 in `rust-toolchain.toml`. Record the exact compiler version
 for reproducible experiments.
 
 ```bash
@@ -67,7 +77,11 @@ See [Research Workflows](docs/RESEARCH_WORKFLOWS.md) for additional examples and
 
 ## High precision
 
-Ubuntu and WSL2 Ubuntu are the primary high-precision environments. Install the native libraries, then enable the `hp` feature:
+Native Windows x64 UCRT and Linux high-precision builds use the same MPFR-based
+numerical contracts. Windows setup, build, and local checks are described in
+[Native Windows](docs/WINDOWS.md); WSL is not required for that build lane.
+
+On Ubuntu, install the native libraries and enable the `hp` feature:
 
 ```bash
 sudo apt install build-essential m4 libgmp-dev libmpfr-dev libmpc-dev libflint-dev pkg-config
@@ -226,7 +240,7 @@ Please report proposed changes upstream so they can be reviewed and incorporated
 
 If you use Xcelerator Toolkit in research, please cite the exact version or Git commit. Citation metadata is also provided in [CITATION.cff](CITATION.cff).
 
-The citation metadata and example below describe v0.17.0. For a development
+The citation metadata and example below describe v0.17.1. For a development
 snapshot or an amended release, also cite its exact Git commit.
 
 ```bibtex
@@ -234,7 +248,7 @@ snapshot or an amended release, also cite its exact Git commit.
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.17.0},
+  version = {0.17.1},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }

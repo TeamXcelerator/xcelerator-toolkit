@@ -728,6 +728,7 @@ pub mod finite_capture {
     use super::super::{
         extended_research::{ExtensionOptions, ExternalResearchInputs},
         retained_evidence::*,
+        sector_gap_certificate::SectorGapCertificateRef,
         state_geometry::RetainedState,
     };
     use anyhow::{bail, Result};
@@ -809,7 +810,7 @@ pub mod finite_capture {
                 None => hash.update([if x.is_nan() { 2 } else { 3 }]),
             }
         }
-        ContentDigest(format!("{:x}", hash.finalize()))
+        ContentDigest(xc_core::hex_lower(&hash.finalize()))
     }
     /// A computation stopped by a resource limit: reported as blocked and never
     /// retained, so a later run with more resources recomputes it.
@@ -1935,11 +1936,9 @@ pub mod finite_capture {
             let request = request();
             let maximum = PROFILE_MAXIMUM_SERIALIZED_BYTES + 1;
             let unowned = ProfileAdmission::inspect_with_limit(&request, maximum).unwrap();
-            assert!(
-                unowned
-                    .failure_predicates
-                    .contains(&"expanded_policy_requires_run_resources")
-            );
+            assert!(unowned
+                .failure_predicates
+                .contains(&"expanded_policy_requires_run_resources"));
             let run = xc_core::RunResources::new(128 << 20).unwrap();
             let _scope = run.enter();
             let admission = ProfileAdmission::inspect_with_limit(&request, maximum).unwrap();
@@ -1954,11 +1953,9 @@ pub mod finite_capture {
                 .try_reserve_working(run.maximum_bytes() - needed + 1)
                 .unwrap();
             let constrained = ProfileAdmission::inspect_with_limit(&request, maximum).unwrap();
-            assert!(
-                constrained
-                    .failure_predicates
-                    .contains(&"expanded_workspace_exceeds_available_budget")
-            );
+            assert!(constrained
+                .failure_predicates
+                .contains(&"expanded_workspace_exceeds_available_budget"));
             assert!(admission.reserve_expanded_workspace().is_err());
         }
         #[test]
@@ -1980,11 +1977,9 @@ pub mod finite_capture {
             assert_eq!(refused.failure_predicates, vec!["serialized_bytes"]);
             let oversized =
                 ProfileAdmission::inspect_with_limit(&request, run.maximum_bytes() + 1).unwrap();
-            assert!(
-                oversized
-                    .failure_predicates
-                    .contains(&"serialized_policy_exceeds_run_budget")
-            );
+            assert!(oversized
+                .failure_predicates
+                .contains(&"serialized_policy_exceeds_run_budget"));
             let mut wrong = request;
             wrong.basis_id = "wrong".into();
             wrong.precision_bits = 32;
@@ -1993,10 +1988,12 @@ pub mod finite_capture {
                     .unwrap();
             assert!(invalid.failure_predicates.contains(&"basis_id"));
             assert!(invalid.failure_predicates.contains(&"precision_bits"));
-            assert!(
-                analyze_profiles_with_limit(&wrong, false, PROFILE_MAXIMUM_SERIALIZED_BYTES + 1)
-                    .is_err()
-            );
+            assert!(analyze_profiles_with_limit(
+                &wrong,
+                false,
+                PROFILE_MAXIMUM_SERIALIZED_BYTES + 1
+            )
+            .is_err());
             assert_eq!(run.usage().working_bytes, 0);
         }
     }
@@ -5190,13 +5187,13 @@ pub mod finite_capture {
             "fit_problem_sha256":fit.problem_sha256,"analytic_obligations":["finite projection to original target","finite target approximation to analytic reference"]});
         Ok(out)
     }
-    fn compute(
+    fn compute_with_certificate_ref(
         id: &str,
         s: &RetainedState,
         m: Option<&RetainedMatrix<'_>>,
         roots: Option<&RetainedRoots>,
         input: Option<&ExternalResearchInputs>,
-        certificate: Option<&super::super::sector_gap_certificate::PortableCcmSectorGapCertificate>,
+        certificate: Option<SectorGapCertificateRef<'_>>,
         automatic_working_bytes: u128,
     ) -> Result<Analysis> {
         let extra = input.and_then(|i| i.finite_diagnostics.as_ref());
@@ -6001,9 +5998,7 @@ pub mod finite_capture {
         id: &str,
         s: &RetainedState,
         _roots: Option<&RetainedRoots>,
-        _certificate: Option<
-            &super::super::sector_gap_certificate::PortableCcmSectorGapCertificate,
-        >,
+        _certificate: Option<SectorGapCertificateRef<'_>>,
     ) -> Result<Analysis> {
         Ok(empty(id,s,"blocked","analytic finite root transfer requires the arb feature and a replayable sector certificate"))
     }
@@ -6012,13 +6007,14 @@ pub mod finite_capture {
         id: &str,
         s: &RetainedState,
         roots: Option<&RetainedRoots>,
-        certificate: Option<&super::super::sector_gap_certificate::PortableCcmSectorGapCertificate>,
+        certificate: Option<SectorGapCertificateRef<'_>>,
     ) -> Result<Analysis> {
         use super::super::sector_gap_certificate::root_budget::{self, Request, Window};
         let (Some(roots), Some(certificate)) = (roots, certificate) else {
             return Ok(empty(id,s,"missing_input","requires retained root outcomes and the run's explicitly requested sector-gap certificate"));
         };
-        if s.modes > 512 || roots.dataset.points.len() > 256 || certificate.precision_bits > 65536 {
+        if s.modes > 512 || roots.dataset.points.len() > 256 || certificate.precision_bits() > 65536
+        {
             return Ok(empty(
                 id,
                 s,
@@ -6026,7 +6022,7 @@ pub mod finite_capture {
                 "analytic root transfer exceeds its validated dimension, row or precision limit",
             ));
         }
-        let p = s.precision.max(certificate.precision_bits);
+        let p = s.precision.max(certificate.precision_bits());
         let radius = Rational::from((1, rug::Integer::from(1) << (p / 8).clamp(16, 256)));
         let mut windows = vec![];
         let mut rows = vec![];
@@ -6064,7 +6060,12 @@ pub mod finite_capture {
             precision_bits: p,
             windows,
         };
-        let report = root_budget::analyze(s, certificate, &request, &CancellationToken::new())?;
+        let report = root_budget::analyze_with_certificate_ref(
+            s,
+            certificate,
+            &request,
+            &CancellationToken::new(),
+        )?;
         for r in &report.rows {
             rows.push(Row {
                 label: r.requested_index.to_string(),
@@ -6867,6 +6868,27 @@ pub mod finite_capture {
         )>,
         execution: &ExecutionContext,
     ) -> Unit {
+        compute_unit_ref(
+            id,
+            s,
+            m,
+            roots,
+            input,
+            certificate.map(|(c, m)| (SectorGapCertificateRef::Full(c), m)),
+            execution,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_unit_ref(
+        id: &str,
+        s: &RetainedState,
+        m: Option<&RetainedMatrix<'_>>,
+        roots: Option<&RetainedRoots>,
+        input: Option<&ExternalResearchInputs>,
+        certificate: Option<(SectorGapCertificateRef<'_>, &ArtifactManifest)>,
+        execution: &ExecutionContext,
+    ) -> Unit {
         let policy = &execution.policy;
         let limited = std::cell::RefCell::new(None);
         let result = (|| -> Result<Analysis> {
@@ -6875,7 +6897,7 @@ pub mod finite_capture {
             let n = s.coefficients.len() as u128;
             let precision = s
                 .precision
-                .max(certificate.map_or(0, |(c, _)| c.precision_bits));
+                .max(certificate.map_or(0, |(c, _)| c.precision_bits()));
             let scalar_bytes = (precision as u128).div_ceil(8) + 256;
             let automatic = matches!(
                 id,
@@ -6923,7 +6945,7 @@ pub mod finite_capture {
                     return Ok(a);
                 }
             }
-            let result = compute(
+            let result = compute_with_certificate_ref(
                 id,
                 s,
                 m,
@@ -7109,7 +7131,7 @@ pub mod finite_capture {
                 None => hash.update([if x.is_nan() { 2 } else { 3 }]),
             }
         }
-        ContentDigest(format!("{:x}", hash.finalize()))
+        ContentDigest(xc_core::hex_lower(&hash.finalize()))
     }
 
     /// Claim of a look-ahead result, tried where the computation would run.
@@ -7163,6 +7185,34 @@ pub mod finite_capture {
         execution: &ExecutionContext,
         prepared: Option<Prepared<'_>>,
     ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<Analysis>>> {
+        capture_with_prepared_ref(
+            id,
+            s,
+            m,
+            roots,
+            input,
+            certificate.map(|(c, m)| (SectorGapCertificateRef::Full(c), m)),
+            parents,
+            cache,
+            execution,
+            prepared,
+        )
+    }
+
+    /// Representation-aware finite capture with actual payload/manifest binding.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_with_prepared_ref(
+        id: &str,
+        s: &RetainedState,
+        m: Option<&RetainedMatrix<'_>>,
+        roots: Option<&RetainedRoots>,
+        input: Option<&ExternalResearchInputs>,
+        certificate: Option<(SectorGapCertificateRef<'_>, &ArtifactManifest)>,
+        parents: &[ArtifactManifest],
+        cache: &ArtifactCacheContext<'_>,
+        execution: &ExecutionContext,
+        prepared: Option<Prepared<'_>>,
+    ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<Analysis>>> {
         if !super::super::capture::FINITE_DIAGNOSTICS.contains(&id) {
             bail!("unknown finite capture identifier");
         }
@@ -7198,13 +7248,25 @@ pub mod finite_capture {
             if m.key.kind != "ccm_sector_gap_certificate" {
                 bail!("root budget certificate payload/manifest mismatch");
             }
-            let Some(admitted) =
-                super::super::sector_gap_certificate::AdmittedCertificate::bind(c, m)?
-            else {
-                bail!("root budget certificate payload/manifest mismatch");
+            let admitted = match c {
+                SectorGapCertificateRef::Full(c) => {
+                    let Some(admitted) =
+                        super::super::sector_gap_certificate::AdmittedCertificate::bind(c, m)?
+                    else {
+                        bail!("root budget certificate payload/manifest mismatch");
+                    };
+                    Some(admitted)
+                }
+                SectorGapCertificateRef::Compact(c) => {
+                    if ContentDigest::sha256_finite_json(c)? != m.content_digest {
+                        bail!("compact root budget certificate payload/manifest mismatch");
+                    }
+                    c.validate_structure()?;
+                    None
+                }
             };
             sources.push(m.clone());
-            Some(admitted)
+            admitted
         } else {
             None
         };
@@ -7213,6 +7275,9 @@ pub mod finite_capture {
             "input_preparation_failure":execution.input_preparation_error.as_ref().map(|_|"input_preparation_failed"),
             "arb_enabled":cfg!(feature="arb"),"streaming_defaults":stream::Options::default(),"convergence_defaults":cv::Options::default(),
             "matrix_policy":"exact rational symmetric part of retained Tau","root_window_policy":"2^-clamp(precision/8,16,256)"});
+        if matches!(certificate, Some((SectorGapCertificateRef::Compact(_), _))) {
+            request["sector_certificate_representation"] = json!("compact_analytic_replay_v1");
+        }
         request["automatic_recipe"] = json!("retained_primary_then_finite_analysis_v1");
         request["profile_recipe"] = json!(if matches!(
             id,
@@ -7249,9 +7314,9 @@ pub mod finite_capture {
         }
         let limited = std::cell::RefCell::new(None);
         let compute = || -> Result<Analysis> {
-            let unit = prepared
-                .and_then(|claim| claim())
-                .unwrap_or_else(|| compute_unit(id, s, m, roots, input, certificate, execution));
+            let unit = prepared.and_then(|claim| claim()).unwrap_or_else(|| {
+                compute_unit_ref(id, s, m, roots, input, certificate, execution)
+            });
             *limited.borrow_mut() = unit.limited;
             unit.result
         };

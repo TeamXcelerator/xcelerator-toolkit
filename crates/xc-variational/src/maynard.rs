@@ -2799,7 +2799,7 @@ impl MkCertifiedDegreeBandAction {
                 maximum_omitted_row_sum = omitted_row_sum;
             }
         }
-        let digest = format!("sha256:{:x}", hasher.finalize());
+        let digest = format!("sha256:{}", xc_core::hex_lower(&hasher.finalize()));
         let certificate = MkApproximationCertificate {
             construction:
                 "exact omitted-entry maximum absolute row-sum bound for a symmetric degree band"

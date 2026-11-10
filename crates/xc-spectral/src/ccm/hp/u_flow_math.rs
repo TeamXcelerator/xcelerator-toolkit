@@ -11,6 +11,9 @@ use xc_numerics::mpfr_interval::MpfrInterval as I;
 type Table = (Vec<Float>, Vec<Float>);
 #[path = "u_flow_admission.rs"]
 mod admission;
+#[path = "u_flow_integral_scratch.rs"]
+mod integral_scratch;
+use integral_scratch::{integral_shared_with_scratch, integral_with_scratch, IntegralScratch};
 fn sum(values: &[I], p: u32) -> Result<I> {
     for v in values {
         v.validate()?;
@@ -92,6 +95,7 @@ fn validate_table(nodes: &[Float], weights: &[Float]) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Result<[I; 3]> {
     validate_table(nodes, weights)?;
     let one = I::from_i64(1, p);
@@ -197,6 +201,7 @@ fn prepare_shared_rule(l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Res
         _reservation: reservation,
     })
 }
+#[cfg(test)]
 fn integral_shared(n: usize, nodes: &[Float], rule: &SharedRule, p: u32) -> Result<[I; 3]> {
     let SharedRule {
         one, two, half, pi, ..
@@ -313,6 +318,9 @@ fn rounding_enclosure(v: Float) -> Result<I> {
     hi.next_up();
     Ok(I::new(lo, hi)?)
 }
+#[path = "u_flow_checkpoints.rs"]
+mod partial;
+
 pub(super) fn evaluate(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -589,8 +597,10 @@ fn evaluate_with_checkpoint(
         bail!("invalid or unsupported u-flow source, precision, shape or resource request");
     }
     if let Some(resources) = xc_core::RunResources::current() {
+        let phase = partial::Phase::new("u-flow source and worker admission");
         let admission = admission::prepare(params, cfg, l, vector, reuse, event_batch, &resources)?;
         let (_fixed, output) = admission::reserve_fixed(&resources, &admission)?;
+        phase.finish();
         if admission.workers < rayon::current_num_threads() {
             xc_core::progress_message!(
                 "u-flow worker admission: {} -> {} workers; phase estimate={} bytes; same source, arithmetic and backend",
@@ -633,6 +643,7 @@ fn evaluate_on_pool(
     event_batch: usize,
     admission: Option<&admission::Admission>,
 ) -> Result<UFlowVelocityActions> {
+    let setup_phase = partial::Phase::new("u-flow exact source setup");
     let p = cfg.precision_bits;
     let n = params.n_modes;
     let base = vector
@@ -677,6 +688,7 @@ fn evaluate_on_pool(
         bytes + scratch,
         budget,
     )?;
+    setup_phase.finish();
     // Preserve source, execution-policy, and workspace admission before any
     // reuse. The checkpoint contains only fully resolved action vectors, never
     // a failed/partial action or the subsequent channel-solve result.
@@ -696,30 +708,41 @@ fn evaluate_on_pool(
         .transpose()?;
     let tables = {
         let plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique, p);
-        let _stage = crate::ccm::capture_runtime::Stage::new(format!(
+        let phase = partial::Phase::new(format!(
             "u-flow quadrature tables ({} unique, {}..{} points, {p} bits, {})",
             unique.len(),
             unique.first().copied().unwrap_or(0),
             unique.last().copied().unwrap_or(0),
             plan.label(),
         ));
-        xc_numerics::hp_runtime::map_gl_precompute_planned(&unique, plan, |points, schedule| {
-            xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
-                points,
-                p,
-                cfg.cache_mode,
-                schedule,
-            )
-            .map(|table| (points, table))
-        })
+        let tables = xc_numerics::hp_runtime::map_gl_precompute_planned(
+            &unique,
+            plan,
+            |points, schedule| {
+                xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
+                    points,
+                    p,
+                    cfg.cache_mode,
+                    schedule,
+                )
+                .map(|table| (points, table))
+            },
+        )
         .into_iter()
-        .collect::<std::result::Result<std::collections::HashMap<usize, Table>, _>>()?
+        .collect::<std::result::Result<std::collections::HashMap<usize, Table>, _>>()?;
+        phase.finish();
+        tables
     };
     drop(gl_reservation);
+    let partial_phase = partial::Phase::new("u-flow partial checkpoint source binding");
+    let partial_checkpoint =
+        partial::Partial::new(checkpoint, &orders, &tables, event_batch, budget);
+    partial_phase.finish();
     let events = super::super::try_prime_powers_up_to(params.lambda_sq_int())?;
     // Exact preparation is independent of the guard precision and prime event.
     // Keep the previous path if the extra preparation cannot be admitted.
     let prime_scratch = prime_response_kernel::workspace_bytes(vector.len(), base + 4096, true);
+    let coefficient_phase = partial::Phase::new("u-flow exact coefficient preparation");
     let coefficient_source = prime_response_kernel::CoefficientSource::new(
         &exact.values,
         n,
@@ -729,6 +752,7 @@ fn evaluate_on_pool(
             0
         },
     );
+    coefficient_phase.finish();
     // The order formula has one repeated prefix, then strictly increasing
     // orders. Sharing only that prefix bounds storage to one rule per guard.
     let shared_order = orders
@@ -738,7 +762,7 @@ fn evaluate_on_pool(
     for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
         let work = base + guard;
         let length = I::from_float(l, work)?;
-        let integral_stage = crate::ccm::capture_runtime::Stage::new(format!(
+        let integral_stage = partial::Phase::new(format!(
             "u-flow integrals (guard={guard}, work={work} bits, {} modes)",
             n + 1,
         ));
@@ -755,21 +779,24 @@ fn evaluate_on_pool(
             // existing failure order is preserved rather than reordered.
             prepare_shared_rule(&length, nodes, weights, work).ok()
         });
-        let integrals = (0..=n)
-            .into_par_iter()
-            .map(|mode| {
+        let integrals = partial::integrals(
+            partial_checkpoint.as_ref(),
+            work,
+            n + 1,
+            IntegralScratch::default,
+            |scratch, mode| {
                 let (nodes, weights) = &tables[&orders[mode]];
                 if shared_order == Some(orders[mode]) {
                     if let Some(rule) = &shared {
-                        return integral_shared(mode, nodes, rule, work);
+                        return integral_shared_with_scratch(mode, nodes, rule, work, scratch);
                     }
                 }
-                integral(mode, &length, nodes, weights, work)
-            })
-            .collect::<Result<Vec<_>>>()?;
+                integral_with_scratch(mode, &length, nodes, weights, work, scratch)
+            },
+        )?;
         drop(shared);
-        drop(integral_stage);
-        let assembly_stage = crate::ccm::capture_runtime::Stage::new(format!(
+        integral_stage.finish();
+        let assembly_stage = partial::Phase::new(format!(
             "u-flow pole and archimedean actions (guard={guard}, work={work} bits)"
         ));
         let poles = pole(&exact.values, n, &length, work)?;
@@ -788,13 +815,32 @@ fn evaluate_on_pool(
                 sum(&terms, work)
             })
             .collect::<Result<Vec<_>>>()?;
-        drop(assembly_stage);
-        let prime_stage = crate::ccm::capture_runtime::Stage::new(format!(
+        assembly_stage.finish();
+        let prime_stage = partial::Phase::new(format!(
             "u-flow prime actions (guard={guard}, work={work} bits, {} events)",
             events.len(),
         ));
         let mut primes = vec![I::from_i64(0, work); vector.len()];
-        for batch in events.chunks(event_batch) {
+        let mut next_event = 0;
+        if let Some(checkpoint) = &partial_checkpoint {
+            if let Some((next, saved)) =
+                checkpoint.prime_prefix(work, vector.len(), events.len(), event_batch)
+            {
+                next_event = next;
+                primes = saved;
+                xc_core::progress_message!(
+                    "u-flow prime prefix: reused {next_event}/{} events at {work} bits",
+                    events.len()
+                );
+            }
+        }
+        for batch in events[next_event..].chunks(event_batch) {
+            let batch_stage = partial::Phase::batch(format!(
+                "u-flow prime batch {}..{} of {} (work={work} bits)",
+                next_event,
+                next_event + batch.len(),
+                events.len()
+            ));
             let actions = if reuse {
                 let pairs = batch
                     .iter()
@@ -846,8 +892,16 @@ fn evaluate_on_pool(
                     }
                 }
             }
+            next_event += batch.len();
+            // The accumulated directed intervals are stored only after every
+            // event in this canonical prefix completed. Never checkpoint a
+            // partially applied batch or a failed GPU execution.
+            if let Some(checkpoint) = &partial_checkpoint {
+                checkpoint.save_prime(work, next_event, &primes)?;
+            }
+            batch_stage.finish();
         }
-        drop(prime_stage);
+        prime_stage.finish();
         let mut pole_out = Vec::with_capacity(vector.len());
         let mut arch_out = pole_out.clone();
         let mut prime_out = pole_out.clone();
@@ -983,11 +1037,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .path();
-            let payload = std::fs::read_dir(key_dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .find(|path| path.extension().is_none())
-                .unwrap();
+            let payload = key_dir.join(ContentDigest::sha256(b"u-flow-velocity-actions").0);
             let mut bytes = std::fs::read(&payload).unwrap();
             bytes[0] = b'!';
             std::fs::write(&payload, bytes).unwrap();
@@ -1004,6 +1054,161 @@ mod tests {
             assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before + 2);
             drop(occupied);
             assert_eq!(resources.usage().working_bytes, 0);
+        });
+    }
+
+    #[test]
+    fn uflow_partial_prime_interruption_resumes_exact_full_actions() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::new(1 << 30).unwrap();
+            let _scope = resources.enter();
+            let (params, cfg, l, vector, semantic) = checkpoint_fixture();
+            let reference = evaluate_with_reuse(&params, &cfg, &l, &vector, false).unwrap();
+            let directory = xc_core::test_support::TestDir::new("u-flow-partial-prime-restart");
+            let store = crate::ccm::capture_runtime::Checkpoints::local(
+                &action_checkpoint_identity(&params, &cfg, &l, &vector, &semantic),
+                directory.to_path_buf(),
+            )
+            .unwrap();
+            partial::STOP_AFTER_PRIME.with(|value| value.set(1));
+            let interrupted =
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store));
+            partial::STOP_AFTER_PRIME.with(|value| value.set(0));
+            assert!(
+                format!("{:#}", interrupted.err().expect("interruption expected"))
+                    .contains("injected interruption")
+            );
+            assert!(
+                load_action_checkpoint(&store, vector.len(), cfg.precision_bits, 1 << 30).is_none()
+            );
+            partial::COMPUTED_PRIME_BATCHES.with(|value| value.set(0));
+            let resumed =
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).unwrap();
+            assert_eq!(
+                partial::COMPUTED_PRIME_BATCHES.with(std::cell::Cell::get),
+                0,
+                "complete prime prefix was recomputed"
+            );
+            let expected =
+                serde_json::to_vec(&ActionCheckpoint::encode(&reference, cfg.precision_bits))
+                    .unwrap();
+            let actual =
+                serde_json::to_vec(&ActionCheckpoint::encode(&resumed, cfg.precision_bits))
+                    .unwrap();
+            assert_eq!(actual, expected);
+            eprintln!(
+                "u-flow partial restart: exact full four-channel action payload sha256={}",
+                ContentDigest::sha256(&actual).0
+            );
+        });
+    }
+
+    #[test]
+    fn uflow_partial_mid_prime_restart_computes_only_remaining_batches() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::new(1 << 30).unwrap();
+            let _scope = resources.enter();
+            let (_, cfg, _, _, semantic) = checkpoint_fixture();
+            let params = CcmParams::from_lambda_sq_integer(13, 3);
+            let l = Float::with_val(128, 13).ln();
+            let vector = (0..7)
+                .map(|k| Float::with_val(128, k - 2) / (k + 3))
+                .collect::<Vec<_>>();
+            // Exercise the production loop's explicit batch argument without
+            // changing process-wide environment in the parallel test runner.
+            let batch = event_batch_size(Some("2")).unwrap();
+            let events = super::super::super::try_prime_powers_up_to(params.lambda_sq_int())
+                .unwrap();
+            assert!(events.len() > batch * 2);
+            let reference = evaluate_with_reuse(&params, &cfg, &l, &vector, false).unwrap();
+            let expected =
+                serde_json::to_vec(&ActionCheckpoint::encode(&reference, cfg.precision_bits))
+                    .unwrap();
+            drop(reference);
+            let identity = action_checkpoint_identity(&params, &cfg, &l, &vector, &semantic);
+            let directory = xc_core::test_support::TestDir::new("u-flow-mid-prime-restart");
+            let fresh_store = crate::ccm::capture_runtime::Checkpoints::local(
+                &identity,
+                directory.join("fresh"),
+            )
+            .unwrap();
+            partial::COMPUTED_PRIME_BATCHES.with(|value| value.set(0));
+            let fresh = evaluate_on_pool(
+                &params,
+                &cfg,
+                &l,
+                &vector,
+                true,
+                Some(&fresh_store),
+                batch,
+                None,
+            )
+            .unwrap();
+            let cold_batches = partial::COMPUTED_PRIME_BATCHES.with(std::cell::Cell::get);
+            assert!(cold_batches > 1);
+            assert_eq!(
+                serde_json::to_vec(&ActionCheckpoint::encode(&fresh, cfg.precision_bits))
+                    .unwrap(),
+                expected
+            );
+            drop(fresh);
+            let store = crate::ccm::capture_runtime::Checkpoints::local(
+                &identity,
+                directory.join("interrupted"),
+            )
+            .unwrap();
+            partial::COMPUTED_PRIME_BATCHES.with(|value| value.set(0));
+            partial::STOP_AFTER_PRIME.with(|value| value.set(batch));
+            let interrupted = evaluate_on_pool(
+                &params,
+                &cfg,
+                &l,
+                &vector,
+                true,
+                Some(&store),
+                batch,
+                None,
+            );
+            partial::STOP_AFTER_PRIME.with(|value| value.set(0));
+            assert!(
+                format!("{:#}", interrupted.err().expect("interruption expected"))
+                    .contains("injected interruption")
+            );
+            assert_eq!(partial::COMPUTED_PRIME_BATCHES.with(std::cell::Cell::get), 1);
+            assert!(
+                load_action_checkpoint(&store, vector.len(), cfg.precision_bits, 1 << 30).is_none()
+            );
+            partial::COMPUTED_PRIME_BATCHES.with(|value| value.set(0));
+            let resumed = evaluate_on_pool(
+                &params,
+                &cfg,
+                &l,
+                &vector,
+                true,
+                Some(&store),
+                batch,
+                None,
+            )
+            .unwrap();
+            let remaining = partial::COMPUTED_PRIME_BATCHES.with(std::cell::Cell::get);
+            assert!(remaining > 0 && remaining < cold_batches);
+            assert_eq!(remaining + 1, cold_batches);
+            let actual =
+                serde_json::to_vec(&ActionCheckpoint::encode(&resumed, cfg.precision_bits))
+                    .unwrap();
+            assert_eq!(actual, expected);
+            eprintln!(
+                "u-flow mid-prime restart: cold_batches={cold_batches}; resumed_batches={remaining}; exact four-channel payload sha256={}",
+                ContentDigest::sha256(&actual).0
+            );
         });
     }
 

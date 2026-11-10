@@ -2,6 +2,10 @@ use std::env;
 use std::path::Path;
 use std::process::Command;
 
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn valid_git_revision(value: &str) -> bool {
     value.len() == 40
         && value
@@ -131,7 +135,10 @@ fn source_tree_digest(manifest_dir: &Path) {
         h.update(bytes);
     }
 
-    println!("cargo:rustc-env=XC_SOURCE_TREE_DIGEST={:x}", h.finalize());
+    println!(
+        "cargo:rustc-env=XC_SOURCE_TREE_DIGEST={}",
+        hex_lower(&h.finalize())
+    );
 }
 
 fn main() {

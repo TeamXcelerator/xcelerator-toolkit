@@ -523,6 +523,13 @@ fn quadrature_provider_exact_supported_visits() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    expect(
+        clippy::useless_conversion,
+        reason = "C long is i32 on Windows but i64 on LP64 targets; preserve portable MPFR range conversions"
+    )
+)]
 fn quadrature_provider_thread_range_fallback() {
     const NAME: &str =
         "distance::hp::quadrature_provider::tests::quadrature_provider_thread_range_fallback";

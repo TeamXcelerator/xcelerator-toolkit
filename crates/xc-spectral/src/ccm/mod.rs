@@ -306,6 +306,10 @@ pub fn try_prime_powers_up_to(bound: u64) -> Result<Vec<(u64, u64, u32)>> {
 /// (gamma-factor) contribution W_R of the Weil quadratic form. Quoted
 /// at full precision for documentation; f64 rounds to its nearest value.
 #[allow(clippy::excessive_precision)]
+#[expect(
+    clippy::approx_constant,
+    reason = "retain the established numerical source literal across the compiler upgrade"
+)]
 pub const EULER_GAMMA: f64 = 0.5772156649015328606;
 
 /// Numerical zero threshold for eigenvector sum normalization.
@@ -1067,6 +1071,10 @@ pub mod state_geometry;
 
 #[cfg(feature = "hp")]
 pub mod retained_evidence;
+
+/// Explicit opt-in post-acquisition finite comparisons; never enabled by Ultra.
+#[cfg(feature = "hp")]
+pub mod explicit_cohort;
 
 /// Additional retained-source observations and external runtime research inputs.
 #[cfg(feature = "hp")]

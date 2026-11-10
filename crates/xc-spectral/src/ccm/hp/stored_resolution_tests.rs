@@ -654,7 +654,10 @@ fn read_only_source_preserves_explicit_solver_routes_without_creating_cache() {
 fn guarded_krylov_matches_exact_hadamard_spectrum_at_unchanged_tolerances() {
     let p = 131;
     let work = krylov_working_precision(4, 4, p).unwrap();
-    assert!(krylov_working_precision(100_000, 4, p).is_err());
+    // Precision is semantic and independent of the producer's resource budget.
+    // The separate admission check must still refuse this oversized solve.
+    assert_eq!(krylov_working_precision(100_000, 4, p).unwrap(), work);
+    assert!(krylov_working_precision_with_budget(100_000, 4, p, 8u128 << 30).is_err());
     assert_eq!(
         krylov_working_precision(4, 4, 1_000_000).unwrap(),
         1_000_000

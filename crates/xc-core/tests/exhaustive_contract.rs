@@ -150,7 +150,7 @@ fn fingerprint() -> ExecutionFingerprint {
 }
 fn digest_json(value: &Value) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
+    xc_core::hex_lower(&Sha256::digest(serde_json::to_vec(value).unwrap()))
 }
 #[test]
 fn reduction_import_rechecks_required_scalar_fields_after_hash_replay() {

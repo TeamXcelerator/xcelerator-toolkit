@@ -36,6 +36,13 @@ pub const BUNDLED_ZETA_ZEROS_JSON: &[u8] = include_bytes!("../data/zeta_zeros_10
 pub const BUNDLED_ZETA_ZEROS_SHA256: &str =
     "115889b81ba4a42bdb858ffb0167a8e1d0689c514a57192a3640784bd3bd26de";
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Stable provenance for a reference-zero dataset used as an explicit solver
 /// input.  Comparison-only callers need not construct this record; seeded
 /// numerical APIs require it so the seed source participates in artifact
@@ -67,7 +74,7 @@ impl ReferenceZeroDatasetIdentity {
 /// Returns content-bound provenance for the toolkit-owned zero table.
 pub fn bundled_dataset_identity() -> Result<ReferenceZeroDatasetIdentity> {
     let records: Vec<String> = serde_json::from_slice(BUNDLED_ZETA_ZEROS_JSON)?;
-    let content_sha256 = format!("{:x}", Sha256::digest(BUNDLED_ZETA_ZEROS_JSON));
+    let content_sha256 = sha256_hex(BUNDLED_ZETA_ZEROS_JSON);
     if content_sha256 != BUNDLED_ZETA_ZEROS_SHA256 {
         return Err(anyhow!(
             "bundled reference-zero bytes differ from the pinned dataset"
@@ -188,7 +195,7 @@ mod tests {
     fn bundled_reference_bytes_match_pinned_provenance() {
         use super::*;
         assert_eq!(
-            format!("{:x}", Sha256::digest(BUNDLED_ZETA_ZEROS_JSON)),
+            sha256_hex(BUNDLED_ZETA_ZEROS_JSON),
             BUNDLED_ZETA_ZEROS_SHA256
         );
         assert_eq!(

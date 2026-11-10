@@ -1,5 +1,137 @@
 # Release notes
 
+## 0.17.1 (2026-11-11)
+
+### Optional retained-source diagnostics
+
+Explicit cohorts compare authenticated retained eigenvalues, states and selected
+root points without opening matrix payloads during numerical comparison. Selected embedded-state residuals
+open only the required larger matrix. Reports retain parameter and quadrature
+changes, missing roots and unresolved branch identification. Cohorts never run
+automatically, including with Ultra; omitted extensions are not incomplete.
+Their reports use a new semantic identity in the existing private diagnostic
+family. Publication staging can separately read dependency payloads when encoded
+transport is unavailable. See [explicit cohorts](CCM_EXPLICIT_COHORTS.md).
+
+### Compact sector-gap certificates
+
+An explicit compact analytic certificate API retains exact scalar assertions,
+configuration, source identity and reconstruction hashes without permanently
+storing the two dense interval matrices or pivot traces. Its independent
+verifier freshly reconstructs the analytic matrix and proves the recorded
+inertia counts. Managed production stages only the compact record under a
+distinct semantic identity in the existing certificate family. Existing full
+certificate readers and claim capture routes remain available. The optional
+compact capture builder now connects actual compact identities to source-error,
+transform and finite-root-budget consumers through verified reconstruction;
+its end-to-end qualification is recorded separately from the API-only tests. See
+[compact sector certificates](CCM_COMPACT_SECTOR_CERTIFICATES.md). This work is
+additive; no existing artifact migration is required or performed.
+
+Internal consumers share a verified immutable reconstruction within a run,
+binding its exact certificate and MPFR exponent context. Every returned handle
+owns its resident allocation charge; independent public verification still
+reconstructs afresh. Certified root-budget work uses checked dimensions and
+resource admission instead of the former N<=512 gate, with unchanged arithmetic
+and the existing 256-window limit. The larger-N control checks the numerical
+kernel and source rejection at N=513; it is not a large-N analytic campaign or
+a complete-spectrum ordinal certificate.
+
+### U-flow maintenance
+
+U-flow reuses MPFR integral term storage and directed root geometry across
+response channels while retaining the original operation order, guard ladder,
+and validation gates. Private restart records retain completed integral blocks
+and prime-event batch prefixes; they bind exact sources, loaded quadrature,
+build, precision, and execution policy. Invalid or unavailable optional records
+fall back to the original computation. Refresh and higher-assurance replay
+bypass partial records. Scientific artifact formats and identities are unchanged.
+
+Phase logs distinguish completed and incomplete exits. Optional
+`XC_RESPONSE_TIMING=1` separates GPU row preparation, contraction including host
+work, and finishing. Neither timing nor execution checkpoints enter scientific
+payloads. See [response performance](CCM_RESPONSE_PERFORMANCE.md). These changes
+passed local native Windows qualification, including exact managed-artifact
+replay against the preceding published v0.17.1 source.
+
+Additional locally qualified maintenance enables the opt-in GL root schedule only for
+the verified native Windows x64 GNU/UCRT/Arb lane, with native-library and
+MPFR context checks. GPU response finishing uses bounded independent row
+workers with charged fallback scratch and canonical error selection. Capacity
+refusal retains serial finishing of the completed contraction. Arithmetic,
+artifact formats, dependency versions, and the default GL policy are unchanged.
+Native Windows CPU/CUDA replays preserve 30 intact managed artifacts byte for
+byte. These bounded checks and phase benchmarks do not establish a universal
+speedup or replace whole-claim qualification.
+
+### Native Windows and compatible dependencies
+
+Native Windows x64 high precision uses a coherent UCRT toolchain, without WSL
+or a Linux container. The native environment selects the matching GNU Rust/C
+host, GMP/MPFR, FLINT headers, linker paths, and DLLs. Both C bridges share an
+explicit prefix. The executed MPFR TLS probe checks header/runtime versions
+and uses the correct Windows executable name. Every numerical spectral Arb
+entry checks loaded library versions, object sizes, TLS, and the calling
+thread's MPFR exponent context before sharing native objects. The Windows
+bootstrap pins native package/signature hashes and verifies the selected
+compiler/runtime dependency graph. See [Windows setup](WINDOWS.md).
+
+Rust is pinned to stable 1.99.1, with MSRV 1.99. Dependency maintenance is
+selective: nalgebra remains exactly 0.33.3 with matrixmultiply 0.3.10, and archive encoding retains ZIP
+2.4.2, flate2 1.1.9 and miniz_oxide 0.8.9. The newer eigensolver changes
+arithmetic; switching compression backends changes encoded bytes. Neither
+change is necessary for native Windows. Existing V1/V2 profiles and reader
+floors remain in use; this release introduces no archive-format migration.
+
+SHA-2 0.11 and getrandom 0.4 are updated. Rug remains at 1.30; the qualified
+Windows native libraries are GMP 6.3.0, MPFR 4.2.2, and FLINT 3.6.0.
+SHA-256 formatting and streamed JSON adapters preserve input
+bytes, framing and lowercase digests. The native port retains HP arithmetic
+policies, source digests, rounding and mathematical artifact identities.
+
+The bounded Linux 0.17.0 / native Windows 0.17.1 comparison matches 591 portable
+HP scalars, mathematical JSON bytes, and complete deterministic ZIP bytes
+exactly. Scalar coverage reaches 23,284 bits. The C=13, N=8, p=192 CCM run
+also produces eleven byte-identical managed-cache object ZIPs from independent
+empty caches. A separate C=13, N=80, p=3386 comparison at approximately 1,000
+decimal digits reproduces all 26,367 scalar fields of the matrix, eigenpair,
+and independently discovered first root. Its mathematical JSON, aggregate ZIP,
+and eleven managed-cache object ZIPs are also byte-identical. Two larger
+retained quadrature packages re-encode to their original bytes. This is exact
+tested equality, not a claim of exhaustive cross-platform equality for every
+input or binary64 transcendental function.
+
+Source/target-bound execution checkpoints retain their existing platform
+binding. Historical artifacts keep their original producer metadata and
+package digests. A new package version does not authorize relabeling or
+replacing existing research evidence. The experimental parallel-GL-root
+policy supports native Linux and the qualified Windows lane described above.
+Native performance versus WSL requires a matched benchmark.
+
+Retained-source utilities expose authenticated root-only recovery and exact
+finite-window movable-root counts, including zero counts. Root-only recovery
+inherits the original matrix and ground-selection evidence; it does not replay
+those proofs or improve assembly accuracy. Window counts explicitly exclude
+carrier zeros, stored poles, endpoints, and roots outside the declared window.
+
+Performance maintenance in this release reuses high-precision Krylov scratch
+storage and batches independent vector work according to precision, vector
+length, and the available worker pool. Product rounding and ordered summation
+are preserved. Optional `XC_KRYLOV_TIMING=1` reports solver phase costs separately
+from numerical results. These timers do not enter artifact identities.
+
+Private restart checkpoints preserve completed prime-power response events
+after their numerical gates, so a restart can reuse a completed prefix. They
+bind the build, exact sources, precision, and execution policy; invalid or
+unavailable checkpoints cause recomputation. Explicit refresh and validation
+runs do not use these event checkpoints. Scientific payload formats and
+assurance levels are unchanged.
+
+Git pushes dominated by compressed artifact parts avoid a second compression
+pass. Ordinary metadata pushes retain Git's normal compression and automatic
+thread selection. This changes transport packing only: artifact ZIPs, Git
+blobs, trees, commits, and destination verification remain unchanged.
+
 ## 0.17.0 (2026-10-19)
 
 U-flow admits a stage worker pool from live retained and working reservations,

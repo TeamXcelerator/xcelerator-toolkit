@@ -4,6 +4,7 @@ use super::retained_evidence::{
     managed, matrix_ancestry, point, precision, scalar, solve_gram_checked, transform,
     transform_math, ResearchRecord, RetainedMatrix, RetainedRoots,
 };
+use super::sector_gap_certificate::SectorGapCertificateRef;
 use super::state_geometry::RetainedState;
 use anyhow::{bail, Result};
 use rayon::prelude::*;
@@ -342,8 +343,9 @@ impl ExternalResearchInputs {
             },
             self,
         )?;
-        let key = ContentDigest(format!("{:x}", hash.finalize()));
-        let content = content_validation_key(&ContentDigest(format!("{:x}", content.finalize())));
+        let key = ContentDigest(xc_core::hex_lower(&hash.finalize()));
+        let content =
+            content_validation_key(&ContentDigest(xc_core::hex_lower(&content.finalize())));
         if !VALIDATED_INPUTS.with(|memo| memo.borrow().contains(&key)) {
             self.validate_values()?;
             remember_validated(key);
@@ -651,7 +653,7 @@ fn content_validation_key(digest: &ContentDigest) -> ContentDigest {
     hash.update(rug::float::exp_min().to_le_bytes());
     hash.update(rug::float::exp_max().to_le_bytes());
     hash.update(digest.0.as_bytes());
-    ContentDigest(format!("{:x}", hash.finalize()))
+    ContentDigest(xc_core::hex_lower(&hash.finalize()))
 }
 
 /// Remember a successful validation key (eight inputs, two keys each).
@@ -2466,6 +2468,33 @@ pub fn capture_extended_with_certificate(
     )
 }
 
+/// Capture using the actual full or compact certificate payload and manifest.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_extended_with_certificate_ref(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    input: Option<&ExternalResearchInputs>,
+    sector_certificate: Option<(SectorGapCertificateRef<'_>, &ArtifactManifest)>,
+    options: &ExtensionOptions,
+    parent_manifests: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
+    capture_extended_prepared_ref(
+        id,
+        s,
+        m,
+        roots,
+        input,
+        sector_certificate,
+        options,
+        parent_manifests,
+        cache,
+        None,
+    )
+}
+
 /// Claim of a look-ahead result for the computation step, given the
 /// effective options and whether the computation is plain (no roots,
 /// certificate, directional source or exceeded row budget).
@@ -2501,6 +2530,31 @@ pub(crate) fn extended_compute(
     directional_source: Option<&ExtendedAnalysis>,
     budget_exceeded: bool,
 ) -> Result<ExtendedAnalysis> {
+    extended_compute_with_certificate_ref(
+        id,
+        s,
+        m,
+        roots,
+        options,
+        input,
+        run_certificate.map(SectorGapCertificateRef::Full),
+        directional_source,
+        budget_exceeded,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extended_compute_with_certificate_ref(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    options: &ExtensionOptions,
+    input: Option<&ExternalResearchInputs>,
+    run_certificate: Option<SectorGapCertificateRef<'_>>,
+    directional_source: Option<&ExtendedAnalysis>,
+    budget_exceeded: bool,
+) -> Result<ExtendedAnalysis> {
     let _stage = super::capture_runtime::Stage::new(format!("{id} compute"));
     if budget_exceeded {
         return Ok(unresolved(
@@ -2520,9 +2574,31 @@ pub(crate) fn extended_compute(
         "spectral_cluster" => cluster(s, m, options, input),
         "resolution_budget" => resolution(s, roots, options, input),
         "energy_allowance" => allowance(s, options, input),
-        _ if super::research_completion::DIAGNOSTICS.contains(&id) => {
-            super::research_completion::analyze(id, s, m, roots, options, input, run_certificate)
-        }
+        _ if super::research_completion::DIAGNOSTICS.contains(&id) => match run_certificate {
+            Some(SectorGapCertificateRef::Compact(_)) => {
+                super::research_completion::analyze_with_certificate_ref(
+                    id,
+                    s,
+                    m,
+                    roots,
+                    options,
+                    input,
+                    run_certificate,
+                )
+            }
+            full => super::research_completion::analyze(
+                id,
+                s,
+                m,
+                roots,
+                options,
+                input,
+                full.and_then(|c| match c {
+                    SectorGapCertificateRef::Full(c) => Some(c),
+                    _ => None,
+                }),
+            ),
+        },
         _ => {
             super::convergence_capture::analyze(id, s, m, roots, options, input, directional_source)
         }
@@ -2553,6 +2629,34 @@ pub(crate) fn capture_extended_prepared(
         &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
         &ArtifactManifest,
     )>,
+    options: &ExtensionOptions,
+    parent_manifests: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+    prepared: Option<ExtendedPrepared<'_>>,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
+    capture_extended_prepared_ref(
+        id,
+        s,
+        m,
+        roots,
+        input,
+        sector_certificate.map(|(c, m)| (SectorGapCertificateRef::Full(c), m)),
+        options,
+        parent_manifests,
+        cache,
+        prepared,
+    )
+}
+
+/// Prepared capture with representation-aware, digest-bound source admission.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_extended_prepared_ref(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    input: Option<&ExternalResearchInputs>,
+    sector_certificate: Option<(SectorGapCertificateRef<'_>, &ArtifactManifest)>,
     options: &ExtensionOptions,
     parent_manifests: &[ArtifactManifest],
     cache: &ArtifactCacheContext<'_>,
@@ -2607,10 +2711,7 @@ fn capture_extended_prepared_with_transform_guard(
     m: Option<&RetainedMatrix<'_>>,
     roots: Option<&RetainedRoots>,
     input: Option<&ExternalResearchInputs>,
-    sector_certificate: Option<(
-        &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
-        &ArtifactManifest,
-    )>,
+    sector_certificate: Option<(SectorGapCertificateRef<'_>, &ArtifactManifest)>,
     options: &ExtensionOptions,
     parent_manifests: &[ArtifactManifest],
     cache: &ArtifactCacheContext<'_>,
@@ -2671,13 +2772,27 @@ fn capture_extended_prepared_with_transform_guard(
             if manifest.key.kind != "ccm_sector_gap_certificate" {
                 bail!("sector-gap certificate object does not match its manifest");
             }
-            let Some(admitted) =
-                super::sector_gap_certificate::AdmittedCertificate::bind(certificate, manifest)?
-            else {
-                bail!("sector-gap certificate object does not match its manifest");
+            let admitted = match certificate {
+                SectorGapCertificateRef::Full(certificate) => {
+                    let Some(admitted) = super::sector_gap_certificate::AdmittedCertificate::bind(
+                        certificate,
+                        manifest,
+                    )?
+                    else {
+                        bail!("sector-gap certificate object does not match its manifest");
+                    };
+                    Some(admitted)
+                }
+                SectorGapCertificateRef::Compact(certificate) => {
+                    if ContentDigest::sha256_finite_json(certificate)? != manifest.content_digest {
+                        bail!("compact sector-gap certificate object does not match its manifest");
+                    }
+                    certificate.validate_structure()?;
+                    None
+                }
             };
             sources.push(manifest.clone());
-            (Some(certificate), Some(admitted))
+            (Some(certificate), admitted)
         }
         _ => (None, None),
     };
@@ -3001,6 +3116,10 @@ fn capture_extended_prepared_with_transform_guard(
         }
         if let (Some((_, manifest)), Some(_)) = (sector_certificate, run_certificate) {
             request["run_sector_certificate"] = json!(manifest.content_digest);
+            if matches!(run_certificate, Some(SectorGapCertificateRef::Compact(_))) {
+                request["run_sector_certificate_representation"] =
+                    json!("compact_analytic_replay_v1");
+            }
         }
         request
     };
@@ -3036,7 +3155,7 @@ fn capture_extended_prepared_with_transform_guard(
             let _stage = super::capture_runtime::Stage::new("signed_transform compute");
             return signed_transforms(s, options, input, maximum_transform_guard);
         }
-        extended_compute(
+        extended_compute_with_certificate_ref(
             id,
             s,
             m,

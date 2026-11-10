@@ -147,7 +147,7 @@ impl OperatorErrorEvidenceHp {
         let a = allowance(&application_error)?;
         let b = metric_application_error
             .as_ref()
-            .map(&allowance)
+            .map(allowance)
             .transpose()?
             .unwrap_or_else(|| Some(Float::with_val(precision, 0)));
         let mut maximum = None;

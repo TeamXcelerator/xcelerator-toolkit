@@ -35,6 +35,10 @@ fn metadata_retention_limit(resources: &ResourcePolicy) -> u64 {
 
 /// Reuse only bytes read from the exact repository/revision/path tuple. A hit
 /// still passes caller limits, cancellation, and the requested serde decoder.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the exact transport identity, resource limits, and cancellation boundary remain explicit"
+)]
 fn read_cached_metadata_json<T: serde::de::DeserializeOwned>(
     remote: &dyn RemoteGitStore,
     documents: &Mutex<MetadataDocumentCache>,

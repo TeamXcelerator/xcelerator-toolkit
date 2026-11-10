@@ -72,10 +72,13 @@ For cold Gauss--Legendre measurements, the `scheduling` field distinguishes
 `table_parallel_root_serial`, `table_serial_planned_roots`, and
 `table_serial_root_serial`. Root-level scheduling is opt-in through the
 default-false `HpRuntimePolicy::parallel_gl_roots` field, is recorded in the
-execution fingerprint, and must be qualified on native Linux. It is not a
-supported WSL mode because concurrent GMP allocation has previously caused
-non-deterministic allocator failures there. The numerical runtime rejects this
-policy on WSL, Windows, and macOS before numerical work begins.
+execution fingerprint, and is supported on native Linux and the qualified
+native Windows x64 GNU/UCRT build with `arb`. Windows admission requires the
+build-established UCRT/TLS/version contract and runtime native-library/MPFR
+context checks. It is not a supported WSL mode because concurrent GMP
+allocation has previously caused nondeterministic allocator failures there.
+The numerical runtime rejects this policy on WSL, macOS, and Windows builds
+outside that qualified lane before numerical work begins.
 
 The default `false` policy value is omitted from serialized runtime policy, so
 existing provenance bytes and cache identities retain their established form.

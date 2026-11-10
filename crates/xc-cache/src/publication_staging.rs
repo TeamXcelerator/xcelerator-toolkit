@@ -939,7 +939,7 @@ pub(crate) fn verify_existing_file(
         }
         hasher.update(&buffer[..count]);
     }
-    let actual = ContentDigest(format!("{:x}", hasher.finalize()));
+    let actual = ContentDigest(xc_core::hex_lower(&hasher.finalize()));
     if &actual != expected_digest {
         return Err(CacheError::DigestMismatch {
             expected: expected_digest.to_string(),

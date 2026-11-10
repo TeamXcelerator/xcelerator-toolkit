@@ -250,7 +250,7 @@ where
             "encoded package must not be empty".to_owned(),
         ));
     }
-    let package_digest = ContentDigest(format!("{:x}", package_hasher.finalize()));
+    let package_digest = ContentDigest(xc_core::hex_lower(&package_hasher.finalize()));
     let unique_paths = ordered_parts
         .iter()
         .map(|part| &part.repository_path)

@@ -5,6 +5,41 @@ versioned semantic identities. An upgrade does not rewrite stored artifacts or
 establish the accuracy of an earlier experiment. The changes below apply to
 the library; applications must update their dependencies and rebuild to use them.
 
+## v0.17.1 native Windows and dependency updates
+
+The native Windows lane preserves the MPFR precision, directed rounding,
+source authentication, and existing high-precision arithmetic contracts. It
+does not reinterpret historical evidence as a new producer's output. Source
+and target bindings of execution checkpoints remain platform specific.
+
+The binary64 eigensolver retains nalgebra 0.33.3 and matrixmultiply 0.3.10. Archive encoding retains ZIP
+2.4.2, flate2 1.1.9 and miniz_oxide 0.8.9 with the existing V1/V2 profiles,
+fixed metadata and original reader floors. The platform port requires no new
+transport profile or numerical compatibility floor. New packages are checked
+against immutable earlier encoder fixtures, including exact package bytes.
+
+Release qualification compares the original Linux 0.17.0 / Rust 1.98.1 build
+with native Windows 0.17.1 / Rust 1.99.1. All 591 portable scalars, selected
+mathematical diagnostics, JSON bytes, and complete ZIP bytes agree exactly.
+The scalar precisions are 192, 729, 5,047, 6,708, and 23,284 bits. The complete
+CCM comparison is C=13, N=8, p=192, with eleven independently generated
+managed-cache object ZIPs also identical. Larger retained GL packages at
+orders 3,000 and 4,000 re-encode to their original complete archive bytes.
+
+A separate production-precision comparison uses C=13, N=80, p=3386
+(approximately 1,000 decimal digits). All 26,367 scalar fields of the full
+Tau matrix, eigenpair, and independently discovered first root agree exactly.
+The complete mathematical JSON, aggregate ZIP, and eleven independently
+generated managed-cache object ZIPs also match byte for byte.
+
+Exact comparisons establish the tested configurations, inputs and arithmetic
+policies. They are not a promise that every binary64 transcendental function
+returns the same bits across operating systems or compiler versions. The HP
+lane is qualified separately using fixed MPFR precision, rounding and arithmetic
+order. Producer/build provenance and execution timings remain truthful even
+when the mathematical payload and encoded package reproduce earlier bytes.
+See [cache encoding](CACHE_SCHEMA.md) and [Windows setup](WINDOWS.md).
+
 ## v0.17.0 retained-artifact compatibility
 
 Compatible 0.16.x artifacts remain reusable; this release does not require a

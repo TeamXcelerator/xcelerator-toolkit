@@ -40,6 +40,18 @@ One central compatibility policy supplies the minimum producer version, reader r
 
 Toolkit 0.16.0 restarted the artifact repositories from a clean slate and sets the producer and reader floor of every managed family and kind to 0.16.0 (`CLEAN_SLATE`). Artifacts produced by earlier releases are misses and are recomputed, and readers released before 0.16.0 refuse 0.16.0 artifacts instead of misreading their changed formats. Each new manifest records at least its kind's reader floor. Floors named in the version-specific sections below are historical.
 
+Toolkit 0.17.1 retains the V1 single-item and V2 multi-item transport profiles:
+ZIP 2.4.2, flate2 1.1.9 and miniz_oxide 0.8.9 at level 6, fixed timestamps,
+Unix creator metadata and mode 0644. These writer settings also apply on
+native Windows. No new transport profile or reader-floor increase is required.
+Immutable encoder fixtures check both decoding and exact re-encoding bytes.
+
+The compressor is selected explicitly. Cargo features unify across consumers;
+adding another flate2 backend changes the encoder graph and is outside this
+profile. Preserve the locked dependency graph and resolved features when
+reproducing package bytes. Source authentication, canonical payload validation
+and immutable transport checks continue to apply.
+
 Publication is producer-version monotonic for each semantic identity. Before payload upload, the publisher reads the current shard index and rejects an incoming producer older than any active discoverable producer. The atomic discoverability phase repeats the check against the latest repository head, closing the concurrent-publication race. Newer producers may publish alongside immutable older history; consumers order compatible candidates by producer version first and assurance second. Revoked or quarantined entries do not block a replacement.
 
 Certificates, validation reports, and publication-ready exports are separate ordinary artifacts. A canonical `ArtifactLinkSet` attaches any number of their exact semantic, manifest, and payload identities to a numerical subject without embedding report bytes in its payload or changing the subject identity. Link roles and identities are uniquely ordered and digest-bound.

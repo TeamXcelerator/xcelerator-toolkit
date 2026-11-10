@@ -292,10 +292,9 @@ pub(crate) fn records_digest(records: &[ExactRationalIntervalRecord]) -> Result<
 /// `ContentDigest::sha256(&serde_json::to_vec(value)?)`, hashing the same
 /// bytes as they are written instead of buffering them.
 fn json_digest(value: &impl serde::Serialize) -> Result<ContentDigest> {
-    use sha2::{Digest, Sha256};
-    let mut hash = Sha256::new();
-    serde_json::to_writer(&mut hash, value)?;
-    Ok(ContentDigest(format!("{:x}", hash.finalize())))
+    Ok(ContentDigest(xc_core::hex_lower(&xc_core::sha256_json(
+        value,
+    )?)))
 }
 
 /// What a sector certificate binds of one validated cutoff-free assembly:

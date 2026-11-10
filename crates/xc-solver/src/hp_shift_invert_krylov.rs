@@ -3,8 +3,12 @@ use super::{
     ShiftInvertFactorizationDescriptorHp, ShiftInvertSolveHp, SolverError,
 };
 use rayon::prelude::*;
-use rug::{ops::Pow, Assign, Float};
+use rug::{
+    ops::{NegAssign, Pow},
+    Assign, Float,
+};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 use xc_core::{
     AssuranceLevel, CancellationToken, DecimalLiteral, EigenTarget, ResultStatus, SolverProvenance,
     TerminationReason,
@@ -103,6 +107,83 @@ struct RitzState {
     target_distance: Float,
 }
 
+/// Optional operational telemetry, intentionally absent from numerical reports
+/// and managed artifacts. The phases partition this call's wall time; visits
+/// count entries into each phase, not arithmetic operations or CPU seconds.
+struct KrylovTimings {
+    enabled: bool,
+    started: Instant,
+    phase_started: Instant,
+    phase: usize,
+    elapsed: [Duration; 8],
+    visits: [usize; 8],
+    dimension: usize,
+    precision: u32,
+}
+
+impl KrylovTimings {
+    fn new(dimension: usize, precision: u32) -> Self {
+        let started = Instant::now();
+        Self {
+            enabled: std::env::var_os("XC_KRYLOV_TIMING").is_some_and(|v| v == "1"),
+            started,
+            phase_started: started,
+            phase: 0,
+            elapsed: [Duration::ZERO; 8],
+            visits: [1, 0, 0, 0, 0, 0, 0, 0],
+            dimension,
+            precision,
+        }
+    }
+
+    fn enter(&mut self, phase: usize) {
+        if self.enabled {
+            let now = Instant::now();
+            self.elapsed[self.phase] += now.duration_since(self.phase_started);
+            self.phase_started = now;
+            self.phase = phase;
+            self.visits[phase] += 1;
+        }
+    }
+}
+
+impl Drop for KrylovTimings {
+    fn drop(&mut self) {
+        if self.enabled {
+            let now = Instant::now();
+            self.elapsed[self.phase] += now.duration_since(self.phase_started);
+            const PHASES: [&str; 8] = [
+                "setup",
+                "basis_and_orthogonalization",
+                "shifted_applications",
+                "projected_matrix",
+                "projected_eigensolve",
+                "ritz_construction",
+                "operator_residual_validation",
+                "source_and_report_validation",
+            ];
+            let phases = PHASES
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    format!(
+                        "{name}={:.6}s/{} visits",
+                        self.elapsed[i].as_secs_f64(),
+                        self.visits[i]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            xc_core::progress_message!(
+                "[HP Krylov timing] dimension={}, precision={} bits; wall={:.6}s; {phases}",
+                self.dimension,
+                self.precision,
+                now.duration_since(self.started).as_secs_f64()
+            );
+        }
+    }
+}
+
 fn zero(precision: u32) -> Float {
     Float::with_val(precision, 0)
 }
@@ -125,41 +206,91 @@ fn parse_positive(
     super::hp_positive_threshold(value, precision, name, rug::float::Round::Down)
 }
 
-/// Vectors at least this long form their products and element updates in
-/// parallel. Each product or update is the same single correctly rounded
-/// operation either way, and sums are always added serially in index order,
-/// so the result is bit-identical at every thread count.
-const PARALLEL_LENGTH: usize = 32;
-
-fn dot(left: &[Float], right: &[Float], precision: u32) -> Float {
-    let product = |(left, right): (&Float, &Float)| {
-        let mut product = Float::with_val(precision, left);
-        product *= right;
-        product
-    };
-    let products: Vec<Float> = if left.len().min(right.len()) >= PARALLEL_LENGTH {
-        left.par_iter().zip(right.par_iter()).map(product).collect()
-    } else {
-        left.iter().zip(right).map(product).collect()
-    };
-    let mut sum = zero(precision);
-    for product in products {
-        sum += product;
-    }
-    sum
+/// Enough work per task to amortize the scheduler, with no worker-count cap.
+/// Higher precision admits smaller chunks; a large vector is still shared
+/// across the caller's entire Rayon pool. This changes only placement, never
+/// arithmetic order. The limb estimate is a scheduling heuristic, not memory
+/// admission or a claim about the cost of MPFR multiplication.
+fn element_chunk_length(length: usize, precision: u32) -> usize {
+    let limbs = (precision as usize).div_ceil(64).max(1);
+    let minimum_work = 4096usize.div_ceil(limbs).max(16);
+    let pool_grain = length.div_ceil(rayon::current_num_threads().saturating_mul(2).max(1));
+    minimum_work.max(pool_grain)
 }
 
-/// Apply `update` to every element, in parallel for long vectors.
-fn for_each_element(values: &mut [Float], update: impl Fn(usize, &mut Float) + Sync + Send) {
-    if values.len() >= PARALLEL_LENGTH {
-        values
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(index, value)| update(index, value));
-    } else {
-        for (index, value) in values.iter_mut().enumerate() {
-            update(index, value);
+#[derive(Default)]
+struct DotWorkspace {
+    products: Vec<Float>,
+}
+
+impl DotWorkspace {
+    fn serial_dot(left: &[Float], right: &[Float], precision: u32) -> Float {
+        let mut sum = zero(precision);
+        let mut product = zero(precision);
+        for (left, right) in left.iter().zip(right) {
+            product.assign(left);
+            product *= right;
+            sum += &product;
         }
+        sum
+    }
+
+    /// Retain MPFR allocations between dot products. The first rounding of
+    /// `left` to p bits and the separate multiplication at p bits are both
+    /// required: an assignment of `left * right` would fuse those two steps.
+    /// Products are always accumulated serially in the original index order.
+    fn dot(&mut self, left: &[Float], right: &[Float], precision: u32) -> Float {
+        let length = left.len().min(right.len());
+        let chunk = element_chunk_length(length, precision);
+        if length < chunk.saturating_mul(2) || rayon::current_num_threads() == 1 {
+            Self::serial_dot(left, right, precision)
+        } else {
+            if self.products.len() < length {
+                self.products.resize_with(length, || zero(precision));
+            }
+            self.products[..length]
+                .par_chunks_mut(chunk)
+                .enumerate()
+                .for_each(|(batch, products)| {
+                    let offset = batch * chunk;
+                    for (index, product) in products.iter_mut().enumerate() {
+                        if product.prec() != precision {
+                            product.set_prec(precision);
+                        }
+                        product.assign(&left[offset + index]);
+                        *product *= &right[offset + index];
+                    }
+                });
+            let mut sum = zero(precision);
+            for product in &self.products[..length] {
+                sum += product;
+            }
+            sum
+        }
+    }
+}
+
+/// One reusable scalar per chunk avoids per-component MPFR allocation.
+/// Callers keep each component's operations in their original order.
+fn for_each_element(
+    values: &mut [Float],
+    precision: u32,
+    update: impl Fn(usize, &mut Float, &mut Float) + Sync + Send,
+) {
+    let chunk = element_chunk_length(values.len(), precision);
+    let apply_chunk = |batch: usize, values: &mut [Float]| {
+        let mut scratch = zero(precision);
+        for (index, value) in values.iter_mut().enumerate() {
+            update(batch * chunk + index, value, &mut scratch);
+        }
+    };
+    if values.len() >= chunk.saturating_mul(2) && rayon::current_num_threads() > 1 {
+        values
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(batch, values)| apply_chunk(batch, values));
+    } else {
+        apply_chunk(0, values);
     }
 }
 
@@ -167,7 +298,21 @@ fn norm(vector: &[Float], precision: u32) -> Float {
     super::hp_norm(vector, precision)
 }
 
-fn add_orthonormal(candidate: &[Float], basis: &mut Vec<Vec<Float>>, precision: u32) -> bool {
+fn reset_values(values: &mut [Float], precision: u32) {
+    for value in values {
+        if value.prec() != precision {
+            value.set_prec(precision);
+        }
+        value.assign(0);
+    }
+}
+
+fn add_orthonormal(
+    candidate: &[Float],
+    basis: &mut Vec<Vec<Float>>,
+    precision: u32,
+    scratch: &mut DotWorkspace,
+) -> bool {
     let mut candidate: Vec<Float> = candidate
         .iter()
         .map(|value| Float::with_val(precision, value))
@@ -178,18 +323,21 @@ fn add_orthonormal(candidate: &[Float], basis: &mut Vec<Vec<Float>>, precision: 
     if !original_norm.is_finite() || original_norm.is_zero() {
         return false;
     }
-    for_each_element(&mut candidate, |_, value| {
-        *value = Float::with_val(precision, &*value);
+    for_each_element(&mut candidate, precision, |_, value, _| {
         *value /= &original_norm;
     });
     for _ in 0..2 {
         for vector in basis.iter() {
-            let projection = dot(vector, &candidate, precision);
-            for_each_element(&mut candidate, |index, value| {
+            let projection = scratch.dot(vector, &candidate, precision);
+            for_each_element(&mut candidate, precision, |index, value, correction| {
                 if let Some(basis_value) = vector.get(index) {
-                    let mut correction = basis_value.clone();
-                    correction *= &projection;
-                    *value -= correction;
+                    // The old clone inherited the basis component's precision.
+                    if correction.prec() != basis_value.prec() {
+                        correction.set_prec(basis_value.prec());
+                    }
+                    correction.assign(basis_value);
+                    *correction *= &projection;
+                    *value -= &*correction;
                 }
             });
         }
@@ -199,7 +347,7 @@ fn add_orthonormal(candidate: &[Float], basis: &mut Vec<Vec<Float>>, precision: 
     if !length.is_finite() || length <= threshold {
         return false;
     }
-    for_each_element(&mut candidate, |_, value| *value /= &length);
+    for_each_element(&mut candidate, precision, |_, value, _| *value /= &length);
     basis.push(candidate);
     true
 }
@@ -250,11 +398,12 @@ fn target_distance(value: &Float, shift: &Float) -> Float {
 }
 
 fn orthogonality_errors(states: &[RitzState], precision: u32) -> (Vec<Float>, Float) {
+    let mut scratch = DotWorkspace::default();
     let mut errors = vec![zero(precision); states.len()];
     let mut maximum = zero(precision);
     for row in 0..states.len() {
         for column in 0..states.len() {
-            let mut value = dot(&states[row].vector, &states[column].vector, precision);
+            let mut value = scratch.dot(&states[row].vector, &states[column].vector, precision);
             if row == column {
                 value -= 1;
             }
@@ -414,6 +563,7 @@ impl ShiftInvertKrylovSolverHp {
         initial_basis: &[Vec<Float>],
         cancellation: &CancellationToken,
     ) -> Result<ShiftInvertKrylovReportHp, SolverError> {
+        let mut timings = KrylovTimings::new(operator.dimension(), config.precision_bits);
         check_solver_cancellation(cancellation)?;
         // Solves, products and updates below run on Rayon workers; MPFR
         // exponent bounds are thread-local, so every worker must share the
@@ -484,17 +634,25 @@ impl ShiftInvertKrylovSolverHp {
         let mut previous_values: Option<Vec<Float>> = None;
         let mut shifted_solves = 0usize;
         let mut operator_applications = 0usize;
+        let mut scratch = DotWorkspace::default();
+        let mut expansion_candidate = vec![zero(config.precision_bits); dimension];
 
         for restart in 1..=config.maximum_restarts {
+            timings.enter(1);
             check_solver_cancellation(cancellation)?;
             let mut basis = Vec::new();
             if restart == 1 {
                 for seed in initial_basis {
-                    let _ = add_orthonormal(seed, &mut basis, config.precision_bits);
+                    let _ = add_orthonormal(seed, &mut basis, config.precision_bits, &mut scratch);
                 }
             } else {
                 for state in &retained_states {
-                    let _ = add_orthonormal(&state.vector, &mut basis, config.precision_bits);
+                    let _ = add_orthonormal(
+                        &state.vector,
+                        &mut basis,
+                        config.precision_bits,
+                        &mut scratch,
+                    );
                 }
                 if let Some(worst) = retained_states
                     .iter()
@@ -508,12 +666,15 @@ impl ShiftInvertKrylovSolverHp {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
                 {
-                    let mut inverse_image = vec![zero(config.precision_bits); dimension];
+                    reset_values(&mut expansion_candidate, config.precision_bits);
+                    let inverse_image = &mut expansion_candidate;
+                    timings.enter(2);
                     shifted_solver.solve_shifted(
                         &worst.vector,
-                        &mut inverse_image,
+                        inverse_image,
                         config.precision_bits,
                     )?;
+                    timings.enter(1);
                     shifted_solves += 1;
                     if inverse_image
                         .iter()
@@ -526,7 +687,7 @@ impl ShiftInvertKrylovSolverHp {
                     // fail a rank test relative to the dominant Ritz image.
                     for _ in 0..2 {
                         for q in &basis {
-                            let coefficient = dot(q, &inverse_image, config.precision_bits);
+                            let coefficient = scratch.dot(q, inverse_image, config.precision_bits);
                             for (value, component) in inverse_image.iter_mut().zip(q) {
                                 *value -= Float::with_val(
                                     config.precision_bits,
@@ -535,7 +696,12 @@ impl ShiftInvertKrylovSolverHp {
                             }
                         }
                     }
-                    let _ = add_orthonormal(&inverse_image, &mut basis, config.precision_bits);
+                    let _ = add_orthonormal(
+                        inverse_image,
+                        &mut basis,
+                        config.precision_bits,
+                        &mut scratch,
+                    );
                 }
             }
             if restart == 1 {
@@ -546,7 +712,12 @@ impl ShiftInvertKrylovSolverHp {
                     let candidate: Vec<Float> = (0..dimension)
                         .map(|row| Float::with_val(config.precision_bits, row + seed + 1).recip())
                         .collect();
-                    let _ = add_orthonormal(&candidate, &mut basis, config.precision_bits);
+                    let _ = add_orthonormal(
+                        &candidate,
+                        &mut basis,
+                        config.precision_bits,
+                        &mut scratch,
+                    );
                 }
             }
             if basis.is_empty() {
@@ -557,7 +728,8 @@ impl ShiftInvertKrylovSolverHp {
                         value
                     })
                     .collect();
-                let _ = add_orthonormal(&reciprocal, &mut basis, config.precision_bits);
+                let _ =
+                    add_orthonormal(&reciprocal, &mut basis, config.precision_bits, &mut scratch);
             }
             for coordinate in 0..dimension {
                 if !basis.is_empty() {
@@ -565,18 +737,22 @@ impl ShiftInvertKrylovSolverHp {
                 }
                 let mut candidate = vec![zero(config.precision_bits); dimension];
                 candidate[coordinate].assign(1);
-                let _ = add_orthonormal(&candidate, &mut basis, config.precision_bits);
+                let _ =
+                    add_orthonormal(&candidate, &mut basis, config.precision_bits, &mut scratch);
             }
 
             let mut expansion_index = 0usize;
             while basis.len() < config.maximum_subspace_dimension {
                 check_solver_cancellation(cancellation)?;
-                let mut candidate = vec![zero(config.precision_bits); dimension];
+                reset_values(&mut expansion_candidate, config.precision_bits);
+                let candidate = &mut expansion_candidate;
+                timings.enter(2);
                 shifted_solver.solve_shifted(
                     &basis[expansion_index],
-                    &mut candidate,
+                    candidate,
                     config.precision_bits,
                 )?;
+                timings.enter(1);
                 shifted_solves += 1;
                 expansion_index += 1;
                 if candidate
@@ -588,14 +764,14 @@ impl ShiftInvertKrylovSolverHp {
                             .to_owned(),
                     ));
                 }
-                if add_orthonormal(&candidate, &mut basis, config.precision_bits) {
+                if add_orthonormal(candidate, &mut basis, config.precision_bits, &mut scratch) {
                     continue;
                 }
                 let mut expanded = false;
                 for coordinate in 0..dimension {
                     let mut fallback = vec![zero(config.precision_bits); dimension];
                     fallback[coordinate].assign(1);
-                    if add_orthonormal(&fallback, &mut basis, config.precision_bits) {
+                    if add_orthonormal(&fallback, &mut basis, config.precision_bits, &mut scratch) {
                         expanded = true;
                         break;
                     }
@@ -614,6 +790,7 @@ impl ShiftInvertKrylovSolverHp {
             // The images are independent solves with one retained factorization.
             // Run them concurrently, then consume them in basis order so the
             // first error and every stored value match the serial loop.
+            timings.enter(2);
             let images = basis
                 .par_iter()
                 .map(|vector| {
@@ -635,6 +812,7 @@ impl ShiftInvertKrylovSolverHp {
                 }
                 inverse_images.push(image);
             }
+            timings.enter(3);
             let subspace_dimension = basis.len();
             let mut projected =
                 vec![zero(config.precision_bits); subspace_dimension * subspace_dimension];
@@ -644,9 +822,18 @@ impl ShiftInvertKrylovSolverHp {
             let values = entries
                 .par_iter()
                 .map(|&(row, column)| {
-                    let mut value =
-                        dot(&basis[row], &inverse_images[column], config.precision_bits);
-                    value += dot(&basis[column], &inverse_images[row], config.precision_bits);
+                    // The independent entries already occupy the Rayon pool;
+                    // do not recursively schedule every scalar product again.
+                    let mut value = DotWorkspace::serial_dot(
+                        &basis[row],
+                        &inverse_images[column],
+                        config.precision_bits,
+                    );
+                    value += DotWorkspace::serial_dot(
+                        &basis[column],
+                        &inverse_images[row],
+                        config.precision_bits,
+                    );
                     value /= 2u32;
                     value
                 })
@@ -655,6 +842,7 @@ impl ShiftInvertKrylovSolverHp {
                 projected[row * subspace_dimension + column] = value.clone();
                 projected[column * subspace_dimension + row] = value;
             }
+            timings.enter(4);
             let (values, vectors) = symmetric_jacobi_eigensystem(
                 &projected,
                 subspace_dimension,
@@ -674,38 +862,50 @@ impl ShiftInvertKrylovSolverHp {
             selected.truncate(retained);
 
             let mut states = Vec::with_capacity(retained);
+            let mut residual = vec![zero(config.precision_bits); dimension];
             for index in selected {
+                timings.enter(5);
                 let coefficients = &vectors[index];
                 // Each component accumulates its basis columns in column order,
                 // exactly as the column-major loop did.
                 let mut vector = vec![zero(config.precision_bits); dimension];
-                for_each_element(&mut vector, |row, component| {
-                    for column in 0..subspace_dimension {
-                        let mut contribution = basis[column][row].clone();
-                        contribution *= &coefficients[column];
-                        *component += contribution;
-                    }
-                });
+                for_each_element(
+                    &mut vector,
+                    config.precision_bits,
+                    |row, component, contribution| {
+                        for column in 0..subspace_dimension {
+                            let basis_value = &basis[column][row];
+                            if contribution.prec() != basis_value.prec() {
+                                contribution.set_prec(basis_value.prec());
+                            }
+                            contribution.assign(basis_value);
+                            *contribution *= &coefficients[column];
+                            *component += &*contribution;
+                        }
+                    },
+                );
+                timings.enter(6);
                 let applied_vector = apply(operator, &vector, config.precision_bits)?;
                 operator_applications += 1;
-                let norm_squared = dot(&vector, &vector, config.precision_bits);
+                let norm_squared = scratch.dot(&vector, &vector, config.precision_bits);
                 if norm_squared <= 0 || !norm_squared.is_finite() {
                     return Err(SolverError::NumericalBreakdown(
                         "inverse Ritz vector has invalid norm".into(),
                     ));
                 }
-                let value = dot(&vector, &applied_vector, config.precision_bits) / norm_squared;
-                let residual: Vec<Float> = applied_vector
-                    .iter()
-                    .zip(&vector)
-                    .map(|(applied, component)| {
-                        let mut result = component.clone();
-                        result *= &value;
-                        result = -result;
-                        result += applied;
-                        result
-                    })
-                    .collect();
+                let value =
+                    scratch.dot(&vector, &applied_vector, config.precision_bits) / norm_squared;
+                for ((result, applied), component) in
+                    residual.iter_mut().zip(&applied_vector).zip(&vector)
+                {
+                    if result.prec() != component.prec() {
+                        result.set_prec(component.prec());
+                    }
+                    result.assign(component);
+                    *result *= &value;
+                    result.neg_assign();
+                    *result += applied;
+                }
                 let (residual_norm, backward_error) = super::hp_residual_measures(
                     &residual,
                     &applied_vector,
@@ -722,6 +922,7 @@ impl ShiftInvertKrylovSolverHp {
                     target_distance: target_distance(&value, &shift),
                 });
             }
+            timings.enter(7);
             states.sort_by(|left, right| {
                 left.target_distance
                     .total_cmp(&right.target_distance)
@@ -1199,12 +1400,242 @@ mod exhaustive_rank_contract {
             let candidate = vec![scale.clone(), scale];
             let mut basis = vec![vec![Float::with_val(128, 1), Float::with_val(128, 0)]];
             assert!(
-                add_orthonormal(&candidate, &mut basis, 128),
+                add_orthonormal(&candidate, &mut basis, 128, &mut DotWorkspace::default()),
                 "scale exponent {exponent}"
             );
             assert_eq!(basis.len(), 2);
             assert!(basis[1][0].clone().abs() < Float::with_val(128, 2).pow(-100));
             assert_eq!(basis[1][1], 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_order_contract {
+    use super::*;
+
+    // The pre-optimization arithmetic and scheduling, kept here as an exact
+    // regression oracle. In particular, do not replace either product with
+    // a fused multiplication/accumulation or change normalization ordering.
+    fn original_dot(left: &[Float], right: &[Float], precision: u32) -> Float {
+        let product = |(left, right): (&Float, &Float)| {
+            let mut value = Float::with_val(precision, left);
+            value *= right;
+            value
+        };
+        let products: Vec<_> = if left.len().min(right.len()) >= 32 {
+            left.par_iter().zip(right.par_iter()).map(product).collect()
+        } else {
+            left.iter().zip(right).map(product).collect()
+        };
+        let mut sum = zero(precision);
+        for product in products {
+            sum += product;
+        }
+        sum
+    }
+
+    fn original_update(values: &mut [Float], update: impl Fn(usize, &mut Float) + Sync + Send) {
+        if values.len() >= 32 {
+            values
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, v)| update(i, v));
+        } else {
+            for (i, v) in values.iter_mut().enumerate() {
+                update(i, v);
+            }
+        }
+    }
+
+    fn original_orthonormal(
+        candidate: &[Float],
+        basis: &mut Vec<Vec<Float>>,
+        precision: u32,
+    ) -> bool {
+        let mut candidate: Vec<_> = candidate
+            .iter()
+            .map(|v| Float::with_val(precision, v))
+            .collect();
+        let original_norm = norm(&candidate, precision);
+        if !original_norm.is_finite() || original_norm.is_zero() {
+            return false;
+        }
+        original_update(&mut candidate, |_, value| {
+            *value = Float::with_val(precision, &*value);
+            *value /= &original_norm;
+        });
+        for _ in 0..2 {
+            for vector in basis.iter() {
+                let projection = original_dot(vector, &candidate, precision);
+                original_update(&mut candidate, |index, value| {
+                    if let Some(basis_value) = vector.get(index) {
+                        let mut correction = basis_value.clone();
+                        correction *= &projection;
+                        *value -= correction;
+                    }
+                });
+            }
+        }
+        let length = norm(&candidate, precision);
+        let threshold = Float::with_val(precision, 2).pow(-(precision as i32 / 3));
+        if !length.is_finite() || length <= threshold {
+            return false;
+        }
+        original_update(&mut candidate, |_, value| *value /= &length);
+        basis.push(candidate);
+        true
+    }
+
+    fn sample(length: usize, precision: u32, seed: usize) -> Vec<Float> {
+        (0..length)
+            .map(|i| {
+                let component_precision = precision + [0, 13, 67][i % 3];
+                let mut value = Float::with_val(
+                    component_precision,
+                    ((i * 37 + seed * 17) % 101) as i32 - 50,
+                );
+                value /= i + seed + 3;
+                value <<= (i % 19) as i32 - 9;
+                value
+            })
+            .collect()
+    }
+
+    #[test]
+    fn workspace_preserves_products_rounding_order_and_precision_changes() {
+        for threads in [1, 2, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut scratch = DotWorkspace::default();
+                for p in [64, 192, 729, 3386, 6708, 23284, 192] {
+                    for n in [0, 1, 31, 32, 127, 501, 2401, 31] {
+                        let left = sample(n, p, 1);
+                        let right = sample(n + 3, p, 2);
+                        let expected = original_dot(&left, &right, p);
+                        let actual = scratch.dot(&left, &right, p);
+                        assert_eq!(actual, expected, "n={n}, p={p}, threads={threads}");
+                        assert_eq!(actual.prec(), expected.prec());
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn cancellation_and_signed_zero_keep_exact_product_and_sum_order() {
+        for threads in [1, 8] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let mut scratch = DotWorkspace::default();
+                    for p in [63, 64, 65, 127, 128, 129, 3386] {
+                        let mut big = Float::with_val(p, 1);
+                        big <<= (p + 5) as i32;
+                        let left: Vec<_> = (0..2401)
+                            .map(|i| match i % 5 {
+                                0 => big.clone(),
+                                1 => Float::with_val(p, 1),
+                                2 => -big.clone(),
+                                3 => Float::with_val(p, rug::float::Special::NegZero),
+                                _ => zero(p),
+                            })
+                            .collect();
+                        let right = vec![Float::with_val(p + 17, 1); left.len()];
+                        let expected = original_dot(&left, &right, p);
+                        let actual = scratch.dot(&left, &right, p);
+                        assert_eq!(actual, expected);
+                        assert_eq!(actual.is_sign_negative(), expected.is_sign_negative());
+                        assert_eq!(actual.prec(), expected.prec());
+                    }
+                });
+        }
+    }
+
+    #[test]
+    fn orthogonalization_matches_original_with_mixed_precision_basis() {
+        for threads in [1, 2, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for p in [64, 192, 3386, 6708] {
+                    let n = 501;
+                    let mut expected_basis = Vec::new();
+                    let mut actual_basis = Vec::new();
+                    let mut scratch = DotWorkspace::default();
+                    for seed in 0..4 {
+                        let input = sample(n, p, seed);
+                        let expected = original_orthonormal(&input, &mut expected_basis, p);
+                        let actual = add_orthonormal(&input, &mut actual_basis, p, &mut scratch);
+                        assert_eq!(actual, expected, "p={p}, seed={seed}, threads={threads}");
+                        assert_eq!(actual_basis, expected_basis);
+                        // Exercise the old clone's inherited component precision.
+                        for basis in [&mut expected_basis, &mut actual_basis] {
+                            for (index, value) in basis.last_mut().unwrap().iter_mut().enumerate() {
+                                value.set_prec(p + [0, 13, 67][index % 3]);
+                            }
+                        }
+                    }
+                    for input in [vec![zero(p); n], actual_basis[0].clone()] {
+                        assert_eq!(
+                            add_orthonormal(&input, &mut actual_basis, p, &mut scratch),
+                            original_orthonormal(&input, &mut expected_basis, p)
+                        );
+                        assert_eq!(actual_basis, expected_basis);
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "matched wall-clock benchmark; run explicitly in release mode on an otherwise quiet host"]
+    fn benchmark_scratch_and_chunk_scheduling() {
+        for threads in [1, 8, rayon::current_num_threads()] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for (n, p) in [(501, 5047), (2401, 4217), (501, 23284)] {
+                    let candidate = sample(n, p, 20);
+                    let basis: Vec<_> = (0..8).map(|seed| {
+                        let mut vector = sample(n, p, seed);
+                        let length = norm(&vector, p);
+                        for value in &mut vector { *value /= &length; }
+                        vector
+                    }).collect();
+                    let mut expected = basis.clone();
+                    let accepted = original_orthonormal(&candidate, &mut expected, p);
+                    let mut workspace = DotWorkspace::default();
+                    let mut actual = basis.clone();
+                    assert_eq!(add_orthonormal(&candidate, &mut actual, p, &mut workspace), accepted);
+                    assert_eq!(actual, expected);
+                    for round in 0..3 {
+                        // Alternate order to limit systematic thermal/cache bias.
+                        for optimized in if round % 2 == 0 { [false, true] } else { [true, false] } {
+                            let start = Instant::now();
+                            for _ in 0..4 {
+                                let mut basis = basis.clone();
+                                let result = if optimized {
+                                    add_orthonormal(&candidate, &mut basis, p, &mut workspace)
+                                } else {
+                                    original_orthonormal(&candidate, &mut basis, p)
+                                };
+                                std::hint::black_box((result, basis));
+                            }
+                            println!("krylov_scratch n={n} p={p} threads={threads} round={round} optimized={optimized} seconds={:.9}", start.elapsed().as_secs_f64());
+                        }
+                    }
+                }
+            });
         }
     }
 }
