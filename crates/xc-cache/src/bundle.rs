@@ -503,7 +503,7 @@ pub fn export_cache_bundle(
             cancellation,
         )?;
         let _ = fs::remove_dir_all(&verification_scratch);
-        fs::rename(&staging, destination)?;
+        crate::rename_replacement(&staging, destination)?;
         Ok(CacheBundleExportReport {
             schema_version: 1,
             bundle_digest: verification.bundle_digest.clone(),

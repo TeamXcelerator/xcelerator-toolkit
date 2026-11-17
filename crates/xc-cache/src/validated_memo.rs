@@ -75,7 +75,7 @@ impl<T> SharedValidated<T> {
         let reservation = RunResources::current()
             .map(|r| r.try_reserve_retained(bytes))
             .transpose()
-            .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+            .map_err(|e| CacheError::ResourceLimit(e.to_string()))?;
         Ok(Self(Arc::new(SharedRuntime {
             value,
             bytes,
@@ -398,7 +398,7 @@ fn reserve_runtime(
             resources
                 .try_reserve_retained(bytes)
                 .map(Some)
-                .map_err(|e| CacheError::InvalidManifest(e.to_string()))
+                .map_err(|e| CacheError::ResourceLimit(e.to_string()))
         }
     }
 }
@@ -434,6 +434,7 @@ where
     let result = resolve_or_compute_json_artifact_core(
         request,
         binding.as_ref(),
+        false,
         || compute().map(|(value, deps)| (value, deps, ArtifactProductionAssessment::default())),
         |payload| build(payload, resources.as_ref(), scope.as_ref()),
     )?;
@@ -583,7 +584,7 @@ mod eviction_tests {
             &request,
             &context,
             || -> Result<(Vec<u32>, Vec<crate::DependencyRef>), CacheError> {
-                panic!("a failed validation must not retry compute")
+                Ok((vec![1, 2, 3], vec![]))
             },
             |_| Err(CacheError::InvalidManifest("domain rejection".into())),
         )

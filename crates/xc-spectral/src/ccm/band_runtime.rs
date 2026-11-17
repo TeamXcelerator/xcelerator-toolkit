@@ -4,7 +4,11 @@ use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use rug::{Assign, Float};
 use serde::Serialize;
-use std::{collections::VecDeque, path::PathBuf};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
+};
+use xc_cache::ContentDigest;
 use xc_numerics::prefix::lossless_decimal as dec;
 
 #[path = "band_runtime/exact_arithmetic.rs"]
@@ -44,6 +48,7 @@ pub(crate) fn disk_estimate(rows: usize, p: u32, degree: usize) -> u64 {
 pub(crate) struct BandVectors {
     pub store: Checkpoints,
     cache: VecDeque<(usize, Vec<Float>)>,
+    written_blocks: BTreeMap<usize, Vec<ContentDigest>>,
     capacity: usize,
     rows: usize,
     p: u32,
@@ -85,6 +90,7 @@ impl BandVectors {
         Ok(Self {
             store,
             cache: VecDeque::new(),
+            written_blocks: BTreeMap::new(),
             capacity,
             rows,
             p,
@@ -105,12 +111,18 @@ impl BandVectors {
         if v.len() != self.rows {
             bail!("basis vector shape mismatch");
         }
+        let mut digests = Vec::with_capacity(v.len().div_ceil(4096));
         for (chunk, values) in v.chunks(4096).enumerate() {
-            self.store.save(
-                &format!("basis-{j}-{chunk}"),
-                &values.iter().map(dec).collect::<Vec<_>>(),
-            )?;
+            let digest = self
+                .store
+                .save_with_digest(
+                    &format!("basis-{j}-{chunk}"),
+                    &values.iter().map(dec).collect::<Vec<_>>(),
+                )?
+                .context("band basis spill directory unavailable")?;
+            digests.push(digest);
         }
+        self.written_blocks.insert(j, digests);
         self.cache(j, v);
         Ok(())
     }
@@ -121,9 +133,13 @@ impl BandVectors {
         let mut result = Vec::with_capacity(self.rows);
         for start in (0..self.rows).step_by(4096) {
             let key = format!("basis-{j}-{}", start / 4096);
+            let written = self
+                .written_blocks
+                .get(&j)
+                .and_then(|blocks| blocks.get(start / 4096));
             let data = self
                 .store
-                .load::<Vec<String>>(&key)?
+                .load_bound::<Vec<String>>(&key, written)?
                 .context("band basis block unavailable or corrupt")?;
             if data.len() != 4096.min(self.rows - start) {
                 bail!("band basis block shape mismatch");
@@ -170,7 +186,9 @@ mod tests {
             .collect::<Vec<_>>();
         let mut b = BandVectors::new(&"scratch-only-roundtrip", 4100, 192, 0, 2).unwrap();
         b.save(0, values.clone()).unwrap();
-        assert_eq!(values, b.get(0).unwrap());
+        xc_core::with_execution_checkpoint_reads(false, || {
+            assert_eq!(values, b.get(0).unwrap());
+        });
         b.save(1, values.clone()).unwrap();
         assert_eq!(values, b.get(1).unwrap());
     }

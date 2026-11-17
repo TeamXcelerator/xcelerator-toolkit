@@ -72,6 +72,33 @@ fn guide(store: &ZipJsonFilesystemCacheStore, kind: &str, label: &str) -> Artifa
 }
 
 #[test]
+fn assembly_guards_double_from_the_request_and_stop_at_the_supported_limit() {
+    assert_eq!(&assembly_precisions(200)[..5], &[200, 264, 328, 456, 712]);
+    assert_eq!(
+        assembly_precisions(MAX_ASSEMBLY_BITS - 65),
+        [
+            MAX_ASSEMBLY_BITS - 65,
+            MAX_ASSEMBLY_BITS - 1,
+            MAX_ASSEMBLY_BITS
+        ]
+    );
+    assert_eq!(assembly_precisions(MAX_ASSEMBLY_BITS), [MAX_ASSEMBLY_BITS]);
+}
+
+#[test]
+fn exhausting_the_ladder_preserves_the_last_numerical_failure() {
+    let mut attempted = Vec::new();
+    let error = try_assembly_precisions(&[MAX_ASSEMBLY_BITS - 1, MAX_ASSEMBLY_BITS], |bits| {
+        attempted.push(bits);
+        Err::<(), _>(AssemblyResolutionLimit(format!("unresolved at {bits}")).into())
+    })
+    .unwrap_err();
+    assert_eq!(attempted, [MAX_ASSEMBLY_BITS - 1, MAX_ASSEMBLY_BITS]);
+    assert!(format!("{error:#}").contains("unresolved at 1000000"));
+    assert!(error.to_string().contains("exhausted"));
+}
+
+#[test]
 fn compact_managed_producer_stages_only_compact_evidence_and_reuses_exact_payload() {
     let scratch = xc_core::test_support::TestDir::new("compact-sector-cache");
     let store = ZipJsonFilesystemCacheStore::new(
@@ -108,23 +135,23 @@ fn compact_managed_producer_stages_only_compact_evidence_and_reuses_exact_payloa
         certification_failure_policy: xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
         production_sink: Some(&sink),
     };
-    let run = |cache: &ArtifactCacheContext<'_>| {
+    let run = |cache: &ArtifactCacheContext<'_>, bits, options| {
         resolve_or_compute(
             &crate::ccm::CcmParams::from_lambda_sq_integer(5, 2),
-            256,
+            bits,
             &Float::with_val(256, 1),
             &Float::with_val(256, 2),
             &Float::with_val(256, 3),
             &even,
             &odd,
             &gap,
-            CcmSectorGapCertificationOptions::default(),
+            options,
             ReconstructionSourceIdentity::current("test-retained-source"),
             cache,
         )
-        .unwrap()
     };
-    let first = run(&cache);
+    let standard = CcmSectorGapCertificationOptions::default();
+    let first = run(&cache, 256, standard).unwrap();
     let manifest = first.produced_manifest.as_ref().unwrap();
     assert_eq!(
         manifest.minimum_reader_version,
@@ -155,14 +182,14 @@ fn compact_managed_producer_stages_only_compact_evidence_and_reuses_exact_payloa
     drop(records);
     cache.mode = ArtifactExecutionCacheMode::RequireReuse;
     cache.write_on_miss = false;
-    let second = run(&cache);
+    let second = run(&cache, 256, standard).unwrap();
     assert_eq!(first.value, second.value);
     assert_eq!(
         manifest.content_digest,
         second.reused_manifest.as_ref().unwrap().content_digest
     );
     cache.requested_assurance = xc_core::AssuranceLevel::Certified;
-    let verified_reuse = run(&cache);
+    let verified_reuse = run(&cache, 256, standard).unwrap();
     assert_eq!(first.value, verified_reuse.value);
     // Producer provenance is retained historical evidence, not a reason to
     // redo expensive compatible mathematics after an implementation rebuild.
@@ -194,4 +221,72 @@ fn compact_managed_producer_stages_only_compact_evidence_and_reuses_exact_payloa
         1,
         "reuse must not produce a second full certificate"
     );
+
+    // A tight relative bracket forces fresh analytic assembly above 64 bits,
+    // even with the existing inner shifted-inertia guard ladder.
+    let tight = CcmSectorGapCertificationOptions {
+        relative_enclosure_bits: 160,
+        maximum_bracket_expansions: 2,
+    };
+    assert!(matches!(
+        run(&cache, 64, tight)
+            .err()
+            .unwrap()
+            .downcast_ref::<CacheError>(),
+        Some(CacheError::NotFound(_))
+    ));
+    cache.mode = ArtifactExecutionCacheMode::PreferReuse;
+    cache.write_on_miss = true;
+    let count = sink.records.lock().unwrap().len();
+    let budget = xc_core::RunResources::new(1).unwrap();
+    let messages = xc_core::MessageCapture::default();
+    {
+        let _scope = budget.enter();
+        let error =
+            xc_core::with_message_capture(Some(messages.clone()), || run(&cache, 64, tight))
+                .err()
+                .expect("fallback exceeds budget");
+        assert!(
+            format!("{error:#}").contains("run memory budget exceeded"),
+            "{error:#}"
+        );
+    }
+    let retries = || {
+        messages
+            .take()
+            .into_iter()
+            .filter(|s| s.contains("retrying at"))
+            .count()
+    };
+    assert_eq!(
+        retries(),
+        1,
+        "the first resource refusal must stop the ladder"
+    );
+    assert_eq!(sink.records.lock().unwrap().len(), count);
+    let cold = run(&cache, 64, tight).unwrap();
+    let achieved = cold.value.precision_bits;
+    assert!(achieved > 128 && assembly_precisions(64).contains(&achieved));
+    let manifest = cold.produced_manifest.as_ref().unwrap();
+    assert!(manifest.key.logical_key.starts_with(&format!(
+        "ccm/sector-gap-replay-certificate/5/2/{achieved}/"
+    )));
+    assert_eq!(sink.evidence.lock().unwrap().len(), 2);
+    assert!(verify_compact_ccm_sector_gap_certificate(&cold.value).mathematical_claim_verified);
+    for mode in [
+        ArtifactExecutionCacheMode::PreferReuse,
+        ArtifactExecutionCacheMode::RequireReuse,
+    ] {
+        cache.mode = mode;
+        cache.write_on_miss = !mode.requires_reuse();
+        let warm = xc_core::with_message_capture(Some(messages.clone()), || run(&cache, 64, tight))
+            .unwrap();
+        assert_eq!(retries(), 0, "warm reuse must skip failed lower rungs");
+        assert_eq!(
+            warm.reused_manifest.as_ref().unwrap().content_digest,
+            manifest.content_digest
+        );
+        assert_eq!(warm.value, cold.value);
+        assert_eq!(sink.evidence.lock().unwrap().len(), 2);
+    }
 }

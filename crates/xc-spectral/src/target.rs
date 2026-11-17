@@ -288,6 +288,7 @@ impl TargetProfileSpec {
         Ok(annotations)
     }
 
+    #[cfg(feature = "hp")]
     pub(crate) fn manifest_provenance_tag(&self) -> Result<(String, String)> {
         Ok((
             xc_cache::MANIFEST_PROVENANCE_V2_TAG.into(),

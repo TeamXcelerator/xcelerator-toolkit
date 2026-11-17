@@ -470,7 +470,10 @@ static int finite_transform_taylor(acb_t value, acb_t slope, const acb_t z,
     arb_init(c); arb_init(radius); arb_init(extent); arb_init(error);
     arb_init(factorial); arb_init(envelope); arb_init(power);
     acb_get_mid(mid, z);
-    acb_sub(delta, z, mid, precision);
+    /* Subtracting the exact midpoint leaves a centered rectangle with
+       exactly the two input radii. delta is zero-initialized above. */
+    mag_set(arb_radref(acb_realref(delta)), arb_radref(acb_realref(z)));
+    mag_set(arb_radref(acb_imagref(delta)), arb_radref(acb_imagref(z)));
     for (slong j = 0; j < count; j++) {
         slong mode = j - count / 2;
         acb_mul_arb(q0, mid, half, precision);

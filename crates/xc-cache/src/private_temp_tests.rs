@@ -139,3 +139,28 @@ fn failed_encoded_staging_does_not_remove_other_owned_files() {
     assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
     fs::remove_dir_all(root).unwrap();
 }
+#[cfg(windows)]
+#[test]
+fn atomic_replacement_waits_for_a_transient_windows_read_handle() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = crate::test_support::temporary_root("atomic-replace-sharing");
+    let path = root.join("record.json");
+    let probe = root.join("probe.json");
+    fs::write(&path, b"old").unwrap();
+    fs::write(&probe, b"probe").unwrap();
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1 | 2) // FILE_SHARE_READ | FILE_SHARE_WRITE
+        .open(&path)
+        .unwrap();
+    assert!(fs::rename(&probe, &path).is_err());
+    std::thread::scope(|threads| {
+        threads.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(reader);
+        });
+        atomic_replace(&path, b"new").unwrap();
+    });
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+}

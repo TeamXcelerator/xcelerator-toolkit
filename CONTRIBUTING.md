@@ -20,6 +20,7 @@ By submitting an authorized contribution, each identified author represents that
 
 - Keep changes focused and identify the public behavior they implement or change.
 - Include normal, boundary, failure, and inconclusive tests appropriate to every changed public capability.
+- For a numerical cache key or payload codec, test an equivalent input from an independent store and a one-field mathematical change. Check the warm lookup, fresh logical bytes and exact dependency separately. Include nested JSON object order, meaningful array order and producer metadata when they occur in the input. See the [cache schema](docs/CACHE_SCHEMA.md).
 - Attach numerical provenance and trusted-reference or certification evidence where applicable.
 - Do not weaken HP, determinism, cache validation, resource enforcement, or assurance guarantees for performance.
 - Do not submit secrets, private cache locations, access tokens, signed URLs, or unpublished payloads.

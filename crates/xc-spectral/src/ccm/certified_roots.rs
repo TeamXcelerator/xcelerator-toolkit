@@ -2630,6 +2630,47 @@ pub fn certify_production_independent_ccm_roots_partially(
     isolation_bits: u32,
     interval_newton: &IntervalNewtonOptions,
 ) -> Result<PartialIndependentCcmRootCertification> {
+    certify_partial_scope(
+        weights,
+        cutoff,
+        modes,
+        PartialRootScope::Ordinals {
+            first,
+            last,
+            target: whole_range_target,
+        },
+        precision_bits,
+        isolation_bits,
+        interval_newton,
+    )
+}
+
+#[cfg(feature = "arb")]
+pub(super) enum PartialRootScope<'a> {
+    Ordinals {
+        first: usize,
+        last: usize,
+        target: &'a IndependentCcmRootTarget,
+    },
+    /// Count through the first positive pole at or above this retained point.
+    /// Membership in the resulting enclosures is checked separately.
+    ThroughPoint(&'a Float),
+}
+
+#[cfg(feature = "arb")]
+pub(super) fn certify_partial_scope(
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    scope: PartialRootScope<'_>,
+    precision_bits: u32,
+    isolation_bits: u32,
+    interval_newton: &IntervalNewtonOptions,
+) -> Result<PartialIndependentCcmRootCertification> {
+    let (first, last) = match scope {
+        PartialRootScope::Ordinals { first, last, .. } => (first, last),
+        PartialRootScope::ThroughPoint(_) => (1, 1),
+    };
     if first == 0 || first > last {
         bail!("partial CCM certification requires 1 <= first <= last");
     }
@@ -2655,15 +2696,35 @@ pub fn certify_production_independent_ccm_roots_partially(
         }
     };
     let route = CountRoute::for_source(&source);
+    let maximum_pole = 2 * modes;
+    let (boundary, needed) = match scope {
+        PartialRootScope::Ordinals { .. } => (maximum_pole, last),
+        PartialRootScope::ThroughPoint(point) => {
+            let height = point
+                .to_rational()
+                .context("expected a finite reference-seeded point")?;
+            let poles = source.point_poles()?;
+            (
+                poles
+                    .partition_point(|pole| pole < &height)
+                    .clamp(modes, maximum_pole),
+                usize::MAX,
+            )
+        }
+    };
+    let beyond_reason = |count| {
+        if boundary == maximum_pole {
+            format!("ordinal beyond the {count} positive roots inside the positive pole range")
+        } else {
+            format!("ordinal beyond the {count} positive roots counted through the bounding pole")
+        }
+    };
     let (available, beyond) = match route {
         CountRoute::ExactFlint | CountRoute::ExactFlintTight => {
-            match cumulative_positive_count(&source, modes, 2 * modes) {
+            match cumulative_positive_count(&source, modes, boundary) {
                 Ok(count) => {
-                    result.available_positive_roots = Some(count);
-                    (
-                    count,
-                    format!("ordinal beyond the {count} positive roots inside the positive pole range"),
-                )
+                    result.available_positive_roots = (boundary == maximum_pole).then_some(count);
+                    (count, beyond_reason(count))
                 }
                 Err(error) => {
                     limited(&mut result, format!("exact positive root count: {error:#}"));
@@ -2674,22 +2735,30 @@ pub fn certify_production_independent_ccm_roots_partially(
         // The census counts only as far as the requested ordinals; the total
         // is recorded only when every positive gap was counted.
         CountRoute::PoleGap => {
-            let (counts, stopped) = pole_gap_prefix(&source, modes, 2 * modes, last);
+            let (counts, stopped) = pole_gap_prefix(&source, modes, boundary, needed);
             let reached = *counts.last().expect("nonempty census counts");
             let reason = match stopped {
                 Some(error) => {
                     format!("pole-gap census stopped after {reached} positive roots: {error:#}")
                 }
                 None => {
-                    if reached < last {
+                    if boundary == maximum_pole && reached < needed {
                         result.available_positive_roots = Some(reached);
                     }
-                    format!("ordinal beyond the {reached} positive roots inside the positive pole range")
+                    beyond_reason(reached)
                 }
             };
             (reached, reason)
         }
     };
+    let prefix = IndependentCcmRootTarget::Prefix {
+        count: available.max(1),
+    };
+    let (last, whole_range_target) = match scope {
+        PartialRootScope::Ordinals { target, .. } => (last, target),
+        PartialRootScope::ThroughPoint(_) => (available.max(1), &prefix),
+    };
+    result.last_index = last;
     for ordinal in first.max(available + 1)..=last {
         result.uncertified.insert(ordinal, beyond.clone());
     }

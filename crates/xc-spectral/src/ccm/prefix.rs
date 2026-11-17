@@ -98,7 +98,7 @@ fn authenticate(
     if bytes.len() as u128 > u128::from(LEGACY_MAXIMUM_ENCODED_BYTES) {
         bail!("retained prefix payload exceeds the encoded byte budget");
     }
-    manifest.validate()?;
+    super::source_admission::admit_manifest(manifest, None)?;
     if manifest.quality.admissible_rank() < CacheQuality::Validated.admissible_rank()
         || !manifest.immutable
         || manifest.size_bytes != bytes.len() as u64
@@ -147,6 +147,16 @@ fn precision(p: u32) -> Result<()> {
 }
 
 impl RetainedEvenMatrix {
+    /// Apply caller source restrictions before authenticating or decoding bytes.
+    pub fn from_payload_with_policy(
+        manifest: &ArtifactManifest,
+        bytes: &[u8],
+        allowed: &[ContentDigest],
+        policy: &xc_cache::CachePolicy,
+    ) -> Result<Self> {
+        super::source_admission::admit_manifest(manifest, Some(policy))?;
+        Self::from_payload(manifest, bytes, allowed)
+    }
     /// Decode the existing ccm_even_sector_matrix payload without rewriting it.
     /// The allowlist must come from the run/campaign's source-selection policy.
     pub fn from_payload(
@@ -179,6 +189,12 @@ impl RetainedEvenMatrix {
         {
             bail!("invalid retained even-matrix shape or metadata");
         }
+        super::source_admission::check_payload_shape(
+            manifest,
+            &payload.lambda_squared,
+            payload.n_modes,
+            payload.precision_bits,
+        )?;
         validate_cutoff(&payload.lambda_squared)?;
         decode_budget(payload.entries.len(), payload.precision_bits, bytes.len())?;
         let entries = payload
@@ -225,6 +241,16 @@ pub struct RetainedEvenEigenpair {
     vector: Vec<Float>,
 }
 impl RetainedEvenEigenpair {
+    /// Apply caller source restrictions before authenticating or decoding bytes.
+    pub fn from_payload_with_policy(
+        manifest: &ArtifactManifest,
+        bytes: &[u8],
+        allowed: &[ContentDigest],
+        policy: &xc_cache::CachePolicy,
+    ) -> Result<Self> {
+        super::source_admission::admit_manifest(manifest, Some(policy))?;
+        Self::from_payload(manifest, bytes, allowed)
+    }
     pub(crate) fn manifest(&self) -> &ArtifactManifest {
         &self.manifest
     }
@@ -257,6 +283,12 @@ impl RetainedEvenEigenpair {
         {
             bail!("invalid eigenpair shape or schema");
         }
+        super::source_admission::check_payload_shape(
+            manifest,
+            &v.lambda_squared,
+            v.n_modes,
+            v.precision_bits,
+        )?;
         validate_cutoff(&v.lambda_squared)?;
         decode_budget(v.eigenvector.len(), v.precision_bits, bytes.len())?;
         let vector = v
@@ -904,7 +936,7 @@ pub fn analyze_retained_prefixes_via_cache(
         production_sink: cache.production_sink,
     };
     // A fresh payload can use its exact process-local seal. Ordinary reuse is
-    // admission of computed evidence, not an independent numerical replay.
+    // source-checked before accepting numerical rows.
     let fresh = std::cell::RefCell::new(None);
     let result = resolve_or_compute_json_artifact_with_dependencies(
         &request,
@@ -925,8 +957,8 @@ pub fn analyze_retained_prefixes_via_cache(
                 return Ok(());
             }
             if !cache.mode.compares_against_reference() {
-                return sanity_prefix(report, matrix, options, eigenpairs)
-                    .map_err(|e| CacheError::InvalidManifest(e.to_string()));
+                sanity_prefix(report, matrix, options, eigenpairs)
+                    .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
             }
             let expected = analyze_retained_prefixes(matrix, options, eigenpairs)
                 .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
@@ -1352,16 +1384,14 @@ pub fn check_retained_reduction_via_cache(
             if fresh.borrow().as_ref() == Some(&ContentDigest::sha256(&bytes)) {
                 return Ok(());
             }
-            if !cache.mode.compares_against_reference() {
-                return sanity_reduction(
-                    report,
-                    matrix,
-                    working_precision_bits,
-                    maximum_dimension,
-                    relative_tolerance,
-                )
-                .map_err(|e| CacheError::InvalidManifest(e.to_string()));
-            }
+            sanity_reduction(
+                report,
+                matrix,
+                working_precision_bits,
+                maximum_dimension,
+                relative_tolerance,
+            )
+            .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
             let expected = check_retained_reduction(
                 matrix,
                 working_precision_bits,
@@ -2010,7 +2040,7 @@ mod exhaustive_retained_prefix {
         assert!(sanity_prefix(&report, &matrix, &options, &[pair.clone(), pair]).is_err());
     }
     #[test]
-    fn ordinary_prefix_and_reduction_hits_do_not_repeat_dense_calculations() {
+    fn prefix_reuse_replays_rows_and_reduction_reuses_checked_diagnostics() {
         // Its later VerifyAgainstReference session is process-global, just
         // like the prolate and finite-Dirichlet verification fixtures.
         let _lock = crate::TEST_CWD_LOCK
@@ -2074,8 +2104,8 @@ mod exhaustive_retained_prefix {
                 .value,
             reduction.value
         );
-        assert_eq!(PREFIX_CALCULATIONS.with(|count| count.get()), 1);
-        assert_eq!(REDUCTION_CALCULATIONS.with(|count| count.get()), 1);
+        assert_eq!(PREFIX_CALCULATIONS.with(|count| count.get()), 2);
+        assert_eq!(REDUCTION_CALCULATIONS.with(|count| count.get()), 2);
         let mut bad = prefix.value.clone();
         bad.ladder.rows[0].sigma = "NaN".into();
         assert!(sanity_prefix(&bad, &matrix, &options, &[]).is_err());

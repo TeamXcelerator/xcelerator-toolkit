@@ -146,6 +146,8 @@ unchanged. Device/runtime errors still propagate without changing backends.
 | `XC_CUDA_PRODUCT_PIPELINE` | Unset prefers the two-lane pipeline at 128 or more residue primes per admitted device, subject to the checks below. `0` forces synchronous execution; `1` requires the pipeline. Other values refuse when CUDA selection is considered. |
 | `XC_CUDA_HEADROOM_MIB` | Device free-memory reserve, default 512 MiB; at least 10% of total device memory is always reserved. |
 | `XC_CUDA_LIB_DIR` | Platform-separated list of installed CUDA shared-library directories searched before `CUDA_PATH` and the platform loader. |
+| `XC_CPU_PRODUCT_KERNEL` | Optional exact CPU residue kernel: `portable` (default), `packed`, `avx2`, `avx512`, or runtime-dispatched `auto`. |
+| `XC_RESIDUE_LAYOUT` | Input residue storage: `nested` (default) or contiguous `flat`; also applies to CUDA preparation. |
 | `RAYON_NUM_THREADS` | CPU pool size; coordinate with the shared run worker allowance and outer process limits. |
 
 `modular_product::cuda_status()` reports discovered driver/runtime/cuBLAS
@@ -458,3 +460,6 @@ bits, signs, rectangular layouts, directed rounding, and resource refusals.
 They validate these primitives; complete primary behavior also requires solver,
 cache-identity, and acceptance regressions. Distribution and dependency scope are recorded in
 [Third-party review](THIRD_PARTY_REVIEW.md).
+
+Optional CPU execution choices and their numerical/resource guarantees are
+described in [CPU execution tuning](CPU_EXECUTION.md).

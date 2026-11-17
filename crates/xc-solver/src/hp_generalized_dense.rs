@@ -296,10 +296,9 @@ pub fn solve_dense_generalized_whitening_hp(
         config.precision_bits,
         "absolute_residual_tolerance",
     )?;
-    let backward_tolerance = parse_positive(
+    let backward_tolerance = super::hp_backward_tolerance(
         &config.scaled_backward_error_tolerance,
         config.precision_bits,
-        "scaled_backward_error_tolerance",
     )?;
     let (lower, minimum_cholesky_pivot) =
         cholesky_lower(problem.metric, problem.dimension, config.precision_bits)?;

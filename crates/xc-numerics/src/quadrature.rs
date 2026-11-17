@@ -1623,7 +1623,7 @@ mod hp {
             std::fs::create_dir_all(&dir).ok()?;
             return Some(dir);
         }
-        let dir = xc_core::configured_cache_root().join("gl_cache");
+        let dir = xc_core::checked_cache_root().ok()?.join("gl_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }
@@ -1687,18 +1687,14 @@ mod hp {
         Some((nodes, weights))
     }
 
-    /// Returns `true` if `a` is strictly older than `b` using simple
-    /// major.minor.patch comparison (no semver pre-release handling
-    /// needed — toolkit versions are always plain `X.Y.Z`).
-    fn version_is_older(a: &str, b: &str) -> bool {
-        let parse = |s: &str| -> (u64, u64, u64) {
-            let mut parts = s.splitn(3, '.');
-            let major = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let minor = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let patch = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            (major, minor, patch)
-        };
-        parse(a) < parse(b)
+    fn version_is_older(producer: &str, floor: &str) -> bool {
+        match (
+            xc_cache::ToolkitVersion::parse(producer),
+            xc_cache::ToolkitVersion::parse(floor),
+        ) {
+            (Ok(producer), Ok(floor)) => producer < floor,
+            _ => true,
+        }
     }
 
     /// Print a diagnostic warning to stderr when a cache file exists
@@ -3599,22 +3595,16 @@ mod hp_cache_tests {
     fn gl_cache_rejects_stale_toolkit_version() {
         let n = 4;
         let prec: u32 = 64;
-        // Build a well-formed envelope but stamp a far-past toolkit_version.
-        let ns: Vec<String> = (0..n).map(|i| format!("{}", i)).collect();
-        let ws: Vec<String> = (0..n).map(|i| format!("{}", i)).collect();
-        let payload = serde_json::json!({
-            "toolkit_version": "0.0.1",
-            "n_pts": n,
-            "precision_bits": prec,
-            "nodes": ns,
-            "weights": ws,
-        })
-        .to_string();
-        // parse_gl_json must return None because 0.0.1 is below the family floor.
-        assert!(
-            hp::parse_gl_json_for_test(&payload, n, prec).is_none(),
-            "parser should reject a stale cache file with toolkit_version=0.0.1"
-        );
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::Off);
+        let mut payload = serde_json::json!({
+            "schema_version":1, "toolkit_version":hp::toolkit_version_for_test(),
+            "n_pts":n, "precision_bits":prec,
+            "nodes": nodes.iter().map(rug::Float::to_string).collect::<Vec<_>>(),
+            "weights": weights.iter().map(rug::Float::to_string).collect::<Vec<_>>(),
+        });
+        assert!(hp::parse_gl_json_for_test(&payload.to_string(), n, prec).is_some());
+        payload["toolkit_version"] = serde_json::json!("0.0.1");
+        assert!(hp::parse_gl_json_for_test(&payload.to_string(), n, prec).is_none());
     }
 
     /// Zip-only contract: fresh compute writes ONLY the `.json.zip`

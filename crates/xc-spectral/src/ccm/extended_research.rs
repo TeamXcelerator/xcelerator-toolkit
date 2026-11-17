@@ -220,7 +220,7 @@ impl ClusterPreparationAssessment {
         if !self.source_eigenpair.validate()
             || !self.source_matrix.validate()
             || !self.evidence_digest.validate()
-            || !(1..=16).contains(&self.requested_eigenpairs_per_sector)
+            || self.requested_eigenpairs_per_sector == 0
             || !["selected", "complete_qr", "cross_checked"]
                 .contains(&self.eigenvalue_route.as_str())
             || !["automatic_sector_attempt", "declared_prior_capture_policy"]
@@ -232,10 +232,23 @@ impl ClusterPreparationAssessment {
         {
             bail!("invalid cluster preparation assessment");
         }
+        if self.origin == "automatic_sector_attempt"
+            && self.evidence_digest
+                != ContentDigest::sha256_json(&serde_json::json!({
+                    "source_eigenpair": self.source_eigenpair, "source_matrix": self.source_matrix,
+                    "source_precision_bits": self.source_precision_bits,
+                    "requested_eigenpairs_per_sector": self.requested_eigenpairs_per_sector,
+                    "eigenvalue_route": self.eigenvalue_route, "reason": self.reason,
+                }))?
+        {
+            bail!(
+                "cluster preparation assessment evidence differs from its automatic sector attempt"
+            );
+        }
         Ok(())
     }
 
-    fn matches(&self, s: &RetainedState, m: &RetainedMatrix<'_>) -> Result<()> {
+    pub(crate) fn matches(&self, s: &RetainedState, m: &RetainedMatrix<'_>) -> Result<()> {
         self.validate()?;
         if self.source_eigenpair != s.manifest.content_digest
             || self.source_matrix != m.manifest.content_digest
@@ -829,6 +842,8 @@ pub struct AnalysisRow {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtendedAnalysis {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub execution_budget_limited: bool,
     pub diagnostic: String,
     pub outcome: String,
     pub reason: Option<String>,
@@ -856,6 +871,7 @@ const ENERGY_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; exclu
 const ASSURANCE: &str = "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise";
 pub(super) fn report(id: &str, s: &RetainedState, o: &ExtensionOptions) -> ExtendedAnalysis {
     ExtendedAnalysis {
+        execution_budget_limited: false,
         diagnostic: id.into(),
         outcome: "point_measurement".into(),
         reason: None,
@@ -2371,7 +2387,8 @@ fn execution_budget_limited(analysis: &ExtendedAnalysis) -> bool {
     let limited = |text: &str| {
         text.contains("working-byte budget") || text.contains("exceeds XC_RESEARCH_BASIS_BYTES")
     };
-    analysis.reason.as_deref().is_some_and(limited)
+    analysis.execution_budget_limited
+        || analysis.reason.as_deref().is_some_and(limited)
         || analysis
             .rows
             .iter()
@@ -2405,6 +2422,20 @@ pub fn capture_extended(
     )
 }
 
+fn validate_external_cluster_origin(
+    id: &str,
+    input: Option<&ExternalResearchInputs>,
+) -> Result<()> {
+    if id.trim_end_matches("_full") == "spectral_cluster"
+        && input
+            .and_then(|i| i.cluster_preparation_assessment.as_ref())
+            .is_some_and(|a| a.origin == "automatic_sector_attempt")
+    {
+        bail!("automatic sector absence requires a witnessed live sector attempt; supply retained sector vectors or an explicit capture policy");
+    }
+    Ok(())
+}
+
 /// [`capture_extended`] with the run's own sector-gap certificate and its
 /// manifest. Capture preflight and the transform enclosure use it when the
 /// external input supplies no certificate. The certificate is bound to their
@@ -2425,6 +2456,7 @@ pub fn capture_extended_with_certificate(
     parent_manifests: &[ArtifactManifest],
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
+    validate_external_cluster_origin(id, input)?;
     capture_extended_prepared(
         id,
         s,
@@ -2452,6 +2484,7 @@ pub fn capture_extended_with_certificate_ref(
     parent_manifests: &[ArtifactManifest],
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
+    validate_external_cluster_origin(id, input)?;
     capture_extended_prepared_ref(
         id,
         s,
@@ -2696,6 +2729,13 @@ fn capture_extended_prepared_with_transform_guard(
     let effective_options = effective_options(options, &resource_policy);
     let options = &effective_options;
     options.validate(s)?;
+    if matches!(id, "directional_response" | "root_transport")
+        && input
+            .and_then(|i| i.run_once.as_ref())
+            .is_some_and(|run| run.automatic_u_flow_failed)
+    {
+        bail!("required automatic u-flow response unavailable");
+    }
     let external_values = input_contract::external_values(id, input)?;
     // Unused optional sources never enter admission, keying or computation.
     let input = external_values.as_ref().and(input);
@@ -2711,14 +2751,18 @@ fn capture_extended_prepared_with_transform_guard(
     let mut sources = vec![s.manifest.clone()];
     if let Some(m) = m {
         m.match_state(s)?;
-        sources.extend(matrix_ancestry(s, m, parent_manifests, cache)?);
+        matrix_ancestry(s, m, parent_manifests, cache)?;
         sources.push(m.manifest.clone());
     }
     if let Some(r) = roots {
         if options.working_precision_bits < r.dataset.precision_bits {
             bail!("working precision below retained root precision");
         }
-        if !xc_cache::manifest_depends_on(&r.secular_manifest, &s.manifest)? {
+        if !super::source_admission::secular_matches_state(
+            &r.secular_manifest,
+            &s.manifest,
+            cache.acceptance,
+        )? {
             bail!("roots belong to another state");
         }
         sources.extend([r.manifest.clone(), r.secular_manifest.clone()]);
@@ -2791,6 +2835,12 @@ fn capture_extended_prepared_with_transform_guard(
             (Some(certificate), admitted)
         }
         _ => (None, None),
+    };
+    let compact_digest = match (id, run_certificate) {
+        ("transform_enclosure", Some(SectorGapCertificateRef::Compact(proof))) => {
+            Some(proof.proof_digest()?)
+        }
+        _ => None,
     };
     let directional_source = if let ("root_transport", Some(_), Some(r)) = (id, m, roots) {
         let mut full = options.clone();
@@ -2905,7 +2955,7 @@ fn capture_extended_prepared_with_transform_guard(
     // manifest, the adopting layer) that differ between workstations for the
     // same state; its semantic key is already its parameters digest.
     let request = {
-        let mut request = json!({"semantics":if id == "transform_enclosure" { "extended-retained-diagnostics-v5-minus-fourier-source-error-hull" } else if matches!(id,"band_reconstruction"|"tail_operator"|"weighted_tail") { "extended-retained-diagnostics-v4" } else if id == "resolution_budget" { "extended-retained-diagnostics-v3" } else { "extended-retained-diagnostics-v2" },"expected_rows":if matches!(id,"transform_enclosure"|"operator_cluster"|"finite_section_transfer"|"configuration_comparison"|"weighted_tail"|"band_reconstruction"|"tail_operator") { None } else { Some(estimated_rows) },"diagnostic":id,"options":identity_options,"external_input_digest":input_digest,"state_identity":if id=="capture_preflight" {None} else {Some(xc_cache::numerical_source_identity(&s.manifest, "state", "stored-weil-state-v1"))}});
+        let mut request = json!({"semantics":if id == "transform_enclosure" { "extended-retained-diagnostics-v6-bound-source-allowance" } else if matches!(id,"band_reconstruction"|"tail_operator"|"weighted_tail") { "extended-retained-diagnostics-v4" } else if id == "resolution_budget" { "extended-retained-diagnostics-v3" } else { "extended-retained-diagnostics-v2" },"expected_rows":if matches!(id,"transform_enclosure"|"operator_cluster"|"finite_section_transfer"|"configuration_comparison"|"weighted_tail"|"band_reconstruction"|"tail_operator") { None } else { Some(estimated_rows) },"diagnostic":id,"options":identity_options,"external_input_digest":input_digest,"state_identity":if id=="capture_preflight" {None} else {Some(xc_cache::numerical_source_identity(&s.manifest, "state", "stored-weil-state-v1"))}});
         if id == "capture_preflight" {
             request["preflight_inventory"] = json!({"lambda_squared":s.cutoff,"n_modes":s.modes,
                 "source_precision_bits":s.precision,"coefficient_count":s.coefficients.len(),
@@ -2923,7 +2973,7 @@ fn capture_extended_prepared_with_transform_guard(
                 json!("all_required_recurrence_steps_including_failed_v2");
         }
         request["source_unit_arithmetic"] = json!("binary_scaled_hypot_checked_range_v2");
-        request["resource_admission"] = json!("budget_limited_results_not_retained_v2");
+        request["resource_admission"] = json!("execution_budget_refusal_v3");
         if id == "operator_cluster" {
             // Only this group's identity changes with the complement solve.
             request["complement_solve"] = json!("midpoint_preconditioned_verified_solve_v1");
@@ -3109,7 +3159,8 @@ fn capture_extended_prepared_with_transform_guard(
             sector_certificate.filter(|_| id != "capture_preflight"),
             run_certificate,
         ) {
-            request["run_sector_certificate"] = json!(manifest.content_digest);
+            request["run_sector_certificate"] =
+                json!(compact_digest.as_ref().unwrap_or(&manifest.content_digest));
             if matches!(run_certificate, Some(SectorGapCertificateRef::Compact(_))) {
                 request["run_sector_certificate_representation"] =
                     json!("compact_analytic_replay_v1");
@@ -4143,8 +4194,14 @@ fn capture_extended_prepared_with_transform_guard(
         xc_core::validate_secret_free(r, "extended research report")?;
         Ok(())
     };
-    let numerical_inputs =
-        (id == "capture_preflight").then_some(&[] as &[xc_cache::NumericalInputIdentity]);
+    let proof_inputs = compact_digest
+        .as_ref()
+        .map(|digest| super::retained_evidence::compact_certificate_inputs(&sources, digest));
+    let numerical_inputs = if id == "capture_preflight" {
+        Some(&[][..])
+    } else {
+        proof_inputs.as_deref()
+    };
     let first = super::retained_evidence::managed_with_input_identities(
         kind,
         request.clone(),
@@ -4153,12 +4210,29 @@ fn capture_extended_prepared_with_transform_guard(
         &BTreeMap::new(),
         numerical_inputs,
         || {
-            let data = compute().inspect_err(|error| {
-                if error.is::<transform::GuardExhausted>() {
-                    exhausted.set(true);
-                }
-            })?;
+            let mut data = compute()
+                .or_else(|error| {
+                    if error
+                        .downcast_ref::<xc_core::ConfigError>()
+                        .is_some_and(|error| {
+                            error.to_string().contains("run memory budget exceeded")
+                        })
+                    {
+                        Ok(unresolved(
+                            report(id, s, options),
+                            "working-byte budget exceeded",
+                        ))
+                    } else {
+                        Err(error)
+                    }
+                })
+                .inspect_err(|error| {
+                    if error.is::<transform::GuardExhausted>() {
+                        exhausted.set(true);
+                    }
+                })?;
             if budget_exceeded || execution_budget_limited(&data) {
+                data.execution_budget_limited = true;
                 *budget_limited.borrow_mut() = Some(data);
                 bail!("diagnostic limited by an execution budget; result is not retained");
             }
@@ -4373,6 +4447,7 @@ mod exhaustive_resumed_resolution_validation_contract {
     #[test]
     fn exhaustive_resumed_resolution_missing_prefix_returns_error() {
         let report = ExtendedAnalysis {
+            execution_budget_limited: false,
             diagnostic: "resolution_budget".into(),
             outcome: "point_measurement".into(),
             reason: None,

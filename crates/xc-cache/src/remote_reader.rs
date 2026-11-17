@@ -456,13 +456,13 @@ fn download_transport_part(
         Ok(source) => source,
         Err(error) => {
             drop(temporary);
-            let _ = fs::remove_file(&temporary_path);
+            let _ = xc_core::remove_temporary_file(&temporary_path);
             return Err(error);
         }
     };
     if let Err(error) = temporary.sync_all() {
         drop(temporary);
-        let _ = fs::remove_file(&temporary_path);
+        let _ = xc_core::remove_temporary_file(&temporary_path);
         return Err(error.into());
     }
     drop(temporary);
@@ -471,7 +471,7 @@ fn download_transport_part(
         || source.repository_path != part.repository_path
         || source.revision != revision
     {
-        let _ = fs::remove_file(&temporary_path);
+        let _ = xc_core::remove_temporary_file(&temporary_path);
         return Err(CacheError::DigestMismatch {
             expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),
             actual: format!("{} ({} bytes)", source.content_digest, source.size_bytes),
@@ -479,11 +479,11 @@ fn download_transport_part(
     }
     match fs::hard_link(&temporary_path, destination) {
         Ok(()) => {
-            let _ = fs::remove_file(&temporary_path);
+            let _ = xc_core::remove_temporary_file(&temporary_path);
             Ok((part.sequence, part.size_bytes, true))
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&temporary_path);
+            let _ = xc_core::remove_temporary_file(&temporary_path);
             verify_local_part(
                 destination,
                 part.size_bytes,
@@ -494,7 +494,7 @@ fn download_transport_part(
             Ok((part.sequence, part.size_bytes, false))
         }
         Err(error) => {
-            let _ = fs::remove_file(&temporary_path);
+            let _ = xc_core::remove_temporary_file(&temporary_path);
             Err(error.into())
         }
     }

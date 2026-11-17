@@ -255,6 +255,7 @@ impl Promotion {
             tail_form,
             uncertainty,
             producer_notes: _,
+            automatic_u_flow_failed: _,
         } = run;
         // A comparison owns its own precision; it does not inherit the bundle's.
         if let Some(completion) = completion {

@@ -24,11 +24,7 @@ pub(crate) fn analyze(
 
 #[cfg(feature = "arb")]
 mod certified {
-    use super::super::{
-        arb_bridge,
-        capture_runtime::{Checkpoints, Stage},
-        research_completion::ContourPolicy,
-    };
+    use super::super::{arb_bridge, capture_runtime::Stage, research_completion::ContourPolicy};
     use super::*;
     use anyhow::bail;
     use rayon::prelude::*;
@@ -102,8 +98,7 @@ mod certified {
         resources: Option<&xc_core::RunResources>,
         pressure_bytes: u64,
     ) -> Result<(String, usize, u128)> {
-        // Each run binds a distinct state identity, so contour checkpoints from
-        // another run can never stand in for an evaluation.
+        // Bind each independent evaluation to its own state identity.
         let nonce = format!(
             "{}-{:?}",
             std::process::id(),
@@ -552,17 +547,10 @@ mod certified {
         let half = l.div(&I::from_i64(2, p))?;
         let mut source_error = None;
         if let Some(c) = certificate {
-            match state_error_ref(s, o, c) {
-                Ok(e) => {
-                    bounds(&mut out.values, "unit_state_l2_error", &e)?;
-                    source_error = Some(e);
-                    out.reason=Some(format!("source certificate replayed; conditional on {} and the certificate's recorded cutoff-free assembly enclosure; no infinite source error claim",c.parity_invariance_premise()));
-                }
-                Err(e) => {
-                    out.outcome = "partial_unresolved".into();
-                    out.reason=Some(format!("source certificate unavailable or unresolved: {e}; finite retained function still enclosed"));
-                }
-            }
+            let e = state_error_ref(s, o, c)?;
+            bounds(&mut out.values, "unit_state_l2_error", &e)?;
+            source_error = Some(e);
+            out.reason=Some(format!("source certificate replayed; conditional on {} and the certificate's recorded cutoff-free assembly enclosure; no infinite source error claim",c.parity_invariance_premise()));
         }
         let default_right = roots
             .and_then(|r| {
@@ -654,14 +642,6 @@ mod certified {
         let mut angle = I::from_i64(0, p);
         let mut unresolved_count = 0usize;
         let pi = I::pi(p);
-        let store = Checkpoints::new(&(
-            "finite-contour-segments-minus-fourier-v4-source-error-hull",
-            FOURIER_SEMANTICS,
-            source_precision,
-            &s.manifest.content_digest,
-            o,
-            input,
-        ))?;
         // Adjacent and child segments share endpoints. `evaluate` is a pure
         // function of the exact point at this precision, so a retained
         // endpoint value equals a fresh evaluation on any thread.
@@ -755,28 +735,12 @@ mod certified {
                 put(&mut rr.values, name, v);
             }
             let key = serde_json::to_string(&rr.values)?;
-            let saved = store.load::<AnalysisRow>(&key)?;
-            if let Some(saved) = saved {
-                if saved.outcome == "point_measurement" {
-                    let turn = I::new(
-                        scalar(&saved.values["argument_increment_lower"], p)?,
-                        scalar(&saved.values["argument_increment_upper"], p)?,
-                    )?;
-                    angle = angle.add(&turn);
-                    let mut saved = saved;
-                    saved.ordinal = rr.ordinal;
-                    out.rows.push(saved);
-                    continue;
-                }
-            }
+            // Only an interval evaluated from the current source can contribute to a certified winding count.
             if !evaluated.contains_key(&key) {
                 let mut wave = vec![(key.clone(), seg.clone())];
                 for next in pending.iter().rev().take(width.saturating_sub(1)) {
                     let next_key = segment_key(next)?;
-                    let checkpointed = store
-                        .load::<AnalysisRow>(&next_key)?
-                        .is_some_and(|row| row.outcome == "point_measurement");
-                    if !checkpointed && !evaluated.contains_key(&next_key) {
+                    if !evaluated.contains_key(&next_key) {
                         wave.push((next_key, next.clone()));
                     }
                 }
@@ -821,9 +785,6 @@ mod certified {
                     }
                     angle = angle.add(&turn);
                     rr.notes.push("Arb encloses the entire segment image in a convex rectangle excluding zero; endpoint argument increment is unambiguous".into());
-                    if let Err(e) = store.save(&key, &rr) {
-                        xc_core::progress_message!("contour checkpoint unavailable: {e}");
-                    }
                 }
                 _ => {
                     if seg.depth < policy.maximum_depth

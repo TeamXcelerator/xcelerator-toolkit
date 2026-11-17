@@ -392,7 +392,11 @@ impl ReferencePreparation {
             }
         }
         if let Some(roots) = roots {
-            if !xc_cache::manifest_depends_on(&roots.secular_manifest, &state.manifest)? {
+            if !super::source_admission::secular_matches_state(
+                &roots.secular_manifest,
+                &state.manifest,
+                None,
+            )? {
                 bail!("reference preparation roots belong to another state");
             }
             source_precision = source_precision.max(roots.dataset.precision_bits);

@@ -532,10 +532,9 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
             config.precision_bits,
             "absolute_residual_tolerance",
         )?;
-        let backward_tolerance = parse_positive(
+        let backward_tolerance = super::hp_backward_tolerance(
             &config.scaled_backward_error_tolerance,
             config.precision_bits,
-            "scaled_backward_error_tolerance",
         )?;
         let stability_tolerance = parse_positive(
             &config.ritz_value_stability_tolerance,

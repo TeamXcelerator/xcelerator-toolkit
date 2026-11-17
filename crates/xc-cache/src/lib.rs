@@ -115,7 +115,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -133,6 +133,7 @@ pub const GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES: u64 = 100_000_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CacheError {
+    RefConflict(String),
     Io(String),
     Serialization(String),
     InvalidManifest(String),
@@ -147,9 +148,23 @@ pub enum CacheError {
     PermissionDenied(String),
 }
 
+impl CacheError {
+    fn skippable_candidate(&self) -> bool {
+        matches!(
+            self,
+            Self::NotFound(_)
+                | Self::Io(_)
+                | Self::DigestMismatch { .. }
+                | Self::Serialization(_)
+                | Self::InvalidManifest(_)
+        )
+    }
+}
+
 impl Display for CacheError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::RefConflict(head) => write!(f, "publication ref changed to {head}"),
             Self::Io(message) => write!(f, "cache I/O error: {message}"),
             Self::Serialization(message) => write!(f, "cache serialization error: {message}"),
             Self::InvalidManifest(message) => write!(f, "invalid cache manifest: {message}"),
@@ -181,7 +196,11 @@ impl Error for CacheError {}
 
 impl From<std::io::Error> for CacheError {
     fn from(value: std::io::Error) -> Self {
-        Self::Io(value.to_string())
+        if value.kind() == std::io::ErrorKind::PermissionDenied {
+            Self::PermissionDenied(value.to_string())
+        } else {
+            Self::Io(value.to_string())
+        }
     }
 }
 
@@ -514,6 +533,23 @@ pub struct ArtifactManifest {
 }
 
 impl ArtifactManifest {
+    /// Only an authenticated numerical envelope may use another store-local label.
+    fn accepts_lookup_key(&self, key: &ArtifactKey) -> Result<bool, CacheError> {
+        if self.key.kind != key.kind || self.key.parameters_digest != key.parameters_digest {
+            return Ok(false);
+        }
+        let Some(raw) = self.tags.get(SEMANTIC_KEY_MANIFEST_TAG) else {
+            return Ok(&self.key == key);
+        };
+        let semantic: SemanticKeyEnvelope = serde_json::from_str(raw)?;
+        if semantic.artifact_kind != key.kind || semantic.digest()? != key.parameters_digest {
+            return Err(CacheError::InvalidManifest(
+                "stored semantic envelope does not match its artifact key".into(),
+            ));
+        }
+        Ok(true)
+    }
+
     pub fn validate(&self) -> Result<(), CacheError> {
         self.key.validate()?;
         if let Some(provenance) = crate::local_manifest_provenance_v2(self)? {
@@ -658,6 +694,26 @@ impl CachePolicy {
         if let Err(error) = manifest.validate() {
             reasons.push(format!("manifest validation failed: {error}"));
         }
+        if let Some(encoded) = manifest.tags.get(SEMANTIC_KEY_MANIFEST_TAG) {
+            match serde_json::from_str::<SemanticKeyEnvelope>(encoded) {
+                Ok(key)
+                    if key.artifact_kind == manifest.key.kind
+                        && key
+                            .digest()
+                            .is_ok_and(|digest| digest == manifest.key.parameters_digest)
+                        && compatibility::supported_numerical_contract(&key) => {}
+                _ => reasons.push("unsupported or inconsistent numerical contract".into()),
+            }
+        } else if matches!(
+            manifest.key.kind.as_str(),
+            "ccm_finite_diagnostic_analysis"
+                | "ccm_transform_enclosure"
+                | "research_capture_receipt"
+                | "ccm_assembly_error_analysis"
+                | "ccm_u_flow_response_analysis"
+        ) {
+            reasons.push("affected computation is missing its numerical contract".into());
+        }
         // The producer floor applies to local entries as well as promoted shards.
         // Local schema/reader admission remains governed by this CachePolicy.
         if let Some(family) = production_staging::family_for_artifact_kind(&manifest.key.kind) {
@@ -673,11 +729,15 @@ impl CachePolicy {
                 }
                 _ => {}
             }
+        } else if ToolkitVersion::parse(compatibility::CLEAN_SLATE)
+            .is_ok_and(|floor| manifest.producer_toolkit_version < floor)
+        {
+            reasons.push("producer version below the minimum supported Toolkit release".to_owned());
         }
         // A promoted shard hit must pass the same canonical validation on
         // ordinary offline reuse as on identity lookup and publication.
         if manifest.tags.contains_key(REMOTE_CANONICAL_MANIFEST_TAG) {
-            if let Err(error) = validate_adopted_manifest(manifest) {
+            if let Err(error) = retained_canonical_manifest(manifest) {
                 reasons.push(format!("retained canonical binding failed: {error}"));
             }
         }
@@ -705,6 +765,13 @@ impl CachePolicy {
                 "current toolkit {:?} exceeds maximum reader {:?}",
                 self.current_toolkit_version, manifest.maximum_reader_version
             ));
+        }
+        if let Some(origin) = manifest.tags.get("xc.origin_visibility") {
+            if !serde_json::from_str::<CacheVisibility>(origin)
+                .is_ok_and(|v| self.allowed_visibilities.contains(&v))
+            {
+                reasons.push("original artifact visibility is not admitted".into());
+            }
         }
         if !self.allowed_visibilities.contains(&manifest.visibility) {
             reasons.push(format!(
@@ -847,6 +914,8 @@ impl CachePromotionPolicy {
         Ok(())
     }
 }
+
+const LOCAL_REFRESH_WRITE_TAG: &str = "xc.local.refresh_write";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ManifestIndex {
@@ -996,7 +1065,7 @@ impl Drop for VerifiedPayloadReader {
     fn drop(&mut self) {
         // Close first so cleanup also works on Windows.
         drop(self.file.take());
-        let _ = fs::remove_file(&self.path);
+        let _ = xc_core::remove_temporary_file(&self.path);
     }
 }
 
@@ -1035,8 +1104,25 @@ pub trait CacheStore: Send + Sync {
     fn name(&self) -> &str;
     fn writable(&self) -> bool;
     fn visibility(&self) -> CacheVisibility;
+    /// Whether an unsuccessful candidate transfer may fall through to another layer.
+    fn allows_payload_fallback(&self, error: &CacheError) -> bool {
+        error.skippable_candidate()
+    }
     fn put(&self, draft: &ArtifactDraft, payload: &[u8]) -> Result<ArtifactManifest, CacheError>;
     fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError>;
+
+    fn candidates_with_rejections(
+        &self,
+        key: &ArtifactKey,
+        _reject: &mut dyn FnMut(String),
+    ) -> Result<Vec<ArtifactManifest>, CacheError> {
+        self.candidates(key)
+    }
+
+    /// Records eligible for an explicitly digest-bound historical dependency.
+    fn exact_candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+        self.candidates(key)
+    }
     /// Enumerate artifact keys whose kind and logical key match a bounded
     /// semantic prefix. Implementations may return an empty set when their
     /// backing format predates searchable logical-key metadata.
@@ -1237,7 +1323,7 @@ pub struct FilesystemCacheStore {
     writable: bool,
     visibility: CacheVisibility,
     identity_query_cache: Mutex<HashMap<String, IdentityQueryMemo>>,
-    scanned_semantic_digests: Mutex<HashSet<ContentDigest>>,
+    scanned_semantic_digests: Mutex<HashMap<ContentDigest, Option<(u64, SystemTime)>>>,
 }
 
 impl FilesystemCacheStore {
@@ -1253,7 +1339,7 @@ impl FilesystemCacheStore {
             writable,
             visibility,
             identity_query_cache: Mutex::new(HashMap::new()),
-            scanned_semantic_digests: Mutex::new(HashSet::new()),
+            scanned_semantic_digests: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1272,86 +1358,148 @@ impl FilesystemCacheStore {
 
     fn key_directory(&self, key: &ArtifactKey) -> PathBuf {
         self.root
-            .join("artifacts-v2")
+            .join("artifacts-v3")
             .join(ContentDigest::sha256(key.kind.as_bytes()).0)
             .join(ContentDigest::sha256(key.logical_key.as_bytes()).0)
             .join(&key.parameters_digest.0)
     }
 
-    fn legacy_key_directory(&self, key: &ArtifactKey) -> Option<PathBuf> {
-        let kind = encode_component(&key.kind);
-        let logical = encode_component(&key.logical_key);
-        if matches!(kind.as_str(), "." | "..") || matches!(logical.as_str(), "." | "..") {
+    fn semantic_directory(&self, key: &ArtifactKey) -> PathBuf {
+        self.root
+            .join("artifacts-v3")
+            .join(ContentDigest::sha256(key.kind.as_bytes()).0)
+            .join("semantic")
+            .join(&key.parameters_digest.0)
+    }
+
+    fn manifest_filename(relative: &str) -> Option<(u64, bool, &str)> {
+        let name = relative.strip_prefix("manifests/")?.strip_suffix(".json")?;
+        let (ordinal, suffix) = name.split_once('-')?;
+        if ordinal.len() != 20 || !ordinal.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        Some(
-            self.root
-                .join("artifacts")
-                .join(kind)
-                .join(logical)
-                .join(&key.parameters_digest.0),
-        )
+        let digest = suffix.strip_prefix("refresh-").unwrap_or(suffix);
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some((ordinal.parse().ok()?, digest != suffix, digest))
     }
 
-    fn index_path(&self, key: &ArtifactKey) -> PathBuf {
-        self.key_directory(key).join("index.json")
-    }
-
-    fn load_index(&self, key: &ArtifactKey) -> Result<ManifestIndex, CacheError> {
+    fn indexed_candidates(
+        &self,
+        key: &ArtifactKey,
+        include_history: bool,
+        reject: &mut dyn FnMut(String),
+    ) -> Result<Vec<ArtifactManifest>, CacheError> {
         key.validate()?;
-        Self::load_index_at(&self.key_directory(key))
+        // The locked index records publication order, including writes in one second.
+        // Stable sorting retains that order within an equal producer and quality.
+        let mut manifests = Vec::new();
+        'directories: for (managed, directory) in [
+            (true, self.semantic_directory(key)),
+            (false, self.key_directory(key)),
+        ] {
+            for relative in Self::load_index_at(&directory)?.manifests.into_iter().rev() {
+                let (_, refresh_barrier, digest) =
+                    Self::manifest_filename(&relative).ok_or_else(|| {
+                        CacheError::InvalidManifest("invalid local manifest name".into())
+                    })?;
+                let path = directory.join(&relative);
+                let read = || -> Result<ArtifactManifest, CacheError> {
+                    let bytes = fs::read(&path)?;
+                    if ContentDigest::sha256(&bytes).0 != digest {
+                        return Err(CacheError::InvalidManifest(
+                            "local manifest record digest mismatch".into(),
+                        ));
+                    }
+                    let mut manifest: ArtifactManifest = serde_json::from_slice(&bytes)?;
+                    manifest.validate()?;
+                    if (!managed && &manifest.key != key) || !manifest.accepts_lookup_key(key)? {
+                        return Err(CacheError::InvalidManifest(
+                            "indexed manifest key mismatch".into(),
+                        ));
+                    }
+                    manifest.key.logical_key.clone_from(&key.logical_key);
+                    Ok(manifest)
+                };
+                match read() {
+                    Ok(manifest) => manifests.push(manifest),
+                    Err(error) if error.skippable_candidate() => {
+                        reject(format!("manifest {digest} unreadable or invalid"));
+                        xc_core::progress_message!(
+                            "cache candidate {} skipped: {error}",
+                            path.display()
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+                if refresh_barrier && !include_history {
+                    break 'directories;
+                }
+            }
+        }
+        manifests.sort_by(|left, right| {
+            right
+                .producer_toolkit_version
+                .cmp(&left.producer_toolkit_version)
+                .then_with(|| {
+                    right
+                        .quality
+                        .admissible_rank()
+                        .cmp(&left.quality.admissible_rank())
+                })
+        });
+        if !include_history
+            && manifests.windows(2).any(|pair| {
+                pair[0].producer_toolkit_version == pair[1].producer_toolkit_version
+                    && pair[0].quality == pair[1].quality
+                    && pair[0].content_digest != pair[1].content_digest
+            })
+        {
+            xc_core::progress_message!("cache key {} has conflicting same-producer payloads; selecting the newest admissible record", key.parameters_digest);
+        }
+        Ok(manifests)
     }
 
     fn load_index_at(key_directory: &Path) -> Result<ManifestIndex, CacheError> {
-        let path = key_directory.join("index.json");
-        if !path.exists() {
-            let manifest_directory = key_directory.join("manifests");
-            if !manifest_directory.exists() {
-                return Ok(ManifestIndex::default());
-            }
-            let mut manifests = Vec::new();
-            for entry in fs::read_dir(&manifest_directory)? {
-                let entry = entry?;
-                if entry.file_type()?.is_file()
-                    && entry
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension == "json")
-                {
-                    manifests.push(format!("manifests/{}", entry.file_name().to_string_lossy()));
+        let mut names = BTreeSet::new();
+        match fs::read(key_directory.join("index.json")) {
+            Ok(bytes) => {
+                if let Ok(index) = serde_json::from_slice::<ManifestIndex>(&bytes) {
+                    if index.schema_version == 1 {
+                        names.extend(
+                            index
+                                .manifests
+                                .into_iter()
+                                .filter(|name| Self::manifest_filename(name).is_some()),
+                        );
+                    }
                 }
             }
-            manifests.sort();
-            return Ok(ManifestIndex {
-                schema_version: 1,
-                manifests,
-            });
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
         }
-        let bytes = fs::read(&path)?;
-        let index: ManifestIndex = serde_json::from_slice(&bytes)?;
-        if index.schema_version != 1 {
-            return Err(CacheError::InvalidManifest(format!(
-                "unsupported manifest index schema {} at {}",
-                index.schema_version,
-                path.display()
-            )));
-        }
-        let mut seen = BTreeSet::new();
-        for relative in &index.manifests {
-            let fields = relative.split('/').collect::<Vec<_>>();
-            if fields.len() != 2
-                || fields[0] != "manifests"
-                || fields[1].is_empty()
-                || !fields[1].ends_with(".json")
-                || relative.contains(['\\', ':'])
-                || !seen.insert(relative)
-            {
-                return Err(CacheError::InvalidManifest(
-                    "manifest index contains an unsafe or duplicate entry".to_owned(),
-                ));
+        // A writer can stop between installing an immutable record and replacing
+        // its index. Include those records and preserve indexed refresh barriers
+        // even if a subsequent copy lost their manifest file.
+        match fs::read_dir(key_directory.join("manifests")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let relative = format!("manifests/{}", entry.file_name().to_string_lossy());
+                    if Self::manifest_filename(&relative).is_some() && entry.file_type()?.is_file()
+                    {
+                        names.insert(relative);
+                    }
+                }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
         }
-        Ok(index)
+        Ok(ManifestIndex {
+            schema_version: 1,
+            manifests: names.into_iter().collect(),
+        })
     }
 
     fn identity_inventory_key(identity: &crate::PayloadDependencyIdentity) -> String {
@@ -1413,7 +1561,11 @@ impl FilesystemCacheStore {
         };
         let path = self.object_path(&object.content_digest);
         if path.exists() {
-            self.verify_object(&object)?;
+            match self.verify_object(&object) {
+                Ok(()) => {}
+                Err(CacheError::DigestMismatch { .. }) => atomic_replace(&path, payload)?,
+                Err(error) => return Err(error),
+            }
         } else {
             atomic_write(&path, payload)?;
         }
@@ -1440,8 +1592,11 @@ impl FilesystemCacheStore {
         };
         let path = self.object_path(&object.content_digest);
         if path.exists() {
-            self.verify_object(&object)?;
-            return Ok(object);
+            match self.verify_object(&object) {
+                Ok(()) => return Ok(object),
+                Err(CacheError::DigestMismatch { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -1464,12 +1619,17 @@ impl FilesystemCacheStore {
             match fs::hard_link(&temporary, &path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.verify_object(&object)
+                    match self.verify_object(&object) {
+                        Err(CacheError::DigestMismatch { .. }) => {
+                            rename_replacement(&temporary, &path).map_err(CacheError::from)
+                        }
+                        result => result,
+                    }
                 }
                 Err(error) => Err(error.into()),
             }
         })();
-        let _ = fs::remove_file(&temporary);
+        let _ = xc_core::remove_temporary_file(&temporary);
         result?;
         Ok(object)
     }
@@ -1494,6 +1654,8 @@ impl FilesystemCacheStore {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| CacheError::Io(error.to_string()))?
             .as_secs();
+        let mut manifest_tags = draft.tags.clone();
+        let refreshed = manifest_tags.remove(LOCAL_REFRESH_WRITE_TAG).is_some();
         let manifest = ArtifactManifest {
             schema_version: draft.schema_version,
             key: draft.key.clone(),
@@ -1508,36 +1670,58 @@ impl FilesystemCacheStore {
             visibility: draft.visibility,
             immutable: draft.immutable,
             dependencies: draft.dependencies.clone(),
-            tags: draft.tags.clone(),
+            tags: manifest_tags,
             provenance_digest: draft.provenance_digest.clone(),
         };
         manifest.validate()?;
 
-        let key_directory = self.key_directory(&manifest.key);
+        let key_directory = if manifest.tags.contains_key(SEMANTIC_KEY_MANIFEST_TAG) {
+            self.semantic_directory(&manifest.key)
+        } else {
+            self.key_directory(&manifest.key)
+        };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_record_digest = ContentDigest::sha256(&manifest_bytes);
-        let manifest_name = format!(
-            "{}-{}.json",
-            manifest.created_unix_seconds, manifest_record_digest.0
-        );
-        let relative_manifest = PathBuf::from("manifests").join(manifest_name);
-        let manifest_path = key_directory.join(&relative_manifest);
-        atomic_write(&manifest_path, &manifest_bytes)?;
-
-        with_record_update_lock(&self.index_path(&manifest.key), || {
-            let mut index = self.load_index(&manifest.key)?;
-            let relative_string = relative_manifest.to_string_lossy().replace('\\', "/");
-            if !index
-                .manifests
-                .iter()
-                .any(|entry| entry == &relative_string)
-            {
-                index.manifests.push(relative_string);
-            }
-            let index_bytes = serde_json::to_vec_pretty(&index)?;
-            atomic_replace(&self.index_path(&manifest.key), &index_bytes)
+        let manifest_path = with_record_update_lock(&key_directory.join("index.json"), || {
+            let mut index = Self::load_index_at(&key_directory)?;
+            // Under the index lock the ordinal is monotonic even when writers
+            // share a timestamp. Sorting immutable names reconstructs that order.
+            let marker = if refreshed { "refresh-" } else { "" };
+            let ordinal = if let Some(last) = index.manifests.last() {
+                let (ordinal, was_refresh, digest) =
+                    Self::manifest_filename(last).ok_or_else(|| {
+                        CacheError::InvalidManifest("invalid local manifest name".into())
+                    })?;
+                if digest == manifest_record_digest.0
+                    && (was_refresh || !refreshed)
+                    && fs::read(key_directory.join(last)).is_ok_and(|bytes| bytes == manifest_bytes)
+                {
+                    return Ok(key_directory.join(last));
+                }
+                ordinal.checked_add(1).ok_or_else(|| {
+                    CacheError::InvalidManifest("local manifest ordinal overflow".into())
+                })?
+            } else {
+                0
+            };
+            let relative = format!(
+                "manifests/{ordinal:020}-{marker}{}.json",
+                manifest_record_digest.0
+            );
+            let path = key_directory.join(&relative);
+            atomic_write(&path, &manifest_bytes)?;
+            index.manifests.push(relative);
+            atomic_replace(
+                &key_directory.join("index.json"),
+                &serde_json::to_vec_pretty(&index)?,
+            )?;
+            Ok(path)
         })?;
-        self.update_ccm_eigenpair_continuation_inventory(&manifest, manifest_record_digest)?;
+        if let Err(error) =
+            self.update_ccm_eigenpair_continuation_inventory(&manifest, manifest_record_digest)
+        {
+            xc_core::progress_message!("optional continuation inventory was not updated: {error}");
+        }
         let root_relative_manifest = self.root_relative_path(&manifest_path)?;
         if let Some(entry) = Self::identity_inventory_entry(&manifest, &root_relative_manifest) {
             self.record_identity_inventory_entries(&manifest.key.parameters_digest, vec![entry])?;
@@ -1559,7 +1743,7 @@ impl FilesystemCacheStore {
     fn identity_inventory_path(&self, semantic_digest: &ContentDigest) -> PathBuf {
         let prefix = semantic_digest.0.get(0..2).unwrap_or("00");
         self.root
-            .join("identities")
+            .join("identities-v3")
             .join(prefix)
             .join(format!("{}.json", semantic_digest.0))
     }
@@ -1575,7 +1759,19 @@ impl FilesystemCacheStore {
     fn load_identity_inventory(path: &Path) -> Result<IdentityInventory, CacheError> {
         match fs::read(path) {
             Ok(bytes) => {
-                let inventory: IdentityInventory = serde_json::from_slice(&bytes)?;
+                let inventory: IdentityInventory = match serde_json::from_slice(&bytes) {
+                    Ok(inventory) => inventory,
+                    Err(error) => {
+                        xc_core::progress_message!(
+                            "rebuilding invalid identity inventory {}: {error}",
+                            path.display()
+                        );
+                        return Ok(IdentityInventory {
+                            schema_version: 1,
+                            entries: Vec::new(),
+                        });
+                    }
+                };
                 if inventory.schema_version != 1 {
                     return Err(CacheError::InvalidManifest(format!(
                         "unsupported identity inventory schema {} at {}",
@@ -1699,15 +1895,9 @@ impl FilesystemCacheStore {
                 .manifest_path
                 .split('/')
                 .fold(self.root.clone(), |path, component| path.join(component));
-            let bytes = match fs::read(&manifest_path) {
-                Ok(bytes) => bytes,
-                // A pruned manifest leaves a dangling inventory entry; it is
-                // simply not a candidate.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+            let Some(manifest) = Self::read_candidate_manifest(&manifest_path)? else {
+                continue;
             };
-            let manifest: ArtifactManifest = serde_json::from_slice(&bytes)?;
-            manifest.validate()?;
             if manifest.key.parameters_digest == identity.semantic_digest
                 && manifest_matches_dependency_identity(&manifest, identity)?
             {
@@ -1717,18 +1907,32 @@ impl FilesystemCacheStore {
         Ok(matches)
     }
 
-    /// Enumerate every retained manifest under one semantic digest by
-    /// entering only the matching `<logical-key>/<semantic-digest>/manifests`
-    /// directories. This is the bounded legacy path for caches written before
-    /// the identity inventory existed or by an older writer.
+    fn read_candidate_manifest(path: &Path) -> Result<Option<ArtifactManifest>, CacheError> {
+        let read = || -> Result<ArtifactManifest, CacheError> {
+            let manifest: ArtifactManifest = serde_json::from_slice(&fs::read(path)?)?;
+            manifest.validate()?;
+            Ok(manifest)
+        };
+        match read() {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(error) if error.skippable_candidate() => {
+                xc_core::progress_message!("cache candidate {} skipped: {error}", path.display());
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Rebuild the optional identity inventory using the current artifact layout.
     fn scan_semantic_digest_manifests(
         &self,
         semantic_digest: &ContentDigest,
     ) -> Result<Vec<(ArtifactManifest, String)>, CacheError> {
         let mut discovered = Vec::new();
-        for artifacts_root in [self.root.join("artifacts-v2"), self.root.join("artifacts")] {
+        {
+            let artifacts_root = self.root.join("artifacts-v3");
             if !artifacts_root.is_dir() {
-                continue;
+                return Ok(discovered);
             }
             for kind_entry in fs::read_dir(&artifacts_root)? {
                 let kind_path = kind_entry?.path();
@@ -1755,9 +1959,9 @@ impl FilesystemCacheStore {
                         {
                             continue;
                         }
-                        let manifest: ArtifactManifest =
-                            serde_json::from_slice(&fs::read(entry.path())?)?;
-                        manifest.validate()?;
+                        let Some(manifest) = Self::read_candidate_manifest(&entry.path())? else {
+                            continue;
+                        };
                         if manifest.key.parameters_digest != *semantic_digest {
                             continue;
                         }
@@ -1905,45 +2109,6 @@ impl FilesystemCacheStore {
     }
 }
 
-fn validate_adopted_manifest(manifest: &ArtifactManifest) -> Result<(), CacheError> {
-    let canonical: CanonicalArtifactManifest = serde_json::from_str(
-        manifest
-            .tags
-            .get(REMOTE_CANONICAL_MANIFEST_TAG)
-            .ok_or_else(|| {
-                CacheError::InvalidManifest(
-                    "adopted artifact lacks its canonical manifest".to_owned(),
-                )
-            })?,
-    )?;
-    let semantic_key: SemanticKeyEnvelope = serde_json::from_str(
-        manifest
-            .tags
-            .get(SEMANTIC_KEY_MANIFEST_TAG)
-            .ok_or_else(|| {
-                CacheError::InvalidManifest("adopted artifact lacks its semantic key".to_owned())
-            })?,
-    )?;
-    semantic_key.validate()?;
-    if semantic_key.artifact_kind != manifest.key.kind
-        || semantic_key.digest()? != manifest.key.parameters_digest
-    {
-        return Err(CacheError::InvalidManifest(
-            "adopted artifact key disagrees with retained semantics".to_owned(),
-        ));
-    }
-    let family = production_staging::family_for_artifact_kind(&semantic_key.artifact_kind)
-        .ok_or_else(|| CacheError::InvalidManifest("unknown adopted artifact family".to_owned()))?;
-    validate_retained_canonical_binding(
-        &canonical,
-        &semantic_key,
-        family,
-        &manifest.content_digest,
-        manifest.size_bytes,
-        manifest.provenance_digest.as_ref(),
-    )
-}
-
 /// Whether a locally retained manifest is the artifact a published
 /// dependency identity names.
 ///
@@ -1977,16 +2142,7 @@ fn manifest_matches_dependency_identity(
     else {
         return Ok(false);
     };
-    if validate_retained_canonical_binding(
-        &canonical,
-        &semantic_key,
-        family,
-        &manifest.content_digest,
-        manifest.size_bytes,
-        manifest.provenance_digest.as_ref(),
-    )
-    .is_err()
-    {
+    if validate_retained_canonical_binding(&canonical, &semantic_key, family, manifest).is_err() {
         return Ok(false);
     }
     Ok(canonical.artifact_family == identity.artifact_family
@@ -2018,8 +2174,7 @@ impl CacheStore for FilesystemCacheStore {
         // The persistent inventory answers exact identity queries without
         // touching the artifact directory tree. An absent entry triggers at
         // most one bounded directory scan per semantic digest per process,
-        // which also repairs the inventory for manifests written before it
-        // existed or by an older toolkit.
+        // to reconstruct a missing inventory from verified current manifests.
         let mut matches = self.identity_matches_from_inventory(identity, &inventory_path)?;
         if matches.is_empty() {
             // A read-only store cannot persist the rebuilt inventory. Scan on
@@ -2029,7 +2184,8 @@ impl CacheStore for FilesystemCacheStore {
                 self.scanned_semantic_digests
                     .lock()
                     .map_err(|_| CacheError::Io("cache identity scan lock poisoned".to_owned()))?
-                    .insert(identity.semantic_digest.clone())
+                    .insert(identity.semantic_digest.clone(), signature)
+                    != Some(signature)
             } else {
                 true
             };
@@ -2095,53 +2251,19 @@ impl CacheStore for FilesystemCacheStore {
     }
 
     fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
-        key.validate()?;
-        let mut directories = vec![(self.key_directory(key), false)];
-        if let Some(legacy) = self.legacy_key_directory(key) {
-            directories.push((legacy, true));
-        }
-        let mut manifests = Vec::new();
-        let mut seen = BTreeSet::new();
-        for (key_directory, legacy) in directories {
-            for relative in Self::load_index_at(&key_directory)?.manifests {
-                let path = key_directory.join(relative);
-                let bytes = fs::read(&path)?;
-                let manifest: ArtifactManifest = serde_json::from_slice(&bytes)?;
-                manifest.validate()?;
-                if &manifest.key != key {
-                    if legacy {
-                        continue;
-                    }
-                    return Err(CacheError::InvalidManifest(format!(
-                        "manifest key mismatch at {}",
-                        path.display()
-                    )));
-                }
-                if seen.insert(ContentDigest::sha256(&serde_json::to_vec(&manifest)?)) {
-                    manifests.push(manifest);
-                }
-            }
-        }
-        let mut ranked = manifests
-            .into_iter()
-            .map(|manifest| {
-                let digest = ContentDigest::sha256(&serde_json::to_vec(&manifest)?);
-                Ok((digest, manifest))
-            })
-            .collect::<Result<Vec<_>, CacheError>>()?;
-        ranked.sort_by(|(left_digest, left), (right_digest, right)| {
-            right
-                .producer_toolkit_version
-                .cmp(&left.producer_toolkit_version)
-                .then_with(|| {
-                    right
-                        .quality
-                        .admissible_rank()
-                        .cmp(&left.quality.admissible_rank())
-                })
-                .then_with(|| left_digest.cmp(right_digest))
-        });
-        Ok(ranked.into_iter().map(|(_, manifest)| manifest).collect())
+        self.indexed_candidates(key, false, &mut |_| {})
+    }
+
+    fn candidates_with_rejections(
+        &self,
+        key: &ArtifactKey,
+        reject: &mut dyn FnMut(String),
+    ) -> Result<Vec<ArtifactManifest>, CacheError> {
+        self.indexed_candidates(key, false, reject)
+    }
+
+    fn exact_candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+        self.indexed_candidates(key, true, &mut |_| {})
     }
 
     fn matching_keys(
@@ -2179,9 +2301,9 @@ impl CacheStore for FilesystemCacheStore {
                         {
                             continue;
                         }
-                        let manifest: ArtifactManifest =
-                            serde_json::from_slice(&fs::read(entry.path())?)?;
-                        manifest.validate()?;
+                        let Some(manifest) = Self::read_candidate_manifest(&entry.path())? else {
+                            continue;
+                        };
                         if manifest.key.kind == kind
                             && manifest.key.logical_key.starts_with(logical_key_prefix)
                         {
@@ -2438,7 +2560,7 @@ impl ZipJsonFilesystemCacheStore {
         // The owned handle has closed on every path, including writer errors,
         // before Windows cleanup. A successful link owns the same bytes and
         // does not require a second compressed copy or compression pass.
-        let _ = fs::remove_file(&temporary);
+        let _ = xc_core::remove_temporary_file(&temporary);
         result
     }
 
@@ -2451,42 +2573,54 @@ impl ZipJsonFilesystemCacheStore {
     ) -> Result<(), CacheError> {
         let path = self.inner.object_path(&object.content_digest);
         fs::create_dir_all(path.parent().expect("object path has a parent"))?;
-        // On the bounded-memory route, never replace an existing canonical
-        // object. Concurrent writers verify the winner, including corruption.
         match link(temporary, &path) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                self.inner.verify_object(object)
-            }
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::Unsupported
+                    std::io::ErrorKind::AlreadyExists
+                        | std::io::ErrorKind::Unsupported
                         | std::io::ErrorKind::PermissionDenied
                         | std::io::ErrorKind::CrossesDevices
                 ) =>
             {
-                // Preserve the old filesystem support when links are not
-                // available. This exceptional route retains a compressed Vec
-                // and uses the original object publication/collision checks;
-                // it does not compress again or use an unchecked rename.
-                let _stage = zip_write_stage("cache.zip.memory_fallback", draft, "memory_fallback");
-                if path.exists() {
-                    return self.inner.verify_object(object);
+                let _stage = zip_write_stage("cache.zip.file_repair", draft, "file");
+                if self.inner.verify_object(object).is_ok() {
+                    return Ok(());
                 }
-                let encoded = fs::read(temporary)?;
-                let digest = ContentDigest::sha256(&encoded);
-                if digest != object.content_digest || encoded.len() as u64 != object.size_bytes {
-                    return Err(CacheError::DigestMismatch {
-                        expected: format!(
-                            "{} ({} bytes)",
-                            object.content_digest, object.size_bytes
-                        ),
-                        actual: format!("{digest} ({} bytes)", encoded.len()),
-                    });
-                }
-                self.inner.ensure_object(&encoded)?;
-                Ok(())
+                let lock = self
+                    .inner
+                    .root
+                    .join("object-locks")
+                    .join(&object.content_digest.0);
+                with_record_update_lock(&lock, || {
+                    match self.inner.verify_object(object) {
+                        Ok(()) => return Ok(()),
+                        Err(CacheError::NotFound(_) | CacheError::DigestMismatch { .. }) => {}
+                        Err(error) => return Err(error),
+                    }
+                    let parent = path.parent().expect("object path has a parent");
+                    let (sibling, mut output) = create_private_sibling_file(parent, "xc-repair")?;
+                    let result = (|| -> Result<(), CacheError> {
+                        std::io::copy(&mut fs::File::open(temporary)?, &mut output)?;
+                        output.sync_all()?;
+                        drop(output);
+                        let (digest, size) = digest_file(&sibling)?;
+                        if digest != object.content_digest || size != object.size_bytes {
+                            return Err(CacheError::DigestMismatch {
+                                expected: format!(
+                                    "{} ({} bytes)",
+                                    object.content_digest, object.size_bytes
+                                ),
+                                actual: format!("{digest} ({size} bytes)"),
+                            });
+                        }
+                        rename_replacement(&sibling, &path)?;
+                        Ok(())
+                    })();
+                    let _ = xc_core::remove_temporary_file(&sibling);
+                    result
+                })
             }
             Err(error) => Err(error.into()),
         }
@@ -2830,6 +2964,18 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
         self.inner.candidates(key)
     }
 
+    fn candidates_with_rejections(
+        &self,
+        key: &ArtifactKey,
+        reject: &mut dyn FnMut(String),
+    ) -> Result<Vec<ArtifactManifest>, CacheError> {
+        self.inner.candidates_with_rejections(key, reject)
+    }
+
+    fn exact_candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+        self.inner.exact_candidates(key)
+    }
+
     fn matching_keys(
         &self,
         kind: &str,
@@ -3021,6 +3167,44 @@ impl CacheResolver {
         Self { layers }
     }
 
+    /// Local bytes copied from a remote retain their original publication authority.
+    /// Recheck the exact envelope against that destination before serving the local copy.
+    fn admitted(
+        &self,
+        manifest: &ArtifactManifest,
+        policy: &CachePolicy,
+    ) -> Result<bool, CacheError> {
+        if !policy.accepts(manifest) {
+            return Ok(false);
+        }
+        let Some(origin) = manifest.tags.get("xc.origin_visibility") else {
+            return Ok(true);
+        };
+        if manifest.visibility != CacheVisibility::Local {
+            return Ok(true);
+        }
+        let origin: CacheVisibility = serde_json::from_str(origin)?;
+        if origin == CacheVisibility::Local {
+            return Ok(true);
+        }
+        let Some(identity) = FilesystemCacheStore::manifest_dependency_identity(manifest) else {
+            return Ok(false);
+        };
+        for layer in &self.layers {
+            if layer.store.visibility() != origin {
+                continue;
+            }
+            for remote in layer.store.identity_candidates(&identity)? {
+                if policy.accepts(&remote)
+                    && manifest_matches_dependency_identity(&remote, &identity)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub fn verified_transport_parts(
         &self,
         layer_name: &str,
@@ -3048,19 +3232,21 @@ impl CacheResolver {
         for dependency in dependencies {
             let mut found = false;
             for (index, layer) in self.layers.iter().enumerate() {
-                if let Some(manifest) =
-                    layer
-                        .store
-                        .candidates(&dependency.key)?
-                        .into_iter()
-                        .find(|manifest| {
-                            manifest.content_digest == dependency.content_digest
-                                && manifest.quality.satisfies(dependency.required_quality)
-                                && policy.accepts(manifest)
-                        })
-                {
+                for manifest in layer.store.exact_candidates(&dependency.key)? {
+                    if !self.exact_candidate_accepted(
+                        &manifest,
+                        &dependency.key,
+                        &dependency.content_digest,
+                        dependency.required_quality,
+                        policy,
+                    )? {
+                        continue;
+                    }
                     selected[index].push(manifest);
                     found = true;
+                    break;
+                }
+                if found {
                     break;
                 }
             }
@@ -3095,7 +3281,7 @@ impl CacheResolver {
             let mut found = false;
             for (index, layer) in self.layers.iter().enumerate() {
                 for manifest in layer.store.identity_candidates(identity)? {
-                    if !policy.accepts(&manifest) {
+                    if !self.admitted(&manifest, policy)? {
                         continue;
                     }
                     if !manifest_matches_dependency_identity(&manifest, identity)? {
@@ -3139,7 +3325,7 @@ impl CacheResolver {
         let mut rejected = Vec::new();
         for layer in &self.layers {
             for manifest in layer.store.candidates(key)? {
-                if policy.accepts(&manifest) {
+                if &manifest.key == key && self.admitted(&manifest, policy)? {
                     return Ok((layer.store.name().to_owned(), manifest));
                 }
                 rejected.push(format!(
@@ -3165,10 +3351,35 @@ impl CacheResolver {
         content_digest: &ContentDigest,
         policy: &CachePolicy,
     ) -> Result<Vec<u8>, CacheError> {
+        self.read_exact_payload_with_quality(key, content_digest, policy.minimum_quality, policy)
+    }
+
+    fn read_exact_payload_with_quality(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+        required_quality: CacheQuality,
+        policy: &CachePolicy,
+    ) -> Result<Vec<u8>, CacheError> {
         for layer in &self.layers {
-            for manifest in layer.store.candidates(key)? {
-                if &manifest.content_digest == content_digest && policy.accepts(&manifest) {
-                    return layer.store.read_payload(&manifest);
+            for manifest in layer.store.exact_candidates(key)? {
+                if self.exact_candidate_accepted(
+                    &manifest,
+                    key,
+                    content_digest,
+                    required_quality,
+                    policy,
+                )? {
+                    match layer.store.read_payload(&manifest) {
+                        Err(error) if layer.store.allows_payload_fallback(&error) => {
+                            xc_core::progress_message!(
+                                "exact cache candidate in {} skipped: {error}",
+                                layer.store.name()
+                            );
+                            continue;
+                        }
+                        result => return result,
+                    }
                 }
             }
         }
@@ -3185,8 +3396,11 @@ impl CacheResolver {
         policy: &CachePolicy,
     ) -> Result<(String, ArtifactManifest), CacheError> {
         for layer in &self.layers {
-            for manifest in layer.store.candidates(key)? {
-                if &manifest.content_digest == content_digest && policy.accepts(&manifest) {
+            for manifest in layer.store.exact_candidates(key)? {
+                if &manifest.key == key
+                    && &manifest.content_digest == content_digest
+                    && self.admitted(&manifest, policy)?
+                {
                     return Ok((layer.store.name().to_owned(), manifest));
                 }
             }
@@ -3273,26 +3487,139 @@ impl CacheResolver {
         key: &ArtifactKey,
         policy: &CachePolicy,
     ) -> Result<ResolvedArtifact, CacheError> {
+        self.resolve_validated(key, policy, false, |_| Ok(None), |_| Ok(()))
+            .map(|(record, (), _)| record)
+    }
+
+    fn resolve_validated<T>(
+        &self,
+        key: &ArtifactKey,
+        policy: &CachePolicy,
+        recompute_rejected: bool,
+        mut dependency_rejection: impl FnMut(&ArtifactManifest) -> Result<Option<String>, CacheError>,
+        mut validate: impl FnMut(&[u8]) -> Result<T, CacheError>,
+    ) -> Result<
+        (
+            ResolvedArtifact,
+            T,
+            Vec<xc_core::CacheCandidateRejectionProvenance>,
+        ),
+        CacheError,
+    > {
         let mut rejected = Vec::new();
+        let mut skipped = Vec::new();
+        let mut last_validation_error = None;
         for layer in &self.layers {
-            for manifest in layer.store.candidates(key)? {
-                if !policy.accepts(&manifest) {
+            let mut record_skip = |stage: &str, reason: String| {
+                skipped.push(xc_core::CacheCandidateRejectionProvenance {
+                    overlay: layer.store.name().to_owned(),
+                    source: None,
+                    stage: stage.to_owned(),
+                    reason,
+                });
+            };
+            for manifest in layer
+                .store
+                .candidates_with_rejections(key, &mut |reason| record_skip("manifest", reason))?
+            {
+                if &manifest.key != key || !self.admitted(&manifest, policy)? {
+                    let reason = if &manifest.key != key {
+                        "candidate key mismatch".to_owned()
+                    } else {
+                        let reasons = policy.assess(&manifest).reasons;
+                        if reasons.is_empty() {
+                            "remote origin admission failed".to_owned()
+                        } else {
+                            reasons.join(", ")
+                        }
+                    };
+                    record_skip("admission", reason.clone());
                     rejected.push(format!(
-                        "{}:{}:{:?}",
+                        "{}:{}: {reason}",
                         layer.store.name(),
-                        manifest.content_digest,
-                        manifest.quality
+                        manifest.content_digest
                     ));
                     continue;
                 }
-                let (payload, encoded_payload) = layer.store.read_payload_and_encoded(&manifest)?;
-                return Ok(ResolvedArtifact {
-                    layer_name: layer.store.name().to_owned(),
-                    manifest,
-                    payload,
-                    encoded_payload,
-                });
+                if let Some(reason) = dependency_rejection(&manifest)? {
+                    xc_core::progress_message!(
+                        "cache candidate {} in {} skipped: {reason}",
+                        key.kind,
+                        layer.store.name()
+                    );
+                    record_skip("dependencies", reason.clone());
+                    rejected.push(reason);
+                    continue;
+                }
+                let (payload, encoded_payload) = match layer
+                    .store
+                    .read_payload_and_encoded(&manifest)
+                {
+                    Ok(payload) => payload,
+                    Err(error) if layer.store.allows_payload_fallback(&error) => {
+                        record_skip(
+                            "transport",
+                            format!("payload {} unavailable or damaged", manifest.content_digest),
+                        );
+                        rejected.push(format!(
+                            "{}: {}: {error}",
+                            layer.store.name(),
+                            manifest.content_digest
+                        ));
+                        xc_core::progress_message!(
+                            "cache payload {} in {} skipped: {error}",
+                            manifest.content_digest,
+                            layer.store.name()
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let value = match validate(&payload) {
+                    Ok(value) => value,
+                    // Domain adapters can wrap a run resource error during decoding.
+                    // Such a refusal says nothing about the validity of these bytes.
+                    Err(CacheError::InvalidManifest(message))
+                        if message.contains("run memory budget exceeded") =>
+                    {
+                        return Err(CacheError::ResourceLimit(message));
+                    }
+                    Err(
+                        error @ (CacheError::Serialization(_)
+                        | CacheError::InvalidManifest(_)
+                        | CacheError::DigestMismatch { .. }),
+                    ) => {
+                        xc_core::progress_message!(
+                            "cache domain validation rejected {} in {}: {error}",
+                            manifest.content_digest,
+                            layer.store.name()
+                        );
+                        record_skip(
+                            "validation",
+                            format!("domain validator rejected {}", manifest.content_digest),
+                        );
+                        last_validation_error = Some(error);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                return Ok((
+                    ResolvedArtifact {
+                        layer_name: layer.store.name().to_owned(),
+                        manifest,
+                        payload,
+                        encoded_payload,
+                    },
+                    value,
+                    skipped,
+                ));
             }
+        }
+        if let Some(error) = last_validation_error {
+            if !recompute_rejected {
+                return Err(error);
+            }
+            rejected.push(error.to_string());
         }
         Err(CacheError::NotFound(format!(
             "{} / {}; rejected candidates: {}",
@@ -3315,16 +3642,29 @@ impl CacheResolver {
         policy: &CachePolicy,
     ) -> Result<ResolvedArtifact, CacheError> {
         for layer in &self.layers {
-            for manifest in layer.store.candidates(key)? {
-                if !Self::exact_candidate_accepted(
+            for manifest in layer.store.exact_candidates(key)? {
+                if !self.exact_candidate_accepted(
                     &manifest,
+                    key,
                     content_digest,
                     required_quality,
                     policy,
-                ) {
+                )? {
                     continue;
                 }
-                let (payload, encoded_payload) = layer.store.read_payload_and_encoded(&manifest)?;
+                let (payload, encoded_payload) =
+                    match layer.store.read_payload_and_encoded(&manifest) {
+                        Ok(payload) => payload,
+                        Err(error) if layer.store.allows_payload_fallback(&error) => {
+                            xc_core::progress_message!(
+                                "cache payload {} in {} skipped: {error}",
+                                manifest.content_digest,
+                                layer.store.name()
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                 return Ok(ResolvedArtifact {
                     layer_name: layer.store.name().to_owned(),
                     manifest,
@@ -3353,20 +3693,31 @@ impl CacheResolver {
         maximum_decoded_bytes: u64,
     ) -> Result<ResolvedPayloadReader, CacheError> {
         for layer in &self.layers {
-            for manifest in layer.store.candidates(key)? {
-                if !Self::exact_candidate_accepted(
+            for manifest in layer.store.exact_candidates(key)? {
+                if !self.exact_candidate_accepted(
                     &manifest,
+                    key,
                     content_digest,
                     required_quality,
                     policy,
-                ) {
+                )? {
                     continue;
                 }
-                let payload = layer.store.open_payload(
+                let payload = match layer.store.open_payload(
                     &manifest,
                     scratch_directory,
                     maximum_decoded_bytes,
-                )?;
+                ) {
+                    Ok(payload) => payload,
+                    Err(error) if layer.store.allows_payload_fallback(&error) => {
+                        xc_core::progress_message!(
+                            "exact cache candidate in {} skipped: {error}",
+                            layer.store.name()
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 return Ok(ResolvedPayloadReader {
                     layer_name: layer.store.name().to_owned(),
                     manifest,
@@ -3380,15 +3731,55 @@ impl CacheResolver {
         )))
     }
 
+    fn exact_dependency_manifest(
+        &self,
+        dependency: &DependencyRef,
+        policy: &CachePolicy,
+    ) -> Result<Option<ArtifactManifest>, CacheError> {
+        for layer in &self.layers {
+            for manifest in layer.store.exact_candidates(&dependency.key)? {
+                if self.exact_candidate_accepted(
+                    &manifest,
+                    &dependency.key,
+                    &dependency.content_digest,
+                    dependency.required_quality,
+                    policy,
+                )? {
+                    return Ok(Some(manifest));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn exact_candidate_accepted(
+        &self,
         manifest: &ArtifactManifest,
+        key: &ArtifactKey,
         content_digest: &ContentDigest,
         required_quality: CacheQuality,
         policy: &CachePolicy,
-    ) -> bool {
-        &manifest.content_digest == content_digest
+    ) -> Result<bool, CacheError> {
+        Ok(&manifest.key == key
+            && &manifest.content_digest == content_digest
             && manifest.quality.satisfies(required_quality)
-            && policy.accepts(manifest)
+            && self.admitted(manifest, policy)?)
+    }
+
+    fn encoded_candidate(
+        layer: &CacheLayer,
+        manifest: ArtifactManifest,
+    ) -> Result<Option<ResolvedEncodedArtifact>, CacheError> {
+        let Some(encoded) = layer.store.verified_encoded_payload(&manifest)? else {
+            return Ok(None);
+        };
+        let transport = layer.store.verified_transport_parts(&manifest)?;
+        Ok(Some(ResolvedEncodedArtifact {
+            layer_name: layer.store.name().to_owned(),
+            manifest,
+            encoded,
+            transport,
+        }))
     }
 
     /// Resolve one exact key/content pair as metadata plus its verified
@@ -3403,25 +3794,25 @@ impl CacheResolver {
         policy: &CachePolicy,
     ) -> Result<Option<ResolvedEncodedArtifact>, CacheError> {
         for layer in &self.layers {
-            for manifest in layer.store.candidates(key)? {
-                if !Self::exact_candidate_accepted(
+            for manifest in layer.store.exact_candidates(key)? {
+                if !self.exact_candidate_accepted(
                     &manifest,
+                    key,
                     content_digest,
                     required_quality,
                     policy,
-                ) {
+                )? {
                     continue;
                 }
-                let Some(encoded) = layer.store.verified_encoded_payload(&manifest)? else {
-                    return Ok(None);
-                };
-                let transport = layer.store.verified_transport_parts(&manifest)?;
-                return Ok(Some(ResolvedEncodedArtifact {
-                    layer_name: layer.store.name().to_owned(),
-                    manifest,
-                    encoded,
-                    transport,
-                }));
+                match Self::encoded_candidate(layer, manifest) {
+                    Err(error) if layer.store.allows_payload_fallback(&error) => {
+                        xc_core::progress_message!(
+                            "encoded cache candidate in {} skipped: {error}",
+                            layer.store.name()
+                        );
+                    }
+                    result => return result,
+                }
             }
         }
         Ok(None)
@@ -3438,7 +3829,7 @@ impl CacheResolver {
         identity.validate()?;
         for layer in &self.layers {
             for manifest in layer.store.identity_candidates(identity)? {
-                if !policy.accepts(&manifest) {
+                if !self.admitted(&manifest, policy)? {
                     continue;
                 }
                 if !manifest_matches_dependency_identity(&manifest, identity)? {
@@ -3464,7 +3855,7 @@ impl CacheResolver {
         identity.validate()?;
         for layer in &self.layers {
             for manifest in layer.store.identity_candidates(identity)? {
-                if !policy.accepts(&manifest) {
+                if !self.admitted(&manifest, policy)? {
                     continue;
                 }
                 if !manifest_matches_dependency_identity(&manifest, identity)? {
@@ -3476,16 +3867,15 @@ impl CacheResolver {
                         identity.semantic_digest.0
                     )));
                 }
-                let Some(encoded) = layer.store.verified_encoded_payload(&manifest)? else {
-                    return Ok(None);
-                };
-                let transport = layer.store.verified_transport_parts(&manifest)?;
-                return Ok(Some(ResolvedEncodedArtifact {
-                    layer_name: layer.store.name().to_owned(),
-                    manifest,
-                    encoded,
-                    transport,
-                }));
+                match Self::encoded_candidate(layer, manifest) {
+                    Err(error) if layer.store.allows_payload_fallback(&error) => {
+                        xc_core::progress_message!(
+                            "encoded cache candidate in {} skipped: {error}",
+                            layer.store.name()
+                        );
+                    }
+                    result => return result,
+                }
             }
         }
         Ok(None)
@@ -3508,7 +3898,7 @@ impl CacheResolver {
         identity.validate()?;
         for layer in &self.layers {
             for manifest in layer.store.identity_candidates(identity)? {
-                if !policy.accepts(&manifest) {
+                if !self.admitted(&manifest, policy)? {
                     continue;
                 }
                 // Stores are not trusted to have matched the identity: the
@@ -3523,7 +3913,19 @@ impl CacheResolver {
                         identity.semantic_digest.0
                     )));
                 }
-                let (payload, encoded_payload) = layer.store.read_payload_and_encoded(&manifest)?;
+                let (payload, encoded_payload) =
+                    match layer.store.read_payload_and_encoded(&manifest) {
+                        Ok(payload) => payload,
+                        Err(error) if layer.store.allows_payload_fallback(&error) => {
+                            xc_core::progress_message!(
+                                "cache payload {} in {} skipped: {error}",
+                                manifest.content_digest,
+                                layer.store.name()
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                 return Ok(Some(ResolvedArtifact {
                     layer_name: layer.store.name().to_owned(),
                     manifest,
@@ -3692,30 +4094,9 @@ impl CacheRepositoryRegistry {
 /// collisions, Windows case/device aliases, dot traversal and long filenames.
 /// The old layout is retained for read compatibility and complete-key filtering.
 pub fn local_artifact_kind_directories(root: &Path, kind: &str) -> Vec<PathBuf> {
-    let mut paths = vec![root
-        .join("artifacts-v2")
-        .join(ContentDigest::sha256(kind.as_bytes()).0)];
-    let legacy = encode_component(kind);
-    if !matches!(legacy.as_str(), "." | "..") {
-        paths.push(root.join("artifacts").join(legacy));
-    }
-    paths
-}
-
-fn encode_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("_{byte:02x}"));
-        }
-    }
-    if out.is_empty() {
-        "_empty".to_owned()
-    } else {
-        out
-    }
+    vec![root
+        .join("artifacts-v3")
+        .join(ContentDigest::sha256(kind.as_bytes()).0)]
 }
 
 fn digest_file(path: &Path) -> Result<(ContentDigest, u64), CacheError> {
@@ -3860,7 +4241,7 @@ fn stage_encoded_object(source: &Path, parent: &Path) -> Result<PathBuf, CacheEr
                 })();
                 drop(output);
                 if let Err(error) = copied {
-                    let _ = fs::remove_file(&temporary);
+                    let _ = xc_core::remove_temporary_file(&temporary);
                     return Err(error.into());
                 }
                 return Ok(temporary);
@@ -3885,7 +4266,7 @@ fn write_private_sibling_file(
     })();
     drop(file);
     if let Err(error) = written {
-        let _ = fs::remove_file(&temporary);
+        let _ = xc_core::remove_temporary_file(&temporary);
         return Err(error.into());
     }
     Ok(temporary)
@@ -3932,11 +4313,13 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
     let temporary = write_private_sibling_file(parent, "replace", bytes)?;
     // std::fs::rename replaces an existing file on Windows as well as Unix.
     // Removing it first would expose a missing record to concurrent readers.
-    fs::rename(&temporary, path).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
+    rename_replacement(&temporary, path).map_err(|error| {
+        let _ = xc_core::remove_temporary_file(&temporary);
         CacheError::Io(format!("failed to replace {}: {error}", path.display()))
     })
 }
+
+use xc_core::rename_replacement;
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
     let parent = path
@@ -3944,10 +4327,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
         .ok_or_else(|| CacheError::Io(format!("path has no parent: {}", path.display())))?;
     fs::create_dir_all(parent)?;
     let temporary = write_private_sibling_file(parent, "tmp", bytes)?;
-    match fs::rename(&temporary, path) {
+    match rename_replacement(&temporary, path) {
         Ok(()) => Ok(()),
         Err(error) if path.exists() => {
-            let _ = fs::remove_file(&temporary);
+            let _ = xc_core::remove_temporary_file(&temporary);
             let (existing_digest, existing_size) = digest_file(path)?;
             let expected_digest = ContentDigest::sha256(bytes);
             if existing_digest == expected_digest && existing_size == bytes.len() as u64 {
@@ -3960,7 +4343,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
             }
         }
         Err(error) => {
-            let _ = fs::remove_file(&temporary);
+            let _ = xc_core::remove_temporary_file(&temporary);
             Err(CacheError::Io(format!(
                 "failed to publish {}: {error}",
                 path.display()
@@ -4217,6 +4600,7 @@ mod tests {
             parameters_digest: semantic_digest,
         };
         let mut artifact = draft(key, CacheQuality::Validated, CacheVisibility::Local);
+        artifact.producer_toolkit_version = canonical.producer_toolkit_version.clone();
         artifact.tags.insert(
             SEMANTIC_KEY_MANIFEST_TAG.to_owned(),
             serde_json::to_string(&semantic_key).unwrap(),
@@ -4504,7 +4888,7 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_zip_rejects_corrupt_existing_object_without_replacement() {
+    fn file_backed_zip_repairs_corrupt_existing_object_from_verified_bytes() {
         let root = temporary_root("xc-cache-file-zip-corruption");
         let store =
             ZipJsonFilesystemCacheStore::new("file", root.path(), true, CacheVisibility::Local);
@@ -4521,10 +4905,14 @@ mod tests {
             payload,
             0,
         );
-        assert!(matches!(result, Err(CacheError::DigestMismatch { .. })));
-        assert_eq!(fs::read(path).unwrap(), corrupt);
+        let manifest = result.unwrap();
+        assert_eq!(store.read_payload(&manifest).unwrap(), payload);
+        assert_eq!(
+            fs::read(path).unwrap(),
+            ZipJsonFilesystemCacheStore::encode(payload).unwrap()
+        );
         assert_no_zip_write_temporary(&store);
-        assert!(store.candidates(&key).unwrap().is_empty());
+        assert_eq!(store.candidates(&key).unwrap().len(), 1);
     }
 
     #[test]
@@ -4657,13 +5045,12 @@ mod tests {
             let mut corrupt = encoded.clone();
             corrupt[0] ^= 1;
             fs::write(&path, &corrupt).unwrap();
-            assert!(matches!(
-                store.publish_file_encoded(&request, &temporary, &object, |_, _| {
+            store
+                .publish_file_encoded(&request, &temporary, &object, |_, _| {
                     Err(std::io::Error::from(kind))
-                }),
-                Err(CacheError::DigestMismatch { .. })
-            ));
-            assert_eq!(fs::read(&path).unwrap(), corrupt);
+                })
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), encoded);
             // Reject a changed staging file before any canonical publication.
             fs::remove_file(&path).unwrap();
             fs::write(&temporary, &corrupt).unwrap();
@@ -4953,6 +5340,7 @@ mod tests {
             parameters_digest: semantic_digest.clone(),
         };
         let mut artifact = draft(key, CacheQuality::Validated, CacheVisibility::Local);
+        artifact.producer_toolkit_version = canonical.producer_toolkit_version.clone();
         artifact.tags.insert(
             SEMANTIC_KEY_MANIFEST_TAG.to_owned(),
             serde_json::to_string(&semantic_key).unwrap(),
@@ -4980,6 +5368,8 @@ mod tests {
             payload_digest: second_canonical.payload_digest.clone(),
         };
         let mut second_artifact = artifact.clone();
+        second_artifact.producer_toolkit_version =
+            second_canonical.producer_toolkit_version.clone();
         second_artifact.tags.insert(
             REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
             serde_json::to_string(&second_canonical).unwrap(),
@@ -4995,7 +5385,7 @@ mod tests {
 
         // A cache written before the inventory existed (or by an older
         // writer) is repaired by one bounded scan of the semantic digest.
-        fs::remove_dir_all(root.join("identities")).unwrap();
+        fs::remove_dir_all(root.join("identities-v3")).unwrap();
         let legacy =
             ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let found = legacy.identity_candidates(&identity).unwrap();
@@ -5016,7 +5406,7 @@ mod tests {
         // therefore rescan after an inventory miss: finding one identity may
         // not mark the shared semantic digest as exhausted and hide a second
         // retained manifest under that digest.
-        fs::remove_dir_all(root.join("identities")).unwrap();
+        fs::remove_dir_all(root.join("identities-v3")).unwrap();
         let read_only =
             ZipJsonFilesystemCacheStore::new("local", root.path(), false, CacheVisibility::Local);
         assert_eq!(read_only.identity_candidates(&identity).unwrap().len(), 1);
@@ -5311,7 +5701,7 @@ mod tests {
     }
 
     #[test]
-    fn seekable_payload_exact_resolver_preserves_quality_and_corrupt_first_refusal() {
+    fn seekable_payload_exact_resolver_preserves_quality_and_skips_damaged_first_copy() {
         let root = temporary_root("xc-cache-seekable-resolver");
         let first =
             FilesystemCacheStore::new("first", root.join("first"), true, CacheVisibility::Local);
@@ -5377,29 +5767,21 @@ mod tests {
         assert_eq!(resolved.manifest, weak);
         drop(resolved);
         fs::write(&first_object, b"evil").unwrap();
-        assert!(matches!(
-            resolver.open_exact_payload(
-                &key,
-                &weak.content_digest,
-                CacheQuality::Validated,
-                &policy,
-                &scratch,
-                4
-            ),
-            Err(CacheError::DigestMismatch { .. })
-        ));
+        let fallback = || {
+            resolver
+                .open_exact_payload(
+                    &key,
+                    &weak.content_digest,
+                    CacheQuality::Validated,
+                    &policy,
+                    &scratch,
+                    4,
+                )
+                .unwrap()
+        };
+        assert_eq!(fallback().layer_name, "second");
         fs::remove_file(first_object).unwrap();
-        assert!(matches!(
-            resolver.open_exact_payload(
-                &key,
-                &weak.content_digest,
-                CacheQuality::Validated,
-                &policy,
-                &scratch,
-                4
-            ),
-            Err(CacheError::NotFound(_))
-        ));
+        assert_eq!(fallback().layer_name, "second");
         assert!(matches!(
             resolver.open_exact_payload(
                 &key,
@@ -5715,6 +6097,35 @@ mod tests {
         assert_eq!(adopted.objects, source_manifest.objects);
         assert_eq!(destination.read_payload(&adopted).unwrap(), payload);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_supersedes_prior_quality_and_preserves_explicit_dependencies() {
+        let root = temporary_root("refresh-supersession");
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
+        let key = ArtifactKey::new("tau", "same", b"parameters").unwrap();
+        let old = store
+            .put(
+                &draft(key.clone(), CacheQuality::Certified, CacheVisibility::Local),
+                b"older",
+            )
+            .unwrap();
+        let mut refreshed = draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local);
+        refreshed
+            .tags
+            .insert(LOCAL_REFRESH_WRITE_TAG.into(), String::new());
+        let new = store.put(&refreshed, b"newer").unwrap();
+        let directory = store.key_directory(&key);
+        fs::remove_file(directory.join("index.json")).unwrap();
+        assert_eq!(store.candidates(&key).unwrap(), vec![new]);
+        assert!(store.exact_candidates(&key).unwrap().contains(&old));
+        let index = FilesystemCacheStore::load_index_at(&directory).unwrap();
+        fs::write(
+            directory.join(index.manifests.last().unwrap()),
+            b"truncated",
+        )
+        .unwrap();
+        assert!(store.candidates(&key).unwrap().is_empty());
     }
 
     #[test]

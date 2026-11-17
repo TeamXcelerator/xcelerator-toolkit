@@ -372,17 +372,27 @@ fn compact_fresh_assembly_rejects_hash_backend_configuration_and_valid_count_cha
 #[test]
 fn compact_provenance_is_explicitly_not_executable_attestation() {
     let mut c = compact();
+    let original = c.proof_digest().unwrap();
+    let original_bytes = ContentDigest::sha256_finite_json(&c).unwrap();
     c.source_identity = ReconstructionSourceIdentity {
         toolkit_revision: "alternate producer provenance".into(),
         source_tree_digest: digest("unattested executable"),
         build_identity: "unattested label".into(),
     };
+    c.producer_toolkit_version = "another producer version".into();
+    assert_eq!(original, c.proof_digest().unwrap());
+    assert_ne!(
+        original_bytes,
+        ContentDigest::sha256_finite_json(&c).unwrap()
+    );
     let report = verify_compact_ccm_sector_gap_certificate(&c);
     assert!(report.valid, "{:?}", report.errors);
     assert!(report
         .warnings
         .iter()
         .any(|s| s.contains("not the producer executable")));
+    c.even_ground.lower = rational_record(&(parse(&c.even_ground.lower).unwrap() - 1));
+    assert_ne!(original, c.proof_digest().unwrap());
 }
 #[test]
 fn compact_structure_consistent_wrong_bracket_fails_fresh_selected_proof() {
@@ -513,7 +523,7 @@ fn compact_consumers_match_full_arithmetic_and_bind_actual_certificate_identity(
     assert_eq!(full_report.rows, compact_report.rows);
     assert_eq!(
         compact_report.matrix_certificate_digest,
-        ContentDigest::sha256_finite_json(&compact).unwrap()
+        compact.proof_digest().unwrap()
     );
     assert_ne!(
         full_report.matrix_certificate_digest,
@@ -523,7 +533,7 @@ fn compact_consumers_match_full_arithmetic_and_bind_actual_certificate_identity(
     assert_eq!(full_report.semantics, "ccm-analytic-local-root-budget-v1");
     assert_eq!(
         compact_report.semantics,
-        "ccm-analytic-local-root-budget-compact-v1"
+        "ccm-analytic-local-root-budget-compact-v2"
     );
     // State-error, transform and root-budget consumers share one reconstructed
     // matrix without changing any directed endpoints or primary numerical rows.
@@ -544,6 +554,39 @@ fn compact_consumers_match_full_arithmetic_and_bind_actual_certificate_identity(
         before + 2
     );
     assert!(root_budget::verify(&state, &full, &request, &compact_report, &token).is_err());
+    let mut old = compact_report.clone();
+    old.semantics = "ccm-analytic-local-root-budget-compact-v1".into();
+    old.matrix_certificate_digest = SectorGapCertificateRef::Compact(&compact)
+        .content_digest()
+        .unwrap();
+    old.request_digest = ContentDigest::sha256(
+        &serde_json::to_vec(&(
+            &old.semantics,
+            &old.source_digest,
+            &old.matrix_certificate_digest,
+            &request,
+        ))
+        .unwrap(),
+    );
+    let mut rebuilt = compact.clone();
+    rebuilt.source_identity = ReconstructionSourceIdentity::current("rebuilt");
+    for (certificate, report, accepted) in [
+        (&compact, &old, true),
+        (&rebuilt, &old, false),
+        (&rebuilt, &compact_report, true),
+    ] {
+        assert_eq!(
+            root_budget::verify_with_certificate_ref(
+                &state,
+                SectorGapCertificateRef::Compact(certificate),
+                &request,
+                report,
+                &token,
+            )
+            .is_ok(),
+            accepted
+        );
+    }
     let mut wrong = compact.clone();
     wrong.raw_matrix_content_digest = digest("tampered source matrix");
     assert!(transform_enclosure::verified_state_error_ref(
@@ -586,4 +629,115 @@ fn compact_consumers_match_full_arithmetic_and_bind_actual_certificate_identity(
     .to_string();
     assert!(!error.contains("root budget dimension, precision or row limit"));
     assert!(error.contains("compact"), "{error}");
+}
+
+#[cfg(feature = "arb")]
+#[test]
+fn certified_contours_are_independent_of_uncertified_checkpoint_history() {
+    // An isolated process owns the checkpoint environment for both directories.
+    const CHILD: &str = "XC_TEST_CERTIFIED_CONTOUR_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("certified_contours_are_independent_of_uncertified_checkpoint_history")
+            .arg("--test-threads=1")
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    use crate::ccm::{state_geometry::RetainedState, transform_enclosure};
+    let full = fixture();
+    let dimension = 2 * full.n_modes + 1;
+    let midpoint = parse_records(&full.cutoff_free_tau)
+        .unwrap()
+        .into_iter()
+        .map(|x| ((x.lower().clone() + x.upper()) / 2_i32).to_f64())
+        .collect::<Vec<_>>();
+    let eigen = nalgebra::SymmetricEigen::new(nalgebra::DMatrix::from_row_slice(
+        dimension, dimension, &midpoint,
+    ));
+    let index = eigen
+        .eigenvalues
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .unwrap()
+        .0;
+    let nonce = format!(
+        "{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+    );
+    let version = serde_json::json!({"major":0,"minor":17,"patch":2,"prerelease":null});
+    let manifest = serde_json::from_value(serde_json::json!({
+        "schema_version":1,"key":{"kind":"ccm_weil_eigenpair","logical_key":"contour checkpoint identity","parameters_digest":digest("contour key")},
+        "content_digest":digest(&format!("contour state {nonce}")),"size_bytes":0,"objects":[],"created_unix_seconds":1,
+        "producer_toolkit_version":version,"minimum_reader_version":version,"maximum_reader_version":null,"quality":"validated","visibility":"local","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
+    })).unwrap();
+    let state = RetainedState {
+        manifest,
+        cutoff: "5".into(),
+        modes: 2,
+        precision: 256,
+        coefficients: eigen
+            .eigenvectors
+            .column(index)
+            .iter()
+            .map(|v| Float::with_val(256, *v))
+            .collect(),
+        eigenvalue: Float::with_val(256, eigen.eigenvalues[index]).to_string(),
+        selection_policy: Some(
+            "numerical trial vector; analytic residual independently bounded".into(),
+        ),
+    };
+    let resources = xc_core::RunResources::new(8 << 30).unwrap();
+    let _resources = resources.enter();
+    let memo = retained::Memo::new(resources);
+    let _memo = memo.enter();
+    let options = crate::ccm::extended_research::ExtensionOptions::for_source(&state);
+
+    let shared = xc_core::test_support::TestDir::new("contour-shared");
+    let empty = xc_core::test_support::TestDir::new("contour-empty");
+    std::env::set_var("XC_RESEARCH_CHECKPOINT_DIR", shared.to_path_buf());
+    let baseline = transform_enclosure::analyze(&state, None, &options, None, None, 256).unwrap();
+    let warm =
+        transform_enclosure::analyze(&state, None, &options, None, Some(&full), 256).unwrap();
+    std::env::set_var("XC_RESEARCH_CHECKPOINT_DIR", empty.to_path_buf());
+    let cold =
+        transform_enclosure::analyze(&state, None, &options, None, Some(&full), 256).unwrap();
+    assert!(!cold.rows.is_empty());
+    assert_ne!(
+        serde_json::to_value(&baseline.rows).unwrap(),
+        serde_json::to_value(&cold.rows).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&warm).unwrap(),
+        serde_json::to_value(&cold).unwrap()
+    );
+}
+
+#[test]
+fn publication_replays_both_producers_and_rejects_a_changed_proof_or_request() {
+    let mut proof = compact();
+    let key = publication_key(&proof);
+    let replay = |p: &CompactCcmSectorGapCertificate| {
+        publication_proof(&key, &serde_json::to_vec(p).unwrap())
+    };
+    let registered: Vec<_> = inventory::iter::<xc_cache::CompactPublicationVerifier>
+        .into_iter()
+        .collect();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(
+        (registered[0].0)(&key, &serde_json::to_vec(&proof).unwrap()).unwrap(),
+        proof.proof_digest().unwrap()
+    );
+    let expected = replay(&proof).unwrap();
+    proof.source_identity = ReconstructionSourceIdentity::current("second-producer");
+    assert_eq!(replay(&proof).unwrap(), expected);
+    let mut wrong_key = key.clone();
+    wrong_key.target = None;
+    assert!(publication_proof(&wrong_key, &serde_json::to_vec(&proof).unwrap()).is_err());
+    proof.raw_matrix_content_digest = digest("changed-reconstruction");
+    assert!(replay(&proof).is_err());
 }

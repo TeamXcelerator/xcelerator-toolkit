@@ -334,6 +334,28 @@ fn missing_zero_singular_and_resource_cases_remain_qualified() {
     assert_eq!(r.outcome, "partial_unresolved");
     assert_eq!(hp(&r.rows[0].values["coupling_gram"]), 0);
     assert!(!r.rows[0].values.contains_key("signed_complement_feedback"));
+    let estimate: u64 = r.values["estimated_factorization_workspace_bytes"]
+        .parse()
+        .unwrap();
+    let singular = capture_extended(
+        "operator_cluster",
+        &s,
+        m.as_ref(),
+        None,
+        Some(&i),
+        &ExtensionOptions {
+            working_precision_bits: 192,
+            maximum_working_bytes: Some(estimate - 1),
+            ..ExtensionOptions::for_source(&s)
+        },
+        &[],
+        &context(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&singular.value.data).unwrap(),
+        serde_json::to_value(&r).unwrap()
+    );
     let r = run("operator_cluster", &s, None, &i, 192);
     assert_eq!(r.outcome, "missing_input");
     i.run_once.as_mut().unwrap().reference_vectors[0] = vec!["0".into(); 3];
@@ -359,7 +381,7 @@ fn missing_zero_singular_and_resource_cases_remain_qualified() {
     .data;
     assert_eq!(r.outcome, "unresolved");
     assert!(r.values.is_empty());
-    // With enough room for vectors but not dense interval factorization, retain core bounds.
+    // The dense estimate exceeds the budget, but this system has a verified solution.
     let n = 51;
     let co = vec!["1".into(); n];
     let mut a = vec!["0".into(); n * n];
@@ -390,9 +412,9 @@ fn missing_zero_singular_and_resource_cases_remain_qualified() {
     .unwrap()
     .value
     .data;
-    assert_eq!(r.outcome, "partial_unresolved");
-    assert!(r.reason.unwrap().contains("budget"));
-    assert!(r.rows[0].values.contains_key("coupling_gram_lower"));
+    assert!(hp(&r.values["estimated_factorization_workspace_bytes"]) > 5_000_000);
+    assert_eq!(r.outcome, "point_measurement");
+    within(&r.rows[0].values, "signed_complement_feedback", "0", 192);
 }
 
 #[test]
@@ -497,9 +519,7 @@ fn budget_stop_before_any_measurement_is_not_retained() {
 }
 
 #[test]
-fn workspace_limited_partial_report_is_not_retained() {
-    // Same fixture; at 150000 bytes the vector scratch of the +1024 guard fits
-    // but the complement factorization workspace (about 191000 bytes) does not.
+fn dense_workspace_warning_preserves_verified_values_and_cache_reuse() {
     let p = 192;
     let h = rug::Integer::from(1) << 1000u32;
     let (d, o) = ((h.clone() * 2u32).to_string(), (-h).to_string());
@@ -520,7 +540,7 @@ fn workspace_limited_partial_report_is_not_retained() {
         reference_vectors: vec![vec!["1".into(); 3]],
         ..Default::default()
     });
-    let dir = xc_core::test_support::TestDir::new("cluster-workspace-stop");
+    let dir = xc_core::test_support::TestDir::new("cluster-workspace-warning");
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(ZipJsonFilesystemCacheStore::new(
@@ -546,13 +566,18 @@ fn workspace_limited_partial_report_is_not_retained() {
         ordered_overlays: vec!["local".into()],
         ..context()
     };
+    let baseline = run("operator_cluster", &s, m.as_ref(), &i, p);
+    assert_eq!(baseline.outcome, "point_measurement");
+    let estimate: u64 = baseline.values["estimated_factorization_workspace_bytes"]
+        .parse()
+        .unwrap();
     let low = ExtensionOptions {
         working_precision_bits: p,
-        maximum_working_bytes: Some(150_000),
+        maximum_working_bytes: Some(estimate - 1),
         ..ExtensionOptions::for_source(&s)
     };
     let high = ExtensionOptions {
-        maximum_working_bytes: Some(10_000_000),
+        maximum_working_bytes: Some(estimate),
         ..low.clone()
     };
     let capture = |o: &ExtensionOptions| {
@@ -568,22 +593,19 @@ fn workspace_limited_partial_report_is_not_retained() {
         )
         .unwrap()
     };
-    let limited = capture(&low);
-    assert_eq!(limited.value.data.outcome, "partial_unresolved");
-    assert!(limited
-        .value
-        .data
-        .reason
-        .as_ref()
-        .unwrap()
-        .contains("working-byte budget"));
-    assert!(limited.value.data.rows[0]
-        .values
-        .contains_key("coupling_gram_lower"));
-    assert!(limited.produced_manifest.is_none() && limited.reused_manifest.is_none());
-    let resolved = capture(&high);
+    let log = xc_core::MessageCapture::default();
+    let resolved = xc_core::with_message_capture(Some(log.clone()), || capture(&low));
+    let used = &baseline.values["arithmetic_precision_bits"];
+    let warning = format!(
+        "warning: operator_cluster estimated dense workspace {estimate} bytes exceeds the working budget of {} bytes at {used} bits (dimension 3)",
+        estimate - 1
+    );
+    assert!(log.take().iter().any(|line| line.starts_with(&warning)));
     assert!(resolved.reused_manifest.is_none() && resolved.produced_manifest.is_some());
-    assert_eq!(resolved.value.data.outcome, "point_measurement");
+    assert_eq!(
+        serde_json::to_value(&baseline).unwrap(),
+        serde_json::to_value(&resolved.value.data).unwrap()
+    );
     let warm = capture(&high);
     assert_eq!(
         warm.reused_manifest.as_ref().map(|m| &m.content_digest),

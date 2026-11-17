@@ -127,16 +127,8 @@ impl RootBracketF64 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RootApproximationStatus {
-    Discovered,
     Refined,
     Approximate,
-    CrossChecked,
-    Certified,
-    Duplicate,
-    Unresolved,
-    Inconclusive,
-    TooCloseToPole,
-    Failed,
 }
 
 /// The observed stopping condition, not a proof of existence or uniqueness.
@@ -367,7 +359,10 @@ where
         if local_residuals.len() > 8 {
             local_residuals.pop_front();
         }
-        if width_met && f_midpoint != 0.0 && local_growth {
+        if width_met
+            && !residual_met
+            && (local_growth || f_midpoint.abs() > f_lower.abs().max(f_upper.abs()))
+        {
             return Err(RootError::NonConvergence(
                 "narrow bracket has a growing residual; continuity or pole exclusion is unresolved"
                     .into(),
@@ -386,7 +381,11 @@ where
                 iterations: iteration,
                 function_evaluations: evaluations,
                 derivative_evaluations: usize::from(derivative.is_some()),
-                status: RootApproximationStatus::Refined,
+                status: if residual_met {
+                    RootApproximationStatus::Refined
+                } else {
+                    RootApproximationStatus::Approximate
+                },
                 convergence_criterion: convergence_criterion(
                     f_midpoint == 0.0,
                     residual_met,
@@ -513,7 +512,10 @@ pub fn safeguarded_newton_f64_controlled(
         if local_residuals.len() > 8 {
             local_residuals.pop_front();
         }
-        if width_met && fx != 0.0 && local_growth {
+        if width_met
+            && !residual_met
+            && (local_growth || fx.abs() > f_lower.abs().max(f_upper.abs()))
+        {
             return Err(RootError::NonConvergence(
                 "narrow bracket has a growing residual; continuity or pole exclusion is unresolved"
                     .into(),
@@ -530,7 +532,11 @@ pub fn safeguarded_newton_f64_controlled(
                 iterations: iteration,
                 function_evaluations,
                 derivative_evaluations,
-                status: RootApproximationStatus::Refined,
+                status: if residual_met {
+                    RootApproximationStatus::Refined
+                } else {
+                    RootApproximationStatus::Approximate
+                },
                 convergence_criterion: convergence_criterion(fx == 0.0, residual_met, width_met),
                 method: "safeguarded_newton_f64_position_local_guard_v3".to_owned(),
             });
@@ -1190,7 +1196,11 @@ pub fn bisect_hp_controlled(
         if local_residuals.len() > 8 {
             local_residuals.pop_front();
         }
-        if width_met && !residual.is_zero() && local_growth {
+        if width_met
+            && !residual_met
+            && (local_growth
+                || (residual > f_lower.clone().abs() && residual > f_upper.clone().abs()))
+        {
             return Err(RootError::NonConvergence("narrow HP bracket has a growing residual; continuity or pole exclusion is unresolved".into()));
         }
         if residual.is_zero() || width_met {
@@ -1213,7 +1223,11 @@ pub fn bisect_hp_controlled(
                 function_evaluations,
                 derivative_evaluations: usize::from(derivative.is_some()),
                 newton_steps: 0,
-                status: RootApproximationStatus::Refined,
+                status: if residual_met {
+                    RootApproximationStatus::Refined
+                } else {
+                    RootApproximationStatus::Approximate
+                },
                 convergence_criterion: convergence_criterion(
                     residual == 0,
                     residual_met,
@@ -1343,7 +1357,11 @@ pub fn safeguarded_newton_hp_controlled(
         if local_residuals.len() > 8 {
             local_residuals.pop_front();
         }
-        if width_met && !residual.is_zero() && local_growth {
+        if width_met
+            && !residual_met
+            && (local_growth
+                || (residual > f_lower.clone().abs() && residual > f_upper.clone().abs()))
+        {
             return Err(RootError::NonConvergence("narrow HP bracket has a growing residual; continuity or pole exclusion is unresolved".into()));
         }
         if residual.is_zero() || width_met {
@@ -1367,7 +1385,11 @@ pub fn safeguarded_newton_hp_controlled(
                 function_evaluations,
                 derivative_evaluations,
                 newton_steps,
-                status: RootApproximationStatus::Refined,
+                status: if residual_met {
+                    RootApproximationStatus::Refined
+                } else {
+                    RootApproximationStatus::Approximate
+                },
                 convergence_criterion: convergence_criterion(
                     residual == 0,
                     residual_met,
@@ -1421,6 +1443,7 @@ pub struct HpRootCrossCheck {
     /// Round-trip encoding of an upward bound for the stored midpoint difference.
     pub observed_midpoint_difference: String,
     pub accepted: bool,
+    /// Independence of the refinement steps only. The evaluator and bracket operations may be shared.
     pub independence_established: bool,
     pub independence_rationale: String,
 }
@@ -1450,15 +1473,47 @@ pub fn cross_check_simple_root_hp(
     stopping: &RootStoppingHp,
     agreement_tolerance: &xc_core::DecimalLiteral,
 ) -> Result<HpRootCrossCheck, RootError> {
+    cross_check_simple_root_hp_with_evaluators(
+        function,
+        function,
+        lower,
+        upper,
+        initial,
+        precision_bits,
+        stopping,
+        agreement_tolerance,
+    )
+}
+
+/// Compare refinements with caller-supplied value evaluators. This also tests
+/// the evaluations when the caller supplies independently implemented models.
+#[cfg(feature = "hp")]
+#[allow(clippy::too_many_arguments)]
+pub fn cross_check_simple_root_hp_with_evaluators(
+    bisection_function: &dyn RealFunctionHp,
+    newton_function: &dyn RealFunctionHp,
+    lower: &rug::Float,
+    upper: &rug::Float,
+    initial: &rug::Float,
+    precision_bits: u32,
+    stopping: &RootStoppingHp,
+    agreement_tolerance: &xc_core::DecimalLiteral,
+) -> Result<HpRootCrossCheck, RootError> {
     let tolerance = parse_hp_tolerance(agreement_tolerance, precision_bits)?;
     if tolerance <= 0 {
         return Err(RootError::InvalidConfiguration(
             "HP root cross-check agreement tolerance must be positive".to_owned(),
         ));
     }
-    let bisection = bisect_hp(function, lower, upper, precision_bits, stopping)?;
-    let safeguarded_newton =
-        safeguarded_newton_hp(function, lower, upper, initial, precision_bits, stopping)?;
+    let bisection = bisect_hp(bisection_function, lower, upper, precision_bits, stopping)?;
+    let safeguarded_newton = safeguarded_newton_hp(
+        newton_function,
+        lower,
+        upper,
+        initial,
+        precision_bits,
+        stopping,
+    )?;
     let bisection_midpoint = parse_hp_output(&bisection.midpoint, precision_bits)?;
     let newton_midpoint = parse_hp_output(&safeguarded_newton.midpoint, precision_bits)?;
     let difference = hp_difference_up(&bisection_midpoint, &newton_midpoint, precision_bits);
@@ -1477,7 +1532,7 @@ pub fn cross_check_simple_root_hp(
         accepted,
         independence_established,
         independence_rationale: if independence_established {
-            "HP sign-only bisection and safeguarded Newton execute from the original bracket, share no decisive iterates, and Newton accepted at least one derivative-based interior update".to_owned()
+            "HP sign-only bisection and safeguarded Newton execute from the original bracket, use separate refinement iterates and shared bracket arithmetic; Newton accepted a derivative step. Evaluator independence requires separately supplied implementations".to_owned()
         } else {
             "No accepted derivative-based Newton update occurred; terminal derivative diagnostics and fallback bisection do not establish independent refinement".to_owned()
         },
@@ -2188,7 +2243,30 @@ mod hp_tests {
             report.safeguarded_newton.method,
             "safeguarded_newton_hp_position_local_guard_v3"
         );
-        assert!(report.independence_rationale.contains("share no decisive"));
+        assert!(report
+            .independence_rationale
+            .contains("Evaluator independence"));
+        struct SqrtThree;
+        impl RealFunctionHp for SqrtThree {
+            fn evaluate(&self, x: &Float, p: u32) -> Result<Float, RootError> {
+                Ok(Float::with_val(p, x * x) - 3)
+            }
+            fn derivative(&self, x: &Float, p: u32) -> Result<Float, RootError> {
+                Ok(Float::with_val(p, x * 2))
+            }
+        }
+        let disagreement = cross_check_simple_root_hp_with_evaluators(
+            &SqrtTwo,
+            &SqrtThree,
+            &Float::with_val(precision, 1),
+            &Float::with_val(precision, 2),
+            &Float::with_val(precision, 1.5),
+            precision,
+            &stopping,
+            &xc_core::DecimalLiteral::new("1e-50").unwrap(),
+        )
+        .unwrap();
+        assert!(!disagreement.accepted);
     }
 
     #[test]

@@ -105,22 +105,7 @@ impl<'a> Partial<'a> {
         xc_numerics::mpfr_interval::ensure_uniform_exponent_range().ok()?;
         // Unicode failure disables optional partial reuse; the original numerical
         // configuration validation still determines the original error.
-        let policy = std::env::vars_os()
-            .filter_map(|(name, value)| {
-                let name = name.to_str()?;
-                (name.starts_with("XC_PRIME_RESPONSE_")
-                    || name.starts_with("XC_ROOT_RESPONSE_")
-                    || name.starts_with("XC_CUDA_")
-                    || name.starts_with("XC_DENSE_")
-                    || name == "XC_RESPONSE_EVENT_BATCH")
-                    .then(|| {
-                        value
-                            .into_string()
-                            .ok()
-                            .map(|value| (name.to_owned(), value))
-                    })
-            })
-            .collect::<Option<BTreeMap<_, _>>>()?;
+        let policy = super::super::response_checkpoints::backend_policy().ok()?;
         // Table identity calculation is optional and admitted before allocation.
         let maximum_bits = tables
             .values()

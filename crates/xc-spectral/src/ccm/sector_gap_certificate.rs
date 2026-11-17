@@ -120,6 +120,8 @@ pub mod root_budget {
         pub semantics: String,
         pub request_digest: ContentDigest,
         pub source_digest: ContentDigest,
+        /// Full certificates and compact-v1 reports bind the exact bytes.
+        /// Compact-v2 binds the canonical proof fields across producer builds.
         pub matrix_certificate_digest: ContentDigest,
         pub lambda_squared: String,
         pub n_modes: usize,
@@ -356,7 +358,10 @@ pub mod root_budget {
         let poles: Vec<_> = (0..weights.len())
             .map(|j| spacing.mul(&I::from_i64(j as i64 - s.modes as i64, p)))
             .collect();
-        let matrix_certificate_digest = c.content_digest()?;
+        let matrix_certificate_digest = match c {
+            super::SectorGapCertificateRef::Full(_) => c.content_digest()?,
+            super::SectorGapCertificateRef::Compact(proof) => proof.proof_digest()?,
+        };
         let branch_id = format!("finite-ground:{}:{}", s.cutoff, s.modes);
         let mut rows = Vec::new();
         for window in &request.windows {
@@ -457,16 +462,25 @@ pub mod root_budget {
         let source_digest = s.manifest.content_digest.clone();
         let semantics = match c {
             super::SectorGapCertificateRef::Full(_) => "ccm-analytic-local-root-budget-v1",
+            super::SectorGapCertificateRef::Compact(_) => super::compact::ROOT_BUDGET_SEMANTICS,
+        };
+        let request_digest = match c {
             super::SectorGapCertificateRef::Compact(_) => {
-                "ccm-analytic-local-root-budget-compact-v1"
+                super::compact::root_budget_request_digest(
+                    &source_digest,
+                    &matrix_certificate_digest,
+                    request,
+                )?
+            }
+            super::SectorGapCertificateRef::Full(_) => {
+                ContentDigest::sha256(&serde_json::to_vec(&(
+                    semantics,
+                    &source_digest,
+                    &matrix_certificate_digest,
+                    request,
+                ))?)
             }
         };
-        let request_digest = ContentDigest::sha256(&serde_json::to_vec(&(
-            semantics,
-            &source_digest,
-            &matrix_certificate_digest,
-            request,
-        ))?);
         Ok(Report{semantics:semantics.into(),request_digest,source_digest,matrix_certificate_digest,
             lambda_squared:s.cutoff.clone(),n_modes:s.modes,unit_state_l2_error_upper:exact(eta.upper())?,rows,
             scope:"reassembled_finite_ccm_ground_inherited_parity_premise_ordinals_only_for_complete_degree_census_with_resolved_carriers_no_continuum_claim".into()})
@@ -516,9 +530,23 @@ pub mod root_budget {
             bail!("analytic root budget source, row count or ordinal scope mismatch");
         }
         // A verifier invocation is independent even inside a retained run.
-        let replay = super::compact::retained::freshly(|| {
+        let mut replay = super::compact::retained::freshly(|| {
             analyze_with_certificate_ref(s, c, request, token)
         })?;
+        // Older portable reports can still be independently verified against
+        // their exact producer record. New cache lookups use the v2 proof key.
+        if matches!(c, super::SectorGapCertificateRef::Compact(_))
+            && report.semantics == "ccm-analytic-local-root-budget-compact-v1"
+        {
+            replay.semantics = report.semantics.clone();
+            replay.matrix_certificate_digest = c.content_digest()?;
+            replay.request_digest = ContentDigest::sha256(&serde_json::to_vec(&(
+                &replay.semantics,
+                &replay.source_digest,
+                &replay.matrix_certificate_digest,
+                request,
+            ))?);
+        }
         if replay != *report {
             bail!("analytic root budget replay mismatch");
         }
@@ -905,6 +933,18 @@ fn interval_midpoint_guides(
         .collect())
 }
 
+/// A valid analytic enclosure was too wide to prove the required counts.
+#[derive(Debug)]
+struct AssemblyResolutionLimit(String);
+
+impl std::fmt::Display for AssemblyResolutionLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CCM sector resolution limit: {}", self.0)
+    }
+}
+
+impl std::error::Error for AssemblyResolutionLimit {}
+
 fn guided_selected_certificate(
     matrix: &[RationalInterval],
     dimension: usize,
@@ -945,6 +985,9 @@ fn guided_selected_certificate(
                     return Ok(*certificate);
                 }
                 SelectedEigenvalueEnclosureResult::Inconclusive { boundary, reason } => {
+                    if !matches!(boundary.as_str(), "lower" | "upper" | "bracket") {
+                        bail!("CCM sector-gap {name} certification failed at {boundary}: {reason}");
+                    }
                     failures.push(format!(
                         "expansion {expansion}, precision {proof_precision}, {boundary}: {reason}"
                     ));
@@ -955,10 +998,11 @@ fn guided_selected_certificate(
     }
     // Every bracket expansion and proof precision was tried: a resolution
     // limit of this precision, not an error in the certificate's inputs.
-    bail!(
-        "CCM sector resolution limit: sector-gap {name} certification remained inconclusive: {}",
+    Err(AssemblyResolutionLimit(format!(
+        "sector-gap {name} certification remained inconclusive: {}",
         failures.join(" | ")
-    )
+    ))
+    .into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2058,6 +2102,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_selected_matrix_is_terminal_for_assembly() {
+        let matrix = [1, 2, 0, 3].map(|v| RationalInterval::point(Rational::from(v)));
+        let error = guided_selected_certificate(
+            &matrix,
+            2,
+            0,
+            &Float::with_val(128, 1),
+            "asymmetric test matrix",
+            CcmSectorGapCertificationOptions::default(),
+        )
+        .unwrap_err();
+        assert!(!error.is::<AssemblyResolutionLimit>());
+        assert!(error.to_string().contains("asymmetric"), "{error}");
+    }
+
+    #[test]
     fn directed_selected_sector_certificate_dense_exact_oracle() {
         // Rational Householder similarity Q D Q^T, Q=I-2vv^T/(v^Tv).
         // Its exact eigenvalues are 1,...,7 despite dense entries.
@@ -2226,21 +2286,19 @@ mod tests {
         let compute = |id: &str,
                        input: &ExternalResearchInputs,
                        run: Option<&PortableCcmSectorGapCertificate>| {
-            serde_json::to_value(
-                extended_compute(
-                    id,
-                    &state,
-                    None,
-                    None,
-                    &options,
-                    Some(input),
-                    run,
-                    None,
-                    false,
-                )
-                .unwrap(),
+            extended_compute(
+                id,
+                &state,
+                None,
+                None,
+                &options,
+                Some(input),
+                run,
+                None,
+                false,
             )
-            .unwrap()
+            .map(|report| serde_json::to_value(report).unwrap())
+            .map_err(|error| error.to_string())
         };
         for id in ["capture_preflight", "transform_enclosure"] {
             for input in [&bare, &contour] {
@@ -2250,6 +2308,13 @@ mod tests {
                     compute(id, &embedded(input, &certificate), None),
                     "{id}"
                 );
+                if id == "transform_enclosure" {
+                    assert!(lent
+                        .as_ref()
+                        .unwrap_err()
+                        .contains("source certificate verification failed"));
+                    assert!(compute(id, input, None).is_ok());
+                }
                 assert_ne!(lent, compute(id, input, None), "{id} uses the certificate");
                 // A certificate embedded in the input takes precedence.
                 let own = embedded(input, &other);

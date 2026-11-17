@@ -8,6 +8,19 @@ Results bind the exact input state and declared policy. Point measurements,
 conditional expressions and qualified absence are distinct from certificates.
 These products do not assume RH or assert infinite-limit convergence.
 
+Consumed-input views whose entire value is bound by the request, and preflight
+inventories derived entirely from the request, do not require the historical
+producer's matrix or factorization payloads. Their producer records remain in
+manifest provenance. Other diagnostics continue to retain and validate the
+exact numerical parents they use. This distinction applies on cache hits as
+well as fresh production; it does not broaden public disclosure eligibility.
+
+Configured inputs loaded from a file or generated during preparation pass the
+same source and cluster-assessment checks as explicitly supplied inputs before
+being returned for supplemental preparation. Retained recovery checks its
+manifest joins before opening numerical payloads; see
+[retained source admission](RETAINED_RESEARCH.md#cost-and-reuse).
+
 | Diagnostic | Artifact kind | Inputs |
 |---|---|---|
 | compactness | ccm_compactness_analysis | Eigenpair |
@@ -162,6 +175,24 @@ Pole and archimedean actions use retained assembly primitives; the prime action
 is reconstructed as Tau minus those signed components. Its closure is algebraic,
 not an independent check of the prime sum. Signed conventions and parent
 identities are retained. No target formula is inferred.
+
+When an acquisition policy explicitly excludes sector analysis, callers can
+provide a `cluster_preparation_assessment` naming the retained eigenpair, Tau
+matrix, source precision, original sector request and exact policy evidence.
+The live adapter checks these sources when admitting the inputs and does not
+retry the excluded solve. A declared exclusion that conflicts with requested
+sector analysis is rejected before automatic preparation, including on a warm
+run. Available cluster vectors continue through the ordinary cluster analysis.
+
+Without individual vectors, this assessment produces `partial_unresolved`:
+it records the retained state's norm, Rayleigh quotient and residual when the
+working budget permits, with `sector_attempted=0` and
+`certifies_spectral_cluster=0`. An actual resolution-limited attempt is recorded
+separately with `sector_attempted=1`. Neither outcome certifies a gap, isolated
+eigenvector or cluster projector. Missing vectors without an explicit valid
+assessment remain `Missing`; arbitrary errors are not converted into an
+exclusion. Fresh applications and retained recovery should attach the same
+policy evidence before supplemental input preparation.
 
 Root transport reuses the full directional artifact through the managed cache.
 The finite-section scan computes every symmetric Fourier prefix of the one
@@ -346,10 +377,13 @@ matrix and encloses each solution in x + z + C[-e, e], where z encloses
 R(b - H x), C encloses I - R H and e = ||z||_inf / (1 - ||C||_inf). Unlike
 directed interval elimination, its width does not compound across elimination
 steps, so large complements resolve; a system whose bound is not proven below one
-reports unresolved before any elimination of the interval matrix. Unresolved or
-budget-limited solves retain enclosed compression and coupling while withholding
-feedback. The reported residual concerns the solution midpoint in the scaled
-system; the feedback enclosure comes from the verified solve.
+reports unresolved before any elimination of the interval matrix. When the
+estimated dense factorization workspace exceeds the configured working-byte
+budget, the producer logs the estimate, budget, precision and matrix dimension
+and attempts the solve. Vector scratch is checked separately before each guard.
+An unresolved solve retains the available compression and coupling enclosures.
+Reporting feedback requires a successful verified solve at the requested accuracy.
+The reported residual concerns the solution midpoint in the scaled system.
 Each value carries outward decimal bounds and the used precision. Guards double
 from 64 to 16,384 extra bits: feedback entries are required to the requested
 relative precision after cancelling terms as large as the complement condition
@@ -380,3 +414,9 @@ working/output budgets and qualified arithmetic failures remain explicit.
 The bounds exclude source-construction and infinite-tail errors. Revisioned
 method, coordinate, point-precision and output contracts prevent reuse of the
 old unbounded complex producer's cached results as new arithmetic evidence.
+
+Certified transform contour checkpoints bind the directed endpoints of the
+applied source-error allowance. A failed verification of a supplied certificate
+ends that attempt. A resource refusal can be retried with additional capacity.
+For reference-free discovery above 64 modes, enable the `arb` feature before
+starting the run. The root assignment check also applies to seeded acquisitions.

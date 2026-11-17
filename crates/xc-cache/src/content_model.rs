@@ -61,20 +61,20 @@ pub fn local_artifact_disclosure(
     if crate::artifact_kind_is_private_only(&manifest.key.kind) {
         return Ok(ArtifactDisclosure::PrivateOnly);
     }
-    if let Some(provenance) = local_manifest_provenance_v2(manifest)? {
-        return Ok(provenance.disclosure);
-    }
+    let local = local_manifest_provenance_v2(manifest)?.map(|p| p.disclosure);
     if let Some(canonical) = crate::retained_canonical_manifest(manifest)? {
-        return Ok(
-            if crate::manifest_admitted_to_destination(
-                &canonical,
-                crate::PublicationDestination::Public,
-            ) {
-                ArtifactDisclosure::PublicInputs
-            } else {
-                ArtifactDisclosure::PrivateOnly
-            },
-        );
+        // An adapter may restrict reuse further. It cannot grant permission
+        // that the retained canonical producer did not grant.
+        if !crate::manifest_admitted_to_destination(
+            &canonical,
+            crate::PublicationDestination::Public,
+        ) {
+            return Ok(ArtifactDisclosure::PrivateOnly);
+        }
+        return Ok(local.unwrap_or(ArtifactDisclosure::PublicInputs));
+    }
+    if let Some(disclosure) = local {
+        return Ok(disclosure);
     }
     if let Some(encoded) = manifest.tags.get(crate::SEMANTIC_KEY_MANIFEST_TAG) {
         let semantic: SemanticKeyEnvelope = serde_json::from_str(encoded)?;
@@ -448,6 +448,57 @@ pub(crate) mod tests {
             producer_receipts: Vec::new(),
         });
         manifest
+    }
+
+    #[test]
+    fn disclosure_inheritance_preserves_canonical_restrictions() {
+        use crate::{ArtifactKey, ArtifactManifest, CacheObjectRef, CacheQuality, CacheVisibility};
+        let mut canonical = current_fixture();
+        canonical.provenance.as_mut().unwrap().disclosure = ArtifactDisclosure::PrivateOnly;
+        canonical.canonical_payload.ordered_items[0].normalized_path = "payload.json".into();
+        canonical.payload_digest = canonical.canonical_payload.digest().unwrap();
+        let logical = &canonical.canonical_payload.ordered_items[0];
+        let mut adapter = ArtifactManifest {
+            schema_version: 1,
+            key: ArtifactKey {
+                kind: canonical.semantic_key.artifact_kind.clone(),
+                logical_key: "synthetic/source".into(),
+                parameters_digest: canonical.semantic_digest.clone(),
+            },
+            content_digest: logical.content_digest.clone(),
+            size_bytes: logical.size_bytes,
+            objects: vec![CacheObjectRef {
+                content_digest: logical.content_digest.clone(),
+                size_bytes: logical.size_bytes,
+            }],
+            created_unix_seconds: 1,
+            producer_toolkit_version: canonical.producer_toolkit_version.clone(),
+            minimum_reader_version: canonical.minimum_reader_version.clone(),
+            maximum_reader_version: canonical.maximum_reader_version.clone(),
+            quality: CacheQuality::Validated,
+            visibility: CacheVisibility::Local,
+            immutable: true,
+            dependencies: vec![],
+            tags: std::collections::BTreeMap::from([
+                (
+                    crate::SEMANTIC_KEY_MANIFEST_TAG.into(),
+                    serde_json::to_string(&canonical.semantic_key).unwrap(),
+                ),
+                (
+                    crate::REMOTE_CANONICAL_MANIFEST_TAG.into(),
+                    serde_json::to_string(&canonical).unwrap(),
+                ),
+            ]),
+            provenance_digest: Some(canonical.digest().unwrap()),
+        };
+        let local = current_fixture().provenance.unwrap();
+        adapter.tags.insert(
+            MANIFEST_PROVENANCE_V2_TAG.into(),
+            serde_json::to_string(&local).unwrap(),
+        );
+        let derived =
+            provenance_for_numerical_inputs("ccm_tau_matrix", &[adapter], vec![]).unwrap();
+        assert_eq!(derived.disclosure, ArtifactDisclosure::PrivateOnly);
     }
 
     #[test]

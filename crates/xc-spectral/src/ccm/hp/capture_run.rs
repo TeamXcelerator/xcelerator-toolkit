@@ -275,6 +275,8 @@ pub(super) fn capture_failure(error: anyhow::Error) -> xc_cache::CaptureFailure 
             || text.contains("exceeds the rational workspace budget")
             || text.contains("run memory budget exceeded")
             || text.contains("run worker budget exceeded")
+            || text.contains("diagnostic execution budget exceeded")
+            || text.contains("required automatic u-flow response unavailable")
     });
     match xc_cache::CaptureFailure::failed(format!("{error:#}")) {
         xc_cache::CaptureFailure::Failed { reason } if limited => {
@@ -653,6 +655,20 @@ impl RetainedCcmRun {
         &mut self,
         inputs: crate::ccm::extended_research::ExternalResearchInputs,
     ) -> Result<()> {
+        self.validate_extended_research_inputs(&inputs)?;
+        self.run_once_prepared = false;
+        self.run_once_sources.clear();
+        self.record_sector_certificate_source();
+        self.extended_inputs = Some(inputs.into());
+        self.extended_input_error = None;
+        self.extended_inputs_loaded = true;
+        Ok(())
+    }
+
+    fn validate_extended_research_inputs(
+        &self,
+        inputs: &crate::ccm::extended_research::ExternalResearchInputs,
+    ) -> Result<()> {
         let record = self
             .eigenpair
             .as_ref()
@@ -663,14 +679,31 @@ impl RetainedCcmRun {
             std::slice::from_ref(&record.manifest.content_digest),
         )?;
         inputs.matches(&state)?;
+        self.validate_cluster_preparation_assessment(inputs, &state)?;
         if self.arithmetic_reference.is_some() {
-            self.check_arithmetic_reference_conflict(&inputs)?;
+            self.check_arithmetic_reference_conflict(inputs)?;
         }
-        self.run_once_prepared = false;
-        self.run_once_sources.clear();
-        self.extended_inputs = Some(inputs.into());
-        self.extended_input_error = None;
-        self.extended_inputs_loaded = true;
+        Ok(())
+    }
+
+    fn validate_cluster_preparation_assessment(
+        &self,
+        inputs: &crate::ccm::extended_research::ExternalResearchInputs,
+        state: &crate::ccm::state_geometry::RetainedState,
+    ) -> Result<()> {
+        if let Some(assessment) = &inputs.cluster_preparation_assessment {
+            let manifest = self.source.tau_manifest.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("cluster preparation assessment requires retained Tau")
+            })?;
+            let matrix = crate::ccm::retained_evidence::RetainedMatrix::from_admitted_runtime(
+                manifest.clone(),
+                state.cutoff.clone(),
+                state.modes,
+                state.precision,
+                &self.source.tau,
+            )?;
+            assessment.matches(state, &matrix)?;
+        }
         Ok(())
     }
     pub fn load_extended_research_inputs(&mut self, path: &std::path::Path) -> Result<()> {
@@ -715,28 +748,15 @@ impl RetainedCcmRun {
         let result = self
             .capture_diagnostic(id, options, cache)
             .map_err(capture_failure)?;
-        if result.value["kind"] == "ccm_finite_diagnostic_analysis"
-            && result.value_reference.is_none()
-            && result.value["data"]["outcome"] == "blocked"
-        {
+        if id == "sector_gap_certificate" && result.value["status"] == "unresolved" {
             return Err(xc_cache::CaptureFailure::Blocked {
-                reason: result.value["data"]["reason"]
+                reason: result.value["reason"]
                     .as_str()
-                    .unwrap_or("diagnostic resource limit")
+                    .unwrap_or("sector-gap certificate unresolved")
                     .into(),
             });
         }
-        if result.value["kind"] != "ccm_finite_diagnostic_analysis"
-            && result.value["data"]["outcome"] == "missing_input"
-        {
-            return Err(xc_cache::CaptureFailure::Missing {
-                reason: result.value["data"]["reason"]
-                    .as_str()
-                    .unwrap_or("required retained inputs unavailable")
-                    .into(),
-            });
-        }
-        Ok(result)
+        result.qualified_for(id)
     }
 
     fn prepare_run_once_inputs(
@@ -745,6 +765,22 @@ impl RetainedCcmRun {
         cache: &ArtifactCacheContext<'_>,
     ) -> Result<()> {
         use crate::ccm::{convergence_capture::*, extended_research::*};
+        // Even a prepared run must reject a changed, contradictory request.
+        if let Some(input) = &self.extended_inputs {
+            if input.cluster.is_empty() {
+                if let (Some(assessment), Some(policy)) = (
+                    &input.cluster_preparation_assessment,
+                    options.sector_analysis,
+                ) {
+                    anyhow::ensure!(
+                        assessment.origin == "automatic_sector_attempt"
+                            && assessment.requested_eigenpairs_per_sector == policy.requested_eigenpairs
+                            && assessment.eigenvalue_route == policy.eigenvalue_route.as_str(),
+                        "cluster preparation assessment conflicts with the requested sector analysis"
+                    );
+                }
+            }
+        }
         if self.run_once_prepared {
             return Ok(());
         }
@@ -770,6 +806,16 @@ impl RetainedCcmRun {
             "schema_version":1,"source_eigenpair":record.manifest.content_digest,"lambda_squared":state.cutoff,"n_modes":state.modes,"precision_bits":state.precision,
             "convention_id":"toolkit_retained_run_inputs_v1","definition_digest":ContentDigest::sha256(b"toolkit_retained_run_inputs_v1"),"approximation_scope":"finite retained sources; automatic component actions and response reuse; no target formula"
         })).expect("static automatic input shape"));
+        // Check an explicit absence against the actual retained sources before
+        // any component or response preparation, including file-loaded inputs.
+        self.validate_cluster_preparation_assessment(&input, &state)?;
+        if input
+            .cluster_preparation_assessment
+            .as_ref()
+            .is_some_and(|assessment| assessment.origin == "automatic_sector_attempt")
+        {
+            input.cluster_preparation_assessment = None;
+        }
         if self.arithmetic_reference.is_some()
             || std::env::var("XC_RESEARCH_PREPARE_TARGET_REFERENCE").is_ok_and(|v| v == "1")
         {
@@ -952,6 +998,7 @@ impl RetainedCcmRun {
                         )?)
                     }) {
                         Ok(response) => {
+                            derived.automatic_u_flow_failed = false;
                             let manifest = record
                                 .sources
                                 .iter()
@@ -961,10 +1008,6 @@ impl RetainedCcmRun {
                             {
                                 bail!("u-flow source belongs to a different state");
                             }
-                            let sign = crate::ccm::retained_evidence::orientation(
-                                &state.coefficients,
-                                state.precision,
-                            );
                             for (j, root) in response.roots.iter().enumerate() {
                                 if let Some(t) = &root.value {
                                     let total =
@@ -1004,38 +1047,31 @@ impl RetainedCcmRun {
                                     );
                                 }
                             }
-                            for channel in response.channels {
-                                let action = channel
-                                    .tau_velocity_action_on_state
-                                    .iter()
-                                    .map(|v| {
-                                        Ok(lossless_hp_decimal(
-                                            &(Float::with_val(state.precision, Float::parse(v)?)
-                                                * sign),
-                                        ))
-                                    })
-                                    .collect::<Result<Vec<_>>>()?;
-                                derived.derivative_actions.push(OperatorAction {
-                                    label: channel.channel,
-                                    source_digest: manifest.content_digest.clone(),
-                                    action,
-                                    convention: response.derivative_convention.clone(),
-                                });
-                            }
+                            derived.derivative_actions = super::response_repair::oriented_actions(
+                                &response,
+                                &state,
+                                &manifest.content_digest,
+                            )?;
                             derived.log_cutoff_velocity = Some("1".into());
                             self.run_once_sources.extend(record.sources);
                         }
-                        Err(error) => derived
-                            .producer_notes
-                            .push(format!("u-flow source decode unavailable: {error}")),
+                        Err(error) => {
+                            derived.automatic_u_flow_failed = true;
+                            derived
+                                .producer_notes
+                                .push(format!("u-flow source decode unavailable: {error}"));
+                        }
                     }
                 }
-                Err(error) => derived
-                    .producer_notes
-                    .push(format!("u-flow response unavailable: {error}")),
+                Err(error) => {
+                    derived.automatic_u_flow_failed = true;
+                    derived
+                        .producer_notes
+                        .push(format!("u-flow response unavailable: {error}"));
+                }
             }
         }
-        if input.cluster.is_empty() {
+        if input.cluster.is_empty() && input.cluster_preparation_assessment.is_none() {
             match self.sectors(options, cache) {
                 Ok(()) => {
                     let sectors = self.sectors.as_ref().expect("prepared sectors");
@@ -1045,7 +1081,12 @@ impl RetainedCcmRun {
                     ] {
                         if let Some(manifest) = manifest {
                             self.run_once_sources.push(manifest.clone());
-                            for vector in &spec.eigenpairs {
+                            if spec.eigenpairs.len() > 16 {
+                                derived.producer_notes.push(format!(
+                                    "cluster basis uses the first 16 of {} retained {} sector eigenpairs in algebraic order",
+                                    spec.eigenpairs.len(), spec.parity.as_str()));
+                            }
+                            for vector in spec.eigenpairs.iter().take(16) {
                                 let full = match spec.parity {
                                     CcmParity::Even => expand_even_sector_vector(
                                         &vector.eigenvector,
@@ -1450,6 +1491,7 @@ impl RetainedCcmRun {
             ) {
                 Ok(resolved) => {
                     self.compact_sector_certificate = Some(resolved);
+                    self.record_sector_certificate_source();
                     Ok(())
                 }
                 Err(error) => {
@@ -1468,6 +1510,7 @@ impl RetainedCcmRun {
         match resolved {
             Ok(resolved) => {
                 self.sector_certificate = Some(resolved);
+                self.record_sector_certificate_source();
                 Ok(())
             }
             Err(error) => {
@@ -1548,12 +1591,25 @@ impl RetainedCcmRun {
         if let Some(error) = &self.extended_input_error {
             bail!("external research preparation: {error}");
         }
+        // File-loaded and generated inputs must pass the same admission as
+        // explicitly supplied data before a caller starts expensive preparation.
+        if let Some(input) = &self.extended_inputs {
+            self.validate_extended_research_inputs(input)?;
+        }
         Ok(self.extended_inputs.as_deref().cloned())
     }
 
     #[doc(hidden)]
     pub fn extended_research_sources(&self) -> &[ArtifactManifest] {
         &self.run_once_sources
+    }
+
+    fn record_sector_certificate_source(&mut self) {
+        if let Some((_, manifest)) = self.sector_certificate_ref() {
+            if !self.run_once_sources.contains(manifest) {
+                self.run_once_sources.push(manifest.clone());
+            }
+        }
     }
 
     /// Prepare signed finite components from this matrix's retained primitives.
@@ -2045,6 +2101,9 @@ impl RetainedCcmRun {
                 || self.sector_certificate_options.is_some())
             {
                 if let Err(error) = self.ensure_sector_certificate(options, cache) {
+                    if matches!(id, "transform_enclosure" | "capture_preflight") {
+                        return Err(error.context("requested sector certificate unavailable"));
+                    }
                     certificate_error = Some(format!("{error:#}"));
                     xc_core::progress_message!(
                         "  sector-gap certificate unavailable to {id}: {error:#}"
@@ -2373,7 +2432,7 @@ impl RetainedCcmRun {
                 // Sector enclosures add exact-form eigenvalue bounds; a sector
                 // limitation only omits those bounds from this measurement.
                 if options.sector_analysis.is_some() {
-                    let _ = self.sectors(options, cache);
+                    self.sectors(options, cache)?;
                 }
                 let tau_manifest = self.source.tau_manifest.clone().ok_or_else(|| {
                     anyhow::anyhow!("retained Tau manifest unavailable for assembly error analysis")
@@ -3343,6 +3402,152 @@ mod tests {
 
     #[cfg(feature = "arb")]
     #[test]
+    fn declared_cluster_absence_is_checked_before_preparation_and_reused() {
+        use xc_cache::*;
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(EphemeralCacheStore::new(256 << 20).unwrap()),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["ephemeral".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let params = CcmParams::from_lambda_sq_integer(13, 16);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.n_eigenvalues = 1;
+        cfg.quad_points = 32;
+        let dataset = xc_zeta::zeros::bundled_dataset_identity().unwrap();
+        let seeds = vec![Float::with_val(
+            cfg.precision_bits,
+            Float::parse(&xc_zeta::zeros::bundled_first_n_strings(1).unwrap()[0]).unwrap(),
+        )];
+        let mut options = crate::ccm::capture::CcmCapturePlan::ultra(2, 17)
+            .unwrap()
+            .primary_options()
+            .unwrap();
+        let requested_sector = options.sector_analysis.take();
+        options.capture_prime_power_response = false;
+        options.capture_u_flow_response = false;
+        let mut expected = None;
+        for _ in 0..2 {
+            let mut run =
+                RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &cache).unwrap();
+            let input: crate::ccm::extended_research::ExternalResearchInputs = serde_json::from_value(serde_json::json!({
+                "schema_version":1,"source_eigenpair":run.eigenpair.as_ref().unwrap().manifest.content_digest,
+                "lambda_squared":"13","n_modes":16,"precision_bits":cfg.precision_bits,
+                "convention_id":"declared-cluster-fixture","definition_digest":ContentDigest::sha256(b"declared-cluster-fixture"),
+                "approximation_scope":"explicit test exclusion; no sector vectors",
+                "cluster_preparation_assessment":{
+                    "source_eigenpair":run.eigenpair.as_ref().unwrap().manifest.content_digest,
+                    "source_matrix":run.source.tau_manifest.as_ref().unwrap().content_digest,
+                    "source_precision_bits":cfg.precision_bits,"requested_eigenpairs_per_sector":2,
+                    "eigenvalue_route":"complete_qr","origin":"declared_prior_capture_policy",
+                    "evidence_digest":ContentDigest::sha256(b"fixture capture request"),
+                    "reason":"sector analysis explicitly excluded by acquisition policy"
+                }
+            })).unwrap();
+            let source_only = crate::ccm::convergence_capture::finite_capture::RetainedFiniteSources::from_manifests(
+                &run.primary_sources(), false, &cache,
+            ).unwrap();
+            assert!(source_only.validate_recovery_input(&input).is_err());
+            let recovery = crate::ccm::convergence_capture::finite_capture::RetainedFiniteSources::from_manifests(
+                &run.primary_sources(), true, &cache,
+            ).unwrap();
+            recovery.validate_recovery_input(&input).unwrap();
+            for field in ["source_eigenpair", "source_matrix", "source_precision_bits"] {
+                let mut bad = serde_json::to_value(&input).unwrap();
+                bad["cluster_preparation_assessment"][field] = if field == "source_precision_bits" {
+                    serde_json::json!(cfg.precision_bits - 1)
+                } else {
+                    serde_json::json!(ContentDigest::sha256(b"foreign source"))
+                };
+                let bad: crate::ccm::extended_research::ExternalResearchInputs =
+                    serde_json::from_value(bad).unwrap();
+                assert!(recovery.validate_recovery_input(&bad).is_err());
+                assert!(run.set_extended_research_inputs(bad.clone()).is_err());
+                assert!(run.extended_inputs.is_none());
+                // Simulate the file-loading route: it must pass the same guard
+                // before a caller is given data for expensive preparation.
+                run.extended_inputs = Some(bad.into());
+                run.extended_inputs_loaded = true;
+                assert!(run
+                    .prepare_extended_research_inputs_with_cache(&cache)
+                    .is_err());
+                assert!(!run.run_once_prepared);
+                run.extended_inputs = None;
+            }
+            run.set_extended_research_inputs(input.clone()).unwrap();
+            run.prepare_extended_research_inputs_with_cache(&cache)
+                .unwrap();
+            let mut contradictory = options.clone();
+            contradictory.sector_analysis = requested_sector;
+            assert!(run
+                .capture_diagnostic_outcome("spectral_cluster_full", &contradictory, &cache)
+                .is_err());
+            assert!(!run.run_once_prepared);
+            let result = run
+                .capture_diagnostic_outcome("spectral_cluster_full", &options, &cache)
+                .unwrap();
+            assert_eq!(result.value["data"]["outcome"], "partial_unresolved");
+            for name in [
+                "sector_attempted",
+                "retained_cluster_vector_count",
+                "cluster_projection_available",
+                "certifies_spectral_cluster",
+            ] {
+                assert_eq!(result.value["data"]["values"][name], "0");
+            }
+            assert!(
+                run.sectors.is_none() && run.sector_options.is_none() && run.sector_error.is_none()
+            );
+            assert_eq!(
+                run.extended_inputs
+                    .as_ref()
+                    .unwrap()
+                    .cluster_preparation_assessment,
+                input.cluster_preparation_assessment
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&result.value, expected);
+            } else {
+                expected = Some(result.value);
+            }
+            // A warm prepared run cannot bypass the option-conflict guard.
+            assert!(run
+                .capture_diagnostic_outcome("spectral_cluster_full", &contradictory, &cache)
+                .is_err());
+        }
+        let mut run = RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &cache).unwrap();
+        assert!(matches!(
+            run.capture_diagnostic_outcome("spectral_cluster_full", &options, &cache),
+            Err(CaptureFailure::Missing { .. })
+        ));
+        assert!(run
+            .extended_inputs
+            .as_ref()
+            .unwrap()
+            .cluster_preparation_assessment
+            .is_none());
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
     fn automatic_unresolved_sector_cluster_is_source_bound_and_cache_stable() {
         use xc_cache::{
             ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
@@ -3710,23 +3915,15 @@ mod tests {
             &cache,
         )
         .unwrap();
-        for id in ids {
+        assert!(matches!(
+            result.value.receipt.outcomes().get("finite_root_budget"),
+            Some(xc_core::DiagnosticOutcome::Blocked { .. })
+        ));
+        for id in &ids[1..] {
             let value =
-                xc_cache::measurement_value(&result.value.measurements[id], &resolver, &policy)
+                xc_cache::measurement_value(&result.value.measurements[*id], &resolver, &policy)
                     .unwrap();
-            if id == "finite_root_budget" {
-                assert_eq!(value["data"]["outcome"], "blocked");
-                assert!(value["data"]["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains("synthetic inertia did not separate"));
-            } else {
-                assert_eq!(value["data"]["outcome"], "computed");
-                assert_eq!(
-                    value["data"]["input_preparation_error"],
-                    "synthetic optional preparation failure"
-                );
-            }
+            assert_eq!(value["data"]["outcome"], "computed");
         }
         assert!(run
             .capture_diagnostic("constrained_l1_fit", &options, &cache)
@@ -5147,10 +5344,10 @@ mod unresolved_certificate_contract {
             .capture_diagnostic("finite_root_budget", &options, &cache)
             .unwrap();
         assert_eq!(budget.value["data"]["outcome"], "blocked");
-        assert!(budget.value["data"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("remained inconclusive"));
+        assert_eq!(
+            budget.value["data"]["reason"],
+            "requested sector-gap certificate unavailable"
+        );
     }
 }
 

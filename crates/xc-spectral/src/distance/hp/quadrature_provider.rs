@@ -34,7 +34,7 @@ impl ProfileTargets {
         }
         let spec = crate::target::TargetProfileSpec::from_environment()?;
         anyhow::ensure!(
-            spec.digest()? == target.base_value_digest(),
+            spec.base_value_digest()? == target.base_value_digest(),
             "runtime target specification changed after its semantic identity was fixed"
         );
         let workers = crate::ccm::research_target::sample_workers(&spec, points.len())?

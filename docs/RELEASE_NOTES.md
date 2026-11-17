@@ -1,5 +1,212 @@
 # Release notes
 
+## 0.17.2 (amended 2026-11-28)
+
+Managed publication checks compact sector-gap certificates that share a key
+and producer version but differ in bytes. Builds with the Arb spectral verifier
+replay both certificates against the keyed request. Matching proofs can reuse
+the active certificate. A child that cites a different exact producer retains
+that evidence separately. A different proof, an invalid archive or an
+unavailable verifier blocks the conflicting publication.
+
+Repeating a publication can reuse the exact compact certificate retained for
+a child even when the live index points to a lower-assurance producer. After
+replaying the equivalent proofs, the publisher verifies the stored producer's
+own batch, assurance, ancestry, revocations and transport before reporting a hit.
+
+Fourier reference sources now serialize with deterministic object ordering.
+Reference projections reuse equivalent authenticated inputs across JSON field
+orders. Compact sector-gap consumers reuse equivalent proofs across producing
+builds while retaining the original certificate as a dependency. The compact
+root-budget report records the canonical proof digest. Existing compact-v1
+reports can still be verified against their original certificate bytes. The
+first request for a transform enclosure or compact root budget under its new
+key can require recomputation.
+
+Assembly-error analyses now include the ordered root ordinals and full-precision
+point values in their cache key. On reuse, the reader checks each row against
+the requested roots. Requests that differ by even one retained ordinal or
+point value have distinct keys. Earlier assembly-error entries are ineligible
+for reuse.
+
+Compact sector-gap certification automatically increases analytic assembly
+precision when the interval counts are inconclusive. Reuse selects an existing
+certificate by its actual precision and guide identities. The primary spectral
+calculation retains its configured precision.
+
+Operator-cluster analysis now warns and continues when its dense workspace
+estimate exceeds the working-byte budget. The guard ladder still checks vector
+scratch, and the complement feedback must pass its interval proof.
+
+Root certification for reference-seeded refinements records the reference
+label and the independently counted finite-source rank. The count extends
+through the retained points. A successful report requires a unique, ordered
+enclosure for each converged point. These reports have their own cache identity.
+Independent ordinal requests continue to use their stated finite ranks.
+
+U-flow checks the directed separation of the selected state and its neighbor
+before computing velocity actions. A finite overlap retains both endpoints and
+their source precision for applications assessing response applicability.
+
+### Cache, publication and capture
+
+Local cache records use the v3 index layout and share content-addressed immutable
+objects. The reader does not enumerate v2 workstation indexes. A run on a
+v2-only cache recomputes local inputs unless an enabled remote source supplies
+them. Recovery needs exact, admissible manifests in the current layout.
+Use separate cache and checkpoint directories when comparing development builds.
+During publication-enabled reuse, the reader checks the exact dependencies of
+a cached result before reporting a hit or copying the result to the workstation.
+If an older diagnostic refers to an obsolete roots contract, ordinary reuse
+tries another eligible candidate and can regenerate the diagnostic with its
+current inputs. Require-reuse mode reports a miss when no candidate qualifies.
+Publication can also replace a value-equivalent diagnostic with obsolete
+ancestry in the live index when a downstream artifact requires the repair.
+Capture receipts and hypothesis evaluations can stage their source artifacts
+under portable research labels. When a producer's draft is already staged,
+the receipt reuses its exact canonical manifest across local labels. Staging
+also checks the exact parent set before reusing a previously staged child.
+Finite diagnostics, transform enclosures, capture receipts, and u-flow responses
+require a producer version of at least 0.17.2. Readers check the numerical
+contract as well, so earlier builds of the same release cannot supply an obsolete
+result. U-flow generates quadrature tables from the requested order and working
+precision. A completed action checkpoint can be reopened using the digest
+retained by its writer. Restarted computations can resume from partial work.
+
+Explicit refresh starts a new local candidate history for ordinary lookups.
+Exact dependencies retain access to earlier payloads. Index reconstruction
+uses recorded write order. Shard lookup checks newer revocations before
+returning historical artifacts and refuses reads when it cannot establish policy.
+
+Capture receipts distinguish resource refusal from a completed measurement.
+Receipt repair and cache admission verify the outcome and coverage of embedded
+and referenced measurements. A completed full directional response or root
+transport requires every requested row to resolve. An explicitly qualified
+partial assessment remains admissible for diagnostics that allow one.
+Certificate-backed recovery uses the selected certificate representation.
+Publication retry binds the destination and exact staged descriptors to the
+authorized run, and refuses a withdrawn publication policy. Public admission
+recognizes the bundled zero table's content-bound attribution and checks
+producer-supplied public documents before scheduling destination writes. It
+checks reference syntax, dataset identifiers and numerical dataset records,
+reviewed formulas and target labels. Root certificate counts and indices use
+unsigned JSON integers. Height bounds accept finite decimals at source precision.
+
+A refused assembly root bound or automatic u-flow action blocks dependent measurements.
+Certified contour counts recompute their interval contributions. Replay can bind an explicitly
+requested gap certificate. Cohort selection authenticates the Tau configuration along a
+producer edge, including when multiple configurations produce identical matrix bytes.
+
+A workstation copy of a published artifact requires an admitted exact manifest in its
+original destination. Publication checks candidates and their dependency chains
+against readable shards before committing them. A public family can publish
+different reviewed artifact shapes together, with a separate proof for each
+disclosure policy.
+Explicit replacements can advance recomputed parents. Retry retains the authorized
+descriptors across sessions that share a staging root and destination.
+
+High-precision root cross-checks support separate evaluators. Fresh dense LU
+factors report successful CPU and CUDA Schur products. These counters describe
+execution and do not contribute to a numerical cache key.
+
+## 0.17.2 (2026-11-17)
+
+Amended 2026-11-19 with cache-validation, native Windows Git transport and
+publication-performance fixes. The release version and portable defaults are
+unchanged.
+
+### Cache reuse and resource accounting
+
+The normal workstation disk defaults are 100 GiB for temporary and permanent
+storage. Temporary readers use the temporary allowance and admit prefetch
+capacity before downloading; memory and transfer allowances remain separate.
+See [resource configuration](PUBLICATION_RECOVERY.md#resource-limits).
+
+Self-contained retained input views and preflight inventories preserve producer
+ancestry as provenance without fetching unrelated historical payloads. Exact
+decimal coordinate equality allows alternate decimal spellings without rounded
+comparisons. Reference projection authenticates original cached JSON bytes when
+typed serialization changes field order or whitespace.
+Root-window replay tolerates the obsolete seed-dataset attribution field in
+older summaries while still checking acquisition decisions, source schema,
+every retained root and all finite statistics against the authenticated source.
+
+Publication recognizes obsolete visibility annotations consistently across
+shards. Disclosure, mathematical assumptions, compatibility, assurance and
+revocation checks remain enforced. Retained transport schema/profile labels
+are reconciled only when their complete encoding digest is already authorized
+by the manifest; package and ordered-part bytes must still match exactly.
+Existing repositories are not rewritten automatically.
+
+Git transport commands explicitly select their bare repository instead of
+allowing parent-directory discovery. On Windows, long publication-journal paths
+use an owned, short temporary Git workspace with the same locking, resource
+accounting and cleanup; retained artifacts and journals keep their original
+paths. This avoids repository-discovery failures before Git's long-path setting
+has taken effect.
+
+Publication preflight reuses validated index and exact-parent metadata within
+an admission pass, with separate Git revisions and destinations. Shared disk
+accounting uses directory-entry metadata to avoid per-file reopen overhead on
+Windows. Limits and ancestry/revocation checks remain enforced; progress logs
+report per-family preflight timing and reuse counts.
+Wide producer-ancestry graphs prefetch manifest, index and revocation metadata
+in bounded batches instead of negotiating a separate transfer for each parent.
+Prefetch never substitutes for hashing, compatibility or disclosure validation.
+Small metadata reads and authenticated absence are shared across publication
+phases by repository, full commit and path. Session cleanup retains this bounded
+invocation memo; resource-policy changes detach it. Memory hits avoid disk scans,
+while cold metadata reads and blob-size checks use batched Git processes.
+Successful exact ancestry proofs also survive phase boundaries, bound to every
+observed head and topology and expiring at scheduled revocations. Each transaction
+refreshes its read snapshot; mutation authorization and compare-and-swap checks
+remain live. Numerical payloads remain streamed, with unchanged resource limits.
+
+New V2 descendants bind to the compatible existing producer selected during
+publication reuse. A changed provenance wrapper no longer forces equal parents
+and their ancestors back into the write set. Numerical keys and payload digests
+remain unchanged, with exact ancestry, version and disclosure checks retained.
+
+### Optional CPU execution tuning
+
+Portable execution remains the default. Opt-in packed, AVX2 and AVX-512 integer
+product kernels preserve exact accumulation and CRT reconstruction. Runtime
+dispatch checks the required ISA features; unsupported explicit choices fail
+before CPU execution. Optional contiguous residue storage also applies to CUDA
+preparation. Both choices preserve conservative workspace admission and
+numerical cache identities, with bounded logs identifying nondefault execution.
+See [CPU execution tuning](CPU_EXECUTION.md) for runtime controls, local compiler
+flags, LTO/PGO considerations and measurement guidance. Hardware-specific build
+flags and process affinity are not enabled by repository defaults.
+
+Parallel profile diagnostics bind schema-4 targets by their declared numerical
+identity. Unchanged targets and provenance-only changes remain valid; changed
+numerical inputs and invalid value contracts are rejected. Synthetic provider
+regressions cover complete residual and deviation payloads with legacy and
+schema-4 targets under serial and parallel execution.
+
+### Toolchain and compatibility
+
+Development and native Windows qualification now use stable Rust 1.100.0;
+the declared MSRV remains 1.99. The Windows dependency lock binds the updated
+Rust package and compiler files. GMP 6.3.0, MPFR 4.2.2, FLINT 3.6.0, numerical
+library versions and archive encoders are unchanged. An unused cache dependency
+and workspace aliases were removed; a transfer-response loop was adjusted for
+strict lint without changing arithmetic order.
+
+This release adds execution options, not a new numerical identity or archive
+format. Existing producer/reader floors, schema-2 capability requirements and
+private-publication restrictions remain in force. Compatible earlier artifacts
+are reused with their original provenance. A newer producer version alone is
+not grounds for republishing. No cache migration or scientific rerun is implied.
+
+Native Windows qualification covers exact-product oracles, optional kernels and
+layouts, CPU/CUDA equality, managed-cache reuse, external consumers and strict
+lint. These bounded checks do not establish whole-claim speedups. The historical
+Linux/Windows byte comparisons in the 0.17.1 notes apply to that native port;
+they are not a new Linux qualification of 0.17.2. See
+[numerical compatibility](NUMERICAL_COMPATIBILITY.md).
+
 ## 0.17.1 (2026-11-11)
 
 ### Cache identity and disclosure maintenance
@@ -484,9 +691,7 @@ CUDA products automatically prefer two pinned transfer lanes when there are
 at least 128 residue primes per admitted device. Both lanes are packed before
 their transfers and exact batched digit products are submitted. Planning keeps
 the synchronous path if optional symbols or additional workspace are unavailable,
-or if the pipeline would lose an admitted device. Explicit overrides remain
-available; execution and arithmetic failures never trigger a retry on another
-path. Exact CPU comparisons, lane reuse, wide CRT, and sanitizer checks passed
+or if the pipeline would lose an admitted device. Requesting the pipeline also permits synchronous CUDA if the workspace cannot fit it before work begins. Execution and arithmetic failures propagate. Exact CPU comparisons, lane reuse, wide CRT, and sanitizer checks passed
 on one RTX 5090; this does not establish complete-workload or multi-device speedups.
 
 Publication routes each encoded part directly to its authenticated source root

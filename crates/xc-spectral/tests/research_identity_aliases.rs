@@ -213,15 +213,10 @@ fn extended_diagnostics_reach_one_child_from_producer_remote_and_adopted_states(
     malformed
         .tags
         .insert(SEMANTIC_KEY_MANIFEST_TAG.into(), "{\"remote\":true}".into());
-    assert!(capture_extended(
-        "compactness",
-        &state(&malformed),
-        None,
-        None,
-        None,
-        &options,
-        &[],
-        &cache.context(REQUIRE),
+    assert!(RetainedState::from_payload(
+        &malformed,
+        &sb,
+        std::slice::from_ref(&malformed.content_digest)
     )
     .is_err());
     // A source descriptor label does not change the consumed numerical values.

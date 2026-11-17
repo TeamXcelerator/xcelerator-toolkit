@@ -2,7 +2,7 @@
 // All rights reserved. See LICENSE in the repository root.
 
 //! Fixed-panel partial-pivot LU. Execution tiling changes no inner sums.
-use super::{lu_factor, LuFactors};
+use super::{lu_factor, LuFactors, LuSchurExecution};
 use crate::exact_product::{
     prepare_borrowed, ExactProductLimits, PreparedProduct, ProductShape, WorkspaceLimit,
 };
@@ -211,7 +211,7 @@ fn update_schur_tile(
     precision: u32,
     options: DenseLuOptions,
     cuda: bool,
-) -> Result<()> {
+) -> Result<LuSchurExecution> {
     // Half the reservation leaves room for panel temporaries and allocator
     // headroom. Inputs are borrowed, so a refused tile has no cloned Floats.
     let product_budget = options.max_workspace_bytes / 2;
@@ -219,6 +219,7 @@ fn update_schur_tile(
     // are dropped before retrying children, including a later CRT admission
     // refusal after exact preparation succeeded. No output is mutated until a
     // complete product has succeeded.
+    let mut execution = LuSchurExecution::default();
     let result = (|| {
         let prepared = prepare_schur_tile(lu, dim, first, end, tile, precision, product_budget)?;
         if cuda
@@ -226,7 +227,7 @@ fn update_schur_tile(
                 || u64::from(prepared.plan().output_integer_bits) + 2
                     <= crate::modular_product::maximum_reconstruction_bits())
         {
-            prepared.modular_product(
+            prepared.modular_product_with_observer(
                 Round::Nearest,
                 options.backend,
                 ProductLimits {
@@ -241,8 +242,16 @@ fn update_schur_tile(
                     max_modular_scalar_products: u64::MAX,
                     workers: options.workers,
                 },
+                &mut |backend| match backend {
+                    ProductBackend::Cuda => execution.cuda_products += 1,
+                    ProductBackend::Cpu => execution.cpu_products += 1,
+                    ProductBackend::Auto => {
+                        unreachable!("completed product has a concrete backend")
+                    }
+                },
             )
         } else {
+            execution.cpu_products += 1;
             prepared.cpu_product_parallel(Round::Nearest)
         }
     })();
@@ -254,8 +263,13 @@ fn update_schur_tile(
                 // complete dimension-bound panel inner sum, and their updates
                 // never touch either panel input. Earlier completed tiles need
                 // no rollback or recomputation.
-                update_schur_tile(lu, dim, first, end, left, precision, options, cuda)?;
-                return update_schur_tile(lu, dim, first, end, right, precision, options, cuda);
+                let left = update_schur_tile(lu, dim, first, end, left, precision, options, cuda)?;
+                let right =
+                    update_schur_tile(lu, dim, first, end, right, precision, options, cuda)?;
+                return Ok(LuSchurExecution {
+                    cpu_products: left.cpu_products + right.cpu_products,
+                    cuda_products: left.cuda_products + right.cuda_products,
+                });
             }
             return Err(error);
         }
@@ -265,7 +279,7 @@ fn update_schur_tile(
             lu[(tile.row + i) * dim + tile.col + j] -= &result[i * tile.cols + j];
         }
     }
-    Ok(())
+    Ok(execution)
 }
 
 /// Default primary factorization: legacy for scalar matrices, exact blocked
@@ -364,6 +378,7 @@ pub fn lu_factor_blocked(a: &[Float], dim: usize, options: DenseLuOptions) -> Re
         .as_ref()
         .map(|r| r.try_reserve_working(options.max_workspace_bytes))
         .transpose()?;
+    let mut execution = LuSchurExecution::default();
     let cuda = match options.backend {
         ProductBackend::Cpu => false,
         ProductBackend::Auto => {
@@ -389,7 +404,7 @@ pub fn lu_factor_blocked(a: &[Float], dim: usize, options: DenseLuOptions) -> Re
             true
         }
     };
-    xc_core::progress_message!("[HP] dense LU: exact dimension-bound Schur updates, backend={}, dimension={dim}, workspace={} bytes", if cuda {"cuda"} else {"cpu"}, options.max_workspace_bytes);
+    xc_core::progress_message!("[HP] dense LU: exact dimension-bound Schur updates, backend={}, dimension={dim}, workspace={} bytes", if cuda && options.backend == ProductBackend::Auto {"auto (CUDA available)"} else if cuda {"cuda"} else {"cpu"}, options.max_workspace_bytes);
     let mut lu = a.to_vec();
     let mut perm: Vec<_> = (0..dim).collect();
     let panel = PANEL.min((dim / 4).max(1));
@@ -465,7 +480,7 @@ pub fn lu_factor_blocked(a: &[Float], dim: usize, options: DenseLuOptions) -> Re
             let rows = tile.min(dim - row0);
             for col0 in (end..dim).step_by(tile) {
                 let cols = tile.min(dim - col0);
-                update_schur_tile(
+                let tile_execution = update_schur_tile(
                     &mut lu,
                     dim,
                     first,
@@ -480,6 +495,8 @@ pub fn lu_factor_blocked(a: &[Float], dim: usize, options: DenseLuOptions) -> Re
                     options,
                     cuda,
                 )?;
+                execution.cpu_products += tile_execution.cpu_products;
+                execution.cuda_products += tile_execution.cuda_products;
             }
         }
         ensure!(
@@ -491,7 +508,11 @@ pub fn lu_factor_blocked(a: &[Float], dim: usize, options: DenseLuOptions) -> Re
         lu.iter().all(Float::is_finite),
         "blocked LU arithmetic exceeds finite range"
     );
-    Ok(LuFactors { lu, perm })
+    Ok(LuFactors {
+        lu,
+        perm,
+        schur_execution: Some(execution),
+    })
 }
 
 #[cfg(test)]

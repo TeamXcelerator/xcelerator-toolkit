@@ -1,11 +1,15 @@
 # Standalone public-API consumer
 
-Version target: `0.17.1`.
+Version target: `0.17.2`.
 
 `tests/external-consumer` is intentionally excluded from the toolkit workspace and has its own manifest and dependency lock. It models an adjacent mathematical application rather than a toolkit crate. Its direct toolkit dependencies include `xc-core`, `xc-operator`, `xc-solver`, `xc-certify`, `xc-cache`, optional HP `xc-numerics`, and `xc-spectral`. The solver example is domain independent; a separate public CCM capture-plan check verifies the current Ultra contract. It imports public CCM types without implementing CCM internals.
 
 The consumer also exercises automatic capture accounting through the public
 cache API, retaining a missing outcome alongside a measured value.
+
+With `hp`, it also calls `modular_product::multiply_with_execution` through the
+public API, selects runtime CPU dispatch and flat residue storage, and checks
+the complete exact integer result against a small independently computed product.
 
 The default workflow constructs a positive diagonal operator through `xc-operator`, solves its algebraic minimum through the public `EigenSolverF64` contract, creates a finite positive-definiteness bundle, and independently invokes `verify_bundle`. The HP feature additionally constructs an exact rational interval matrix through public numerics types, builds a portable interval-inertia certificate, and invokes the standalone verifier.
 

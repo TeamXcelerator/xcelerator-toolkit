@@ -44,6 +44,20 @@ of guide discovery and bracket search. It still performs interval assembly and
 the required dense inertia calculations. It can be substantially more
 expensive than reading a research result.
 
+Fresh compact certification starts at the requested assembly precision `p`.
+If the full-matrix inertia or the selected sector counts remain inconclusive,
+the producer reassembles at `p + 64`, `p + 128`, `p + 256` bits and so on,
+doubling the guard up to the supported ceiling of 1,000,000 total bits.
+Each rung recalculates the geometric truncation for its precision. The first
+verified certificate records the actual assembly and proof precisions. A
+workspace refusal or an arithmetic, input or staging error ends the attempt.
+The enclosing spectral computation retains its requested precision.
+
+Reuse checks the ladder in ascending order for an admissible certificate.
+Each rung uses the existing key for its actual assembly parameters, so a
+successful earlier certificate can be reused byte for byte. Failed proof
+attempts generate no certificate or publication candidate.
+
 The managed API distinguishes ordinary computed reuse from independent proof
 replay: authenticated computed reuse checks the compact record's structure and
 request identity; certified or reference-verification reuse performs fresh
@@ -69,6 +83,18 @@ compatible build reuses the exact original record and its historical provenance.
 Explicit regeneration under another source snapshot can change provenance bytes;
 it does not rewrite an existing record. Mathematical changes require updated
 algorithm semantics.
+
+The transform enclosure and compact finite-root budget bind the SHA-256 of
+the compact proof encoded as compact UTF-8 JSON with recursively sorted
+object keys. Only the two top-level fields `source_identity` and
+`producer_toolkit_version` are omitted. Array order, decimal strings, matrix
+hashes, assembly settings, bounds and proof assertions are preserved. Both
+consumers keep the exact producer payload digest in the dependency manifest.
+The compact-v2 root-budget report stores the proof digest in
+`matrix_certificate_digest` and incorporates it into `request_digest`.
+Earlier compact-v1 reports can be replayed against their original certificate
+bytes. A first lookup with the new compact input identity can require a fresh
+calculation.
 
 The managed representation uses the registered `ccm_sector_gap_certificate`
 family with a separate logical key, explicit `compact_analytic_replay_v1`

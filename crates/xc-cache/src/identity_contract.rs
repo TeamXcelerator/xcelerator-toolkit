@@ -45,8 +45,8 @@ pub fn artifact_identity_contract(kind: &str) -> Result<ArtifactIdentityContract
         "quadrature_rule" => (
             "quadrature",
             "quadrature_rule",
-            "quadrature-rule-v1",
-            Some("xc-numerics/quadrature"),
+            "registration-only",
+            None,
             false,
         ),
         "quadrature_reference_table" => (
@@ -679,7 +679,10 @@ pub fn artifact_identity_contract(kind: &str) -> Result<ArtifactIdentityContract
     Ok(ArtifactIdentityContract {
         family,
         kind,
-        value_revision: 1,
+        value_revision: match kind {
+            "ccm_transform_enclosure" | "ccm_finite_diagnostic_analysis" => 2,
+            _ => 1,
+        },
         payload_codec,
         producer,
         private_only: crate::artifact_kind_is_private_only(kind),

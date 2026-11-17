@@ -223,7 +223,7 @@ pub fn package_canonical_payload_zip64(
         cancellation,
     );
     if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
+        let _ = xc_core::remove_temporary_file(&temporary_path);
     }
     result
 }
@@ -313,7 +313,7 @@ pub fn package_canonical_payload_bytes_zip64(
         })
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
+        let _ = xc_core::remove_temporary_file(&temporary_path);
     }
     result
 }
@@ -377,7 +377,7 @@ fn reconstruct_transport_package_inner(
         cancellation,
     );
     if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
+        let _ = xc_core::remove_temporary_file(&temporary_path);
     }
     result
 }
@@ -982,6 +982,10 @@ fn map_io_error(error: io::Error, cancellation: &CancellationToken) -> CacheErro
             .err()
             .map_or_else(|| error.to_string(), |reason| reason.to_string());
         CacheError::Cancelled(reason)
+    } else if error.kind() == io::ErrorKind::InvalidData
+        || error.to_string().eq_ignore_ascii_case("invalid checksum")
+    {
+        CacheError::InvalidManifest(format!("invalid package entry: {error}"))
     } else if error.kind() == io::ErrorKind::StorageFull {
         CacheError::ResourceLimit("deterministic package exceeds temporary-disk budget".to_owned())
     } else {

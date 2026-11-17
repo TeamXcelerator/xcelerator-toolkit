@@ -7,6 +7,10 @@
 use super::*;
 use anyhow::ensure;
 
+#[cfg(test)]
+#[path = "retained_root_recovery_tests.rs"]
+mod tests;
+
 /// An immutable, authenticated retained even-sector source. Construction binds
 /// its coefficients and state-resolution record to the original point payload.
 pub struct RetainedSeededRootSource {
@@ -25,7 +29,7 @@ fn admit(
     kind: &str,
     allowed: &[ContentDigest],
 ) -> Result<SemanticKeyEnvelope> {
-    manifest.validate()?;
+    crate::ccm::source_admission::admit_manifest(manifest, None)?;
     ensure!(
         manifest.key.kind == kind
             && manifest.immutable
@@ -56,6 +60,35 @@ fn admit(
 }
 
 impl RetainedSeededRootSource {
+    /// Apply caller source restrictions in addition to this reader's contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_payloads_with_policy(
+        params: &CcmParams,
+        cfg: &HighPrecConfig,
+        original: &PortableHighPrecResult,
+        tau: &ArtifactManifest,
+        eigenpair: &ArtifactManifest,
+        eigenpair_payload: &[u8],
+        secular: &ArtifactManifest,
+        secular_payload: &[u8],
+        allowed: &[ContentDigest],
+        policy: &xc_cache::CachePolicy,
+    ) -> Result<Self> {
+        for source in [tau, eigenpair, secular] {
+            crate::ccm::source_admission::admit_manifest(source, Some(policy))?;
+        }
+        Self::from_payloads(
+            params,
+            cfg,
+            original,
+            tau,
+            eigenpair,
+            eigenpair_payload,
+            secular,
+            secular_payload,
+            allowed,
+        )
+    }
     /// Authenticate exact retained coefficients, the secular definition, and
     /// the original portable result. Tau is bound by immutable identity only;
     /// its original computation and state-selection proof are not rerun.
@@ -104,17 +137,12 @@ impl RetainedSeededRootSource {
                 "retained source C/N/precision differs from root recovery request"
             );
         }
-        let declared_tau: DependencyRef = serde_json::from_value(
-            ep_semantic.resolved_mathematical_parameters["tau_source_identity"].clone(),
-        )?;
         ensure!(
-            declared_tau.key == tau.key
-                && declared_tau.content_digest == tau.content_digest
-                && declared_tau.required_quality == CacheQuality::Validated,
+            crate::ccm::source_admission::declared_tau_matches(eigenpair, tau, None)?,
             "retained eigenpair belongs to a different Tau identity"
         );
         ensure!(
-            xc_cache::manifest_depends_on(secular, eigenpair)?,
+            crate::ccm::source_admission::declared_secular_matches(secular, eigenpair, None)?,
             "retained secular definition has a different eigenpair parent"
         );
         let ep: PortableWeilEigenpair = serde_json::from_slice(eigenpair_payload)?;
@@ -127,8 +155,14 @@ impl RetainedSeededRootSource {
         let mut resolved_cfg = cfg.clone();
         resolved_cfg.eigenstate_solver = solver;
         let (expected_ep, _) = weil_eigenpair_cache_identity(params, &resolved_cfg, tau)?;
+        // The shared admission above checked both supported parent formats.
+        // Normalize only that field for the arithmetic-policy comparison;
+        // every other algorithm/precision/normalization field stays exact.
+        let mut normalized_ep = ep_semantic.clone();
+        normalized_ep.resolved_mathematical_parameters["tau_source_identity"] =
+            expected_ep.resolved_mathematical_parameters["tau_source_identity"].clone();
         ensure!(
-            expected_ep == ep_semantic,
+            expected_ep == normalized_ep,
             "retained eigenpair arithmetic policy differs"
         );
         ensure!(

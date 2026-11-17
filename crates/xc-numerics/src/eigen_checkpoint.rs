@@ -101,7 +101,8 @@ impl Checkpoint {
         p: u32,
         options: TridiagQrOptions,
     ) -> Option<Self> {
-        if !ALLOWED.with(std::cell::Cell::get)
+        if !xc_core::execution_checkpoint_reads_enabled()
+            || !ALLOWED.with(std::cell::Cell::get)
             || matches!(
                 std::env::var("XC_CACHE_MODE").as_deref(),
                 Ok("refresh" | "verify" | "verify_against_reference" | "verify-against-reference")

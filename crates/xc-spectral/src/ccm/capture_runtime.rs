@@ -193,6 +193,9 @@ pub(crate) struct Checkpoints {
     identity: ContentDigest,
     max_bytes: u64,
     verbose: bool,
+    shared_directory: bool,
+    // Independently retained digest of the immutable completion block written by this handle.
+    completion_digest: std::sync::Arc<std::sync::OnceLock<ContentDigest>>,
 }
 impl Checkpoints {
     pub(crate) fn new<T: Serialize>(identity: &T) -> Result<Self> {
@@ -209,6 +212,8 @@ impl Checkpoints {
             identity: identity_digest(identity)?,
             max_bytes: policy.maximum_checkpoint_bytes,
             verbose: checkpoint_logging(),
+            shared_directory: true,
+            completion_digest: Default::default(),
         })
     }
     pub(crate) fn enabled(&self) -> bool {
@@ -222,14 +227,20 @@ impl Checkpoints {
             identity: self.identity.clone(),
             max_bytes: self.max_bytes.min(maximum),
             verbose: self.verbose,
+            shared_directory: self.shared_directory,
+            completion_digest: self.completion_digest.clone(),
         }
     }
+    /// A caller-owned directory isolated from overlapping managed executions.
+    /// This also backs spill files created and consumed within the same operation.
     pub(crate) fn local<T: Serialize>(identity: &T, directory: PathBuf) -> Result<Self> {
         Ok(Self {
             directory: Some(directory),
             identity: identity_digest(identity)?,
             max_bytes: CaptureResourcePolicy::from_environment()?.maximum_checkpoint_bytes,
             verbose: checkpoint_logging(),
+            shared_directory: false,
+            completion_digest: Default::default(),
         })
     }
     fn path(&self, label: &str) -> Option<PathBuf> {
@@ -238,7 +249,37 @@ impl Checkpoints {
                 .join(ContentDigest::sha256(label.as_bytes()).0)
         })
     }
+    pub(crate) fn load_completion<T: DeserializeOwned>(&self, label: &str) -> Result<Option<T>> {
+        let Some(expected) = self.completion_digest.get() else {
+            return Ok(None);
+        };
+        self.load_bound(label, Some(expected))
+    }
+    pub(crate) fn save_completion<T: Serialize>(&self, label: &str, value: &T) -> Result<()> {
+        if let Some(digest) = self.save_with_digest(label, value)? {
+            if self.completion_digest.get_or_init(|| digest.clone()) != &digest {
+                bail!("completion block changed during one execution");
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn load<T: DeserializeOwned>(&self, label: &str) -> Result<Option<T>> {
+        self.load_bound(label, None)
+    }
+
+    /// An exact digest from a write in this execution permits reading its own
+    /// spill even when a refresh suppresses reuse of earlier checkpoints.
+    pub(crate) fn load_bound<T: DeserializeOwned>(
+        &self,
+        label: &str,
+        written: Option<&ContentDigest>,
+    ) -> Result<Option<T>> {
+        if written.is_none()
+            && self.shared_directory
+            && !xc_core::execution_checkpoint_reads_enabled()
+        {
+            return Ok(None);
+        }
         let Some(path) = self.path(label) else {
             return Ok(None);
         };
@@ -254,6 +295,7 @@ impl Checkpoints {
             let seal: Seal = serde_json::from_reader(BufReader::new(File::open(&seal_path)?))?;
             if seal.schema_version != 1
                 || seal.identity != self.identity
+                || written.is_some_and(|digest| digest != &seal.payload)
                 || seal.bytes > self.max_bytes
                 || fs::metadata(&path)?.len() != seal.bytes
             {
@@ -296,8 +338,16 @@ impl Checkpoints {
         }
     }
     pub(crate) fn save<T: Serialize>(&self, label: &str, value: &T) -> Result<()> {
+        self.save_with_digest(label, value).map(|_| ())
+    }
+
+    pub(crate) fn save_with_digest<T: Serialize>(
+        &self,
+        label: &str,
+        value: &T,
+    ) -> Result<Option<ContentDigest>> {
         let Some(path) = self.path(label) else {
-            return Ok(());
+            return Ok(None);
         };
         fs::create_dir_all(path.parent().expect("checkpoint parent"))?;
         // Unique temporary names also allow independent diagnostics/processes.
@@ -339,18 +389,15 @@ impl Checkpoints {
         drop(writer.writer);
         // The newly computed checkpoint replaces the old one. An interrupted
         // replacement has no matching seal and is rejected by the reader.
-        if path.exists() {
-            fs::remove_file(&path)?;
+        if let Err(error) = xc_core::rename_replacement(&temp, &path) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
         }
-        fs::rename(&temp, &path)?;
-        let seal_tmp = path.with_extension(format!("{suffix}.seal.tmp"));
-        fs::write(&seal_tmp, serde_json::to_vec(&seal)?)?;
-        let seal_path = path.with_extension("seal.json");
-        if seal_path.exists() {
-            fs::remove_file(&seal_path)?;
-        }
-        fs::rename(seal_tmp, seal_path)?;
-        Ok(())
+        xc_cache::atomic_replace_cache_file(
+            &path.with_extension("seal.json"),
+            &serde_json::to_vec(&seal)?,
+        )?;
+        Ok(Some(seal.payload))
     }
 }
 struct DigestReader<R> {
@@ -745,9 +792,8 @@ pub(crate) fn lookahead_results_taken() -> usize {
     LOOKAHEAD_RESULTS_TAKEN.with(std::cell::Cell::get)
 }
 
-/// Conservative heap allowance from streamed JSON size; no materialized JSON tree.
-/// Includes a per-byte factor for Rust containers, scalar storage, and allocation slack.
-pub(crate) fn retained_json_bytes(value: &impl serde::Serialize) -> anyhow::Result<u64> {
+/// Count compact JSON bytes without allocating a second serialized report.
+pub(crate) fn serialized_json_bytes(value: &impl serde::Serialize) -> anyhow::Result<u64> {
     struct Counter(u64);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -763,8 +809,13 @@ pub(crate) fn retained_json_bytes(value: &impl serde::Serialize) -> anyhow::Resu
     }
     let mut count = Counter(0);
     serde_json::to_writer(&mut count, value)?;
-    count
-        .0
+    Ok(count.0)
+}
+
+/// Conservative heap allowance from streamed JSON size; no materialized JSON tree.
+/// Includes a per-byte factor for Rust containers, scalar storage, and allocation slack.
+pub(crate) fn retained_json_bytes(value: &impl serde::Serialize) -> anyhow::Result<u64> {
+    serialized_json_bytes(value)?
         .checked_mul(64)
         .and_then(|n| n.checked_add(4096))
         .ok_or_else(|| anyhow::anyhow!("retained size overflow"))
@@ -1082,6 +1133,8 @@ mod tests {
             identity: ContentDigest::sha256(&serde_json::to_vec(&key).unwrap()),
             max_bytes: 1024,
             verbose: false,
+            shared_directory: false,
+            completion_digest: Default::default(),
         };
         legacy.save("block", &vec![1, 2, 3]).unwrap();
         let current = Checkpoints::local(&key, root.clone()).unwrap();
@@ -1091,6 +1144,27 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn refresh_blocks_shared_worker_reads_and_preserves_operation_private_spill() {
+        let root = xc_core::test_support::TestDir::new("checkpoint-refresh-worker");
+        let mut shared = Checkpoints::local(&"shared", root.join("shared")).unwrap();
+        shared.shared_directory = true;
+        let scratch = Checkpoints::local(&"isolated", root.join("scratch")).unwrap();
+        shared.save("block", &7_u32).unwrap();
+        xc_core::with_execution_checkpoint_reads(false, || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        assert_eq!(shared.load::<u32>("block").unwrap(), None);
+                        scratch.save("block", &11_u32).unwrap();
+                        assert_eq!(scratch.load::<u32>("block").unwrap(), Some(11));
+                    })
+                    .join()
+                    .unwrap();
+            });
+        });
+    }
+
+    #[test]
     fn checkpoint_reuse_binds_sources_and_rejects_corruption_and_resource_excess() {
         let root_dir = xc_core::test_support::TestDir::new("checkpoint-test");
         let root = root_dir.to_path_buf();
@@ -1099,6 +1173,8 @@ mod tests {
             identity: ContentDigest::sha256(b"source A and policy"),
             max_bytes: 1024,
             verbose: false,
+            shared_directory: false,
+            completion_digest: Default::default(),
         };
         store
             .save("block", &vec!["1.234567890123456789012345678901234567890"])
@@ -1110,6 +1186,8 @@ mod tests {
             identity: ContentDigest::sha256(b"source B and policy"),
             max_bytes: 1024,
             verbose: false,
+            shared_directory: false,
+            completion_digest: Default::default(),
         };
         assert!(other.load::<Vec<String>>("block").unwrap().is_none());
         let path = store.path("block").unwrap();

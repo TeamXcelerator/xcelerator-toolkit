@@ -263,7 +263,7 @@ fn dot_keys_remain_inside_the_cache_root() {
 }
 
 #[test]
-fn legacy_colliding_keys_and_new_records_remain_discoverable() {
+fn obsolete_colliding_directories_are_excluded_from_lookup_and_enumeration() {
     let temp = Temp::new();
     let a = manifest("test", "foo/bar");
     let b = manifest("test", "foo_2fbar");
@@ -280,14 +280,11 @@ fn legacy_colliding_keys_and_new_records_remain_discoverable() {
         .unwrap();
     }
     let store = FilesystemCacheStore::new("test", temp.path(), true, CacheVisibility::Local);
-    assert_eq!(store.candidates(&a.key).unwrap(), vec![a.clone()]);
-    assert_eq!(store.candidates(&b.key).unwrap(), vec![b.clone()]);
+    assert!(store.candidates(&a.key).unwrap().is_empty());
+    assert!(store.candidates(&b.key).unwrap().is_empty());
     let fresh = store.put(&draft("test", "foo/bar"), b"fresh").unwrap();
-    let candidates = store.candidates(&a.key).unwrap();
-    assert_eq!(candidates.len(), 2);
-    assert!(candidates.contains(&a));
-    assert!(candidates.contains(&fresh));
-    assert_eq!(store.matching_keys("test", "foo", 10).unwrap().len(), 2);
+    assert_eq!(store.candidates(&a.key).unwrap(), vec![fresh]);
+    assert_eq!(store.matching_keys("test", "foo", 10).unwrap(), vec![a.key]);
 }
 #[test]
 fn keys_validate_before_their_digest_is_used_as_a_path() {

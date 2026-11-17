@@ -70,7 +70,7 @@ struct BootstrapShardCapacityPolicy {
     rollover_repository_pattern: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct BootstrapShard {
     pub(crate) authorized_repository: String,
     pub(crate) repository_url: String,
@@ -79,7 +79,7 @@ pub(crate) struct BootstrapShard {
     pub(crate) writable: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct BootstrapFamilyTopology {
     pub(crate) family: String,
     pub(crate) visibility: CacheVisibility,
@@ -101,6 +101,13 @@ fn visibility_name(visibility: CacheVisibility) -> Result<&'static str, CacheErr
 /// Supplies exact-revision document bytes without replacing topology validation.
 /// The generic method preserves the same serde duplicate/unknown-field checks.
 pub(crate) trait BootstrapDocumentReader {
+    fn registry_revision(
+        &self,
+        remote: &dyn RemoteGitStore,
+        repository: &str,
+    ) -> Result<String, CacheError> {
+        remote.read_ref(repository, "main")
+    }
     fn read_topology_json<T: serde::de::DeserializeOwned>(
         &self,
         repository: &str,
@@ -170,7 +177,7 @@ pub(crate) fn read_bootstrap_family_topology_with_reader<R: BootstrapDocumentRea
     }
     let registry_id = format!("{owner}/xcelerator-cache-{visibility_name}-registry");
     let registry_repository = format!("https://github.com/{registry_id}.git");
-    let registry_revision = remote.read_ref(&registry_repository, "main")?;
+    let registry_revision = documents.registry_revision(remote, &registry_repository)?;
     let registry: BootstrapRegistry = documents.read_topology_json(
         &registry_repository,
         &registry_revision,

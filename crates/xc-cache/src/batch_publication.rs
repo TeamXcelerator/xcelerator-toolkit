@@ -148,6 +148,21 @@ impl RemotePublicationEvidence {
 }
 
 impl RepositoryPublicationBatch {
+    /// Revocable policy and producer evidence used by the selected batch member.
+    pub(crate) fn revocable_evidence<'a>(
+        &'a self,
+        manifest: &'a ContentDigest,
+    ) -> impl Iterator<Item = (crate::RevocationScope, &'a ContentDigest)> {
+        std::iter::once((crate::RevocationScope::Policy, &self.policy_digest)).chain(
+            self.artifacts
+                .iter()
+                .find(|artifact| &artifact.manifest_digest == manifest)
+                .into_iter()
+                .flat_map(|artifact| &artifact.provenance_evidence_digests)
+                .map(|digest| (crate::RevocationScope::Attestation, digest)),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         destination: PublicationDestination,

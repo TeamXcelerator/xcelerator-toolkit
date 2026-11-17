@@ -92,6 +92,10 @@ response directories produced above:
 ```
 
 Each embedded old measurement must match its authenticated response source.
+Every value reference carried into the repaired receipt is read and verified.
+The receipt shard is searched automatically. When retained values live in
+other shards, supply their checkout directories in the optional `source_shards`
+array of the receipt request.
 The new receipt updates measurement evidence digests and both runtime and
 canonical dependency identities. It retains the original plan, requested
 diagnostics and all missing, blocked or failed outcomes. It does not turn an

@@ -25,6 +25,72 @@ pub(crate) struct RetainedResponseSources<'a> {
     pub secular_payload: &'a [u8],
 }
 
+pub(super) fn oriented_actions(
+    response: &PortableUFlowResponseAnalysis,
+    state: &crate::ccm::state_geometry::RetainedState,
+    digest: &ContentDigest,
+) -> Result<Vec<crate::ccm::convergence_capture::OperatorAction>> {
+    anyhow::ensure!(
+        response.eigenpair_content_digest == state.manifest.content_digest.0
+            && response.n_modes == state.modes
+            && response.precision_bits == state.precision
+            && response.channels.len() == 4,
+        "u-flow action source differs from the retained state"
+    );
+    let sign = crate::ccm::retained_evidence::orientation(&state.coefficients, state.precision);
+    let mut labels = std::collections::BTreeSet::new();
+    response
+        .channels
+        .iter()
+        .map(|channel| {
+            anyhow::ensure!(
+                matches!(
+                    channel.channel.as_str(),
+                    "tau_pole" | "tau_archimedean" | "tau_active_prime_aggregate" | "tau_total"
+                ) && labels.insert(channel.channel.as_str())
+                    && channel.tau_velocity_action_on_state.len() == state.coefficients.len(),
+                "invalid retained u-flow channel inventory"
+            );
+            let action = channel
+                .tau_velocity_action_on_state
+                .iter()
+                .map(|v| {
+                    Ok(lossless_hp_decimal(
+                        &(Float::with_val(state.precision, Float::parse(v)?) * sign),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(crate::ccm::convergence_capture::OperatorAction {
+                label: channel.channel.clone(),
+                source_digest: digest.clone(),
+                action,
+                convention: response.derivative_convention.clone(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn read_retained_actions(
+    source: &RetainedResponseSources<'_>,
+    manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<Vec<crate::ccm::convergence_capture::OperatorAction>> {
+    let resolver = cache
+        .resolver
+        .ok_or_else(|| anyhow::anyhow!("missing retained response resolver"))?;
+    let policy = cache
+        .acceptance
+        .ok_or_else(|| anyhow::anyhow!("missing retained response policy"))?;
+    let raw = resolver.read_exact_payload(&manifest.key, &manifest.content_digest, policy)?;
+    let flow: PortableUFlowResponseAnalysis = serde_json::from_slice(&raw)?;
+    anyhow::ensure!(
+        flow.tau_content_digest == source.matrix.manifest.content_digest.0
+            && flow.root_range_content_digest == source.roots.manifest.content_digest.0,
+        "u-flow actions belong to a different retained matrix or root window"
+    );
+    oriented_actions(&flow, source.state, &manifest.content_digest)
+}
+
 struct ValidatedResponse {
     params: CcmParams,
     cfg: HighPrecConfig,
@@ -610,7 +676,7 @@ fn fixture_source(
         resolved_mathematical_configuration_digest: ContentDigest(
             xc_core::research_digest(&serde_json::json!({})).unwrap().0,
         ),
-        producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        producer_toolkit_version: xc_cache::current_toolkit_version().unwrap(),
         minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         maximum_reader_version: None,
         requested_assurance: xc_core::AssuranceLevel::Computed,

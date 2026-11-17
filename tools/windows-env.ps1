@@ -23,8 +23,10 @@ $env:PATH = $bin + ';' + $msysBin + ';' + $env:PATH
 $env:XC_NATIVE_PREFIX = $Prefix
 $env:RUSTC = Join-Path $bin 'rustc.exe'
 $env:RUSTDOC = Join-Path $bin 'rustdoc.exe'
-$env:CC = Join-Path $bin 'gcc.exe'
-$env:AR = Join-Path $bin 'ar.exe'
+# Autoconf also consumes these values through sh when building bundled GMP.
+# Forward slashes keep the same absolute executables valid for Rust and sh.
+$env:CC = (Join-Path $bin 'gcc.exe').Replace('\','/')
+$env:AR = (Join-Path $bin 'ar.exe').Replace('\','/')
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = $env:CC
 $env:CARGO_BUILD_TARGET = 'x86_64-pc-windows-gnu'
 foreach ($name in @('CC_x86_64-pc-windows-gnu','CC_x86_64_pc_windows_gnu','HOST_CC','TARGET_CC')) {
@@ -40,8 +42,8 @@ $env:PKG_CONFIG_LIBDIR = $env:PKG_CONFIG_PATH
 $env:LIBRARY_PATH = Join-Path $Prefix 'lib'
 $env:CARGO_TARGET_DIR = Join-Path (Split-Path -Parent $Prefix) 'build'
 $version = & $env:RUSTC --version
-if ($LASTEXITCODE -ne 0 -or $version -notmatch '^rustc 1\.99\.1 ') {
-    throw "Expected Rust 1.99.1 in the selected UCRT prefix; found $version"
+if ($LASTEXITCODE -ne 0 -or $version -notmatch '^rustc 1\.100\.0 ') {
+    throw "Expected Rust 1.100.0 in the selected UCRT prefix; found $version"
 }
 $hostInfo = @(& $env:RUSTC -vV)
 if ($LASTEXITCODE -ne 0 -or $hostInfo -notcontains 'host: x86_64-pc-windows-gnu') {

@@ -3,8 +3,46 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use xc_cache::*;
 use xc_spectral::ccm::explicit_cohort::*;
+#[path = "common/published_sources.rs"]
+mod published_sources;
 
 struct NoMatrixReads(FilesystemCacheStore);
+
+// Restrict lookup to the chosen inventory. Old parent aliases remain on disk
+// solely as fixtures and cannot accidentally rescue a broken ancestry join.
+struct SelectedSources<S> {
+    store: S,
+    manifests: Vec<ArtifactManifest>,
+}
+impl<S: CacheStore> CacheStore for SelectedSources<S> {
+    fn name(&self) -> &str {
+        "selected-sources"
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn visibility(&self) -> CacheVisibility {
+        CacheVisibility::Local
+    }
+    fn put(&self, _: &ArtifactDraft, _: &[u8]) -> Result<ArtifactManifest, CacheError> {
+        panic!("read-only selected sources")
+    }
+    fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+        Ok(self
+            .manifests
+            .iter()
+            .filter(|m| &m.key == key)
+            .cloned()
+            .collect())
+    }
+    fn read_payload_to(
+        &self,
+        m: &ArtifactManifest,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<(), CacheError> {
+        self.store.read_payload_to(m, writer)
+    }
+}
 impl CacheStore for NoMatrixReads {
     fn name(&self) -> &str {
         self.0.name()
@@ -121,6 +159,18 @@ fn fixture(
     q: usize,
     coefficients: Vec<&str>,
 ) -> Vec<ArtifactManifest> {
+    fixture_at_cutoff(store, label, n, "13", eigenvalue, q, coefficients)
+}
+
+fn fixture_at_cutoff(
+    store: &dyn CacheStore,
+    label: &str,
+    n: usize,
+    cutoff: &str,
+    eigenvalue: &str,
+    q: usize,
+    coefficients: Vec<&str>,
+) -> Vec<ArtifactManifest> {
     let dim = 2 * n + 1;
     let mut entries = vec!["0"; dim * dim];
     for i in 0..dim {
@@ -130,16 +180,16 @@ fn fixture(
         store,
         "ccm_tau_matrix",
         &format!("{label}/tau"),
-        json!({"lambda_squared":"13","n_modes":n,"precision_bits":128,"resolved_quadrature_orders":vec![q;n+1],"quadrature_policy":"fixed","scalar_backend":"rug_mpfr"}),
-        json!({"schema_version":2,"lambda_squared":"13","n_modes":n,"precision_bits":128,"entries":entries}),
+        json!({"lambda_squared":cutoff,"n_modes":n,"precision_bits":128,"resolved_quadrature_orders":vec![q;n+1],"quadrature_policy":"fixed","scalar_backend":"rug_mpfr"}),
+        json!({"schema_version":2,"lambda_squared":cutoff,"n_modes":n,"precision_bits":128,"entries":entries}),
         &[],
     );
     let state = put(
         store,
         "ccm_weil_eigenpair",
         &format!("{label}/state"),
-        json!({"lambda_squared":"13","n_modes":n,"precision_bits":128,"force_even":true,"normalization":"sum_xi_equals_sqrt_log_lambda_squared","tau_source_identity":DependencyRef {key:tau.key.clone(),content_digest:tau.content_digest.clone(),required_quality:CacheQuality::Validated}}),
-        json!({"schema_version":3,"lambda_squared":"13","n_modes":n,"precision_bits":128,"force_even":true,"eigenvalue":eigenvalue,"eigenvector":coefficients}),
+        json!({"lambda_squared":cutoff,"n_modes":n,"precision_bits":128,"force_even":true,"normalization":"sum_xi_equals_sqrt_log_lambda_squared","tau_source_identity":DependencyRef {key:tau.key.clone(),content_digest:tau.content_digest.clone(),required_quality:CacheQuality::Validated}}),
+        json!({"schema_version":3,"lambda_squared":cutoff,"n_modes":n,"precision_bits":128,"force_even":true,"eigenvalue":eigenvalue,"eigenvector":coefficients}),
         &[&tau],
     );
     vec![tau, state]
@@ -168,6 +218,15 @@ fn roots(
     } else {
         "independent"
     };
+    let seeds: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .map(str::to_owned)
+                .unwrap_or_else(|| (100 + index).to_string())
+        })
+        .collect();
     let outcomes = values
         .into_iter()
         .map(|v| match v {
@@ -184,7 +243,7 @@ fn roots(
         },
         &format!("{}/roots", state.key.logical_key),
         json!({"lambda_squared":"13","n_modes":n,"precision_bits":128,"first_root_index":first,"force_even":true,"reference_seeds_used":seeded,"discovery_mode":acquisition,"secular_source_content_digest":sec.content_digest.0}),
-        json!({"schema_version":6,"lambda_squared":"13","n_modes":n,"precision_bits":128,"first_root_index":first,"force_even":true,"reference_seeds_used":seeded,"discovery_mode":acquisition,"completeness":"requested_window","secular_source_content_digest":sec.content_digest.0,"outcomes":outcomes}),
+        json!({"schema_version":6,"lambda_squared":"13","n_modes":n,"precision_bits":128,"first_root_index":first,"force_even":true,"reference_seeds_used":seeded,"discovery_mode":acquisition,"completeness":"requested_window","secular_source_content_digest":sec.content_digest.0,"outcomes":outcomes,"starting_points":seeds}),
         &[&sec],
     );
     source.extend([sec, root]);
@@ -276,6 +335,10 @@ fn explicit_cohort_lightweight_replay_and_aliases_open_no_matrices() {
     assert_eq!(replay.cache_status, "reused");
     assert_eq!(replay.operations.decoded_payload_bytes_opened, 0);
     assert_eq!(
+        replay.operations.report_bytes,
+        serde_json::to_vec(&first.measurements).unwrap().len() as u64
+    );
+    assert_eq!(
         serde_json::to_vec(&first.measurements).unwrap(),
         serde_json::to_vec(&replay.measurements).unwrap()
     );
@@ -285,9 +348,19 @@ fn explicit_cohort_optional_residual_is_directed_and_source_bound() {
     let dir = xc_core::test_support::TestDir::new("explicit-cohort-residual");
     let store = FilesystemCacheStore::new("local", dir.to_path_buf(), true, CacheVisibility::Local);
     let a = fixture(&store, "a", 1, "1", 8, vec!["0", "3", "0"]);
-    let b = fixture(&store, "b", 2, "2", 8, vec!["0", "0", "1", "0", "0"]);
+    let b = fixture_at_cutoff(
+        &store,
+        "b",
+        2,
+        "13.0",
+        "2",
+        8,
+        vec!["0", "0", "1", "0", "0"],
+    );
+    let c = fixture_at_cutoff(&store, "c", 2, "14", "2", 8, vec!["0", "0", "1", "0", "0"]);
     let mut manifests = a.clone();
     manifests.extend(b.clone());
+    manifests.extend(c.clone());
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(store),
@@ -315,6 +388,215 @@ fn explicit_cohort_optional_residual_is_directed_and_source_bound() {
         r.measurements.pairs[0]["embedded_residual"]["high_mode_forcing_squared"]["upper"],
         "0"
     );
+    for invalid in [plan(&b, &a, true), plan(&a, &c, true)] {
+        let rejected = analyze_frozen_cohort(
+            &invalid,
+            &manifests,
+            &cache,
+            &xc_core::RunResources::new(64 << 20).unwrap(),
+            &dir,
+        )
+        .unwrap();
+        assert!(!rejected.measurements.execution_complete);
+        assert_eq!(rejected.operations.decoded_payload_bytes_opened, 0);
+        assert!(rejected
+            .operations
+            .failures
+            .iter()
+            .any(|e| e.contains("smaller left state at equal cutoff")));
+    }
+}
+
+#[test]
+fn embedded_residual_is_stable_across_producers_but_binds_legacy_matrix_bytes() {
+    let dir = xc_core::test_support::TestDir::new("explicit-cohort-residual-identity");
+    let store = FilesystemCacheStore::new("local", dir.to_path_buf(), true, CacheVisibility::Local);
+    let mut a = fixture(&store, "a", 1, "1", 8, vec!["0", "1", "0"]);
+    let mut b = fixture(&store, "b", 2, "2", 8, vec!["0", "0", "1", "0", "0"]);
+    let state = &b[1];
+    let mut parameters: SemanticKeyEnvelope =
+        serde_json::from_str(&state.tags[SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
+    parameters
+        .resolved_mathematical_parameters
+        .as_object_mut()
+        .unwrap()
+        .remove("tau_source_identity");
+    let state_bytes = store.read_payload(state).unwrap();
+    let tau: SemanticKeyEnvelope =
+        serde_json::from_str(&b[0].tags[SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
+    let mut matrix: Value = serde_json::from_slice(&store.read_payload(&b[0]).unwrap()).unwrap();
+    matrix["entries"][12] = json!("3");
+    let other_tau = put(
+        &store,
+        "ccm_tau_matrix",
+        "other/tau",
+        tau.resolved_mathematical_parameters,
+        matrix,
+        &[],
+    );
+    let legacy_state = |matrix: &ArtifactManifest| {
+        put(
+            &store,
+            "ccm_weil_eigenpair",
+            &format!("{}/legacy-state", matrix.key.logical_key),
+            parameters.resolved_mathematical_parameters.clone(),
+            serde_json::from_slice(&state_bytes).unwrap(),
+            &[matrix],
+        )
+    };
+    let first_state = legacy_state(&b[0]);
+    let second_state = legacy_state(&other_tau);
+    b[1] = first_state;
+    let mut frozen = plan(&a, &b, true);
+    // This case exercises ancestry selection without an explicitly frozen matrix.
+    for member in &mut frozen.members {
+        member.matrix = None;
+    }
+    a.extend(b.clone());
+    let p = policy();
+    let resources = xc_core::RunResources::new(64 << 20).unwrap();
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(store),
+    }]);
+    let cache = context(&resolver, &p);
+    let first = analyze_frozen_cohort(&frozen, &a, &cache, &resources, &dir).unwrap();
+    assert!(
+        first.measurements.execution_complete,
+        "{:?}",
+        first.operations.failures
+    );
+    let mut alias = a.clone();
+    alias[2].producer_toolkit_version = ToolkitVersion::parse("0.17.3").unwrap();
+    alias[2] = published_sources::published(alias[2].clone(), &[]);
+    let cold_resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(SelectedSources {
+            store: FilesystemCacheStore::new(
+                "local",
+                dir.to_path_buf(),
+                false,
+                CacheVisibility::Local,
+            ),
+            manifests: alias.clone(),
+        }),
+    }]);
+    let mut cold_cache = context(&cold_resolver, &p);
+    cold_cache.write_on_miss = false;
+    let cold = analyze_frozen_cohort(&frozen, &alias, &cold_cache, &resources, &dir).unwrap();
+    assert!(
+        cold.measurements.execution_complete,
+        "{:?}",
+        cold.operations.failures
+    );
+    assert_eq!(cold.operations.dense_matrix_payload_opens, 1);
+    assert_eq!(
+        serde_json::to_vec(&first.measurements).unwrap(),
+        serde_json::to_vec(&cold.measurements).unwrap()
+    );
+    let warm = analyze_frozen_cohort(&frozen, &alias, &cache, &resources, &dir).unwrap();
+    assert_eq!(warm.cache_status, "reused");
+    assert_eq!(warm.operations.decoded_payload_bytes_opened, 0);
+    let mut changed = a;
+    let mut ambiguous = changed.clone();
+    ambiguous.extend([other_tau.clone(), second_state.clone()]);
+    for sources in [
+        &ambiguous,
+        &ambiguous.iter().rev().cloned().collect::<Vec<_>>(),
+    ] {
+        let report = analyze_frozen_cohort(&frozen, sources, &cache, &resources, &dir).unwrap();
+        assert!(!report.measurements.execution_complete);
+        assert_eq!(report.operations.decoded_payload_bytes_opened, 0);
+        assert!(report
+            .operations
+            .failures
+            .iter()
+            .any(|e| e.contains("ambiguous legacy cohort source ancestry")));
+    }
+    changed[2] = other_tau;
+    changed[3] = second_state;
+    let changed = analyze_frozen_cohort(&frozen, &changed, &cache, &resources, &dir).unwrap();
+    assert!(
+        changed.measurements.execution_complete,
+        "{:?}",
+        changed.operations.failures
+    );
+    assert_ne!(
+        first.measurements.numerical_identity,
+        changed.measurements.numerical_identity
+    );
+    assert_ne!(
+        first.measurements.pairs[0]["embedded_residual"],
+        changed.measurements.pairs[0]["embedded_residual"]
+    );
+}
+
+#[test]
+fn lightweight_cohort_charges_short_coefficients_at_their_decoded_precision() {
+    let dir = xc_core::test_support::TestDir::new("cohort-coefficient-memory");
+    let store = FilesystemCacheStore::new("local", dir.to_path_buf(), true, CacheVisibility::Local);
+    let member = |label: &str, n: usize| {
+        let mut coefficients = vec!["0"; 2 * n + 1];
+        coefficients[n] = "1";
+        let tau = put(
+            &store,
+            "ccm_tau_matrix",
+            &format!("{label}/tau"),
+            json!({"lambda_squared":"13","n_modes":n,"precision_bits":131072,"resolved_quadrature_orders":[8]}),
+            json!({"metadata_only_test_fixture":label}),
+            &[],
+        );
+        let state = put(
+            &store,
+            "ccm_weil_eigenpair",
+            &format!("{label}/state"),
+            json!({"lambda_squared":"13","n_modes":n,"precision_bits":131072,"force_even":true,"normalization":"sum_xi_equals_sqrt_log_lambda_squared"}),
+            json!({"schema_version":3,"lambda_squared":"13","n_modes":n,"precision_bits":131072,"force_even":true,"eigenvalue":"2","eigenvector":coefficients}),
+            &[&tau],
+        );
+        vec![tau, state]
+    };
+    let mut a = member("a", 512);
+    let b = member("b", 513);
+    let frozen = plan(&a, &b, false);
+    a.extend(b);
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(NoMatrixReads(store)),
+    }]);
+    let p = policy();
+    let mut cache = context(&resolver, &p);
+    cache.write_on_miss = false;
+    let small = analyze_frozen_cohort(
+        &frozen,
+        &a,
+        &cache,
+        &xc_core::RunResources::new(12 << 20).unwrap(),
+        &dir,
+    )
+    .unwrap();
+    assert!(!small.measurements.execution_complete);
+    assert_eq!(small.operations.decoded_payload_bytes_opened, 0);
+    assert!(small
+        .operations
+        .failures
+        .iter()
+        .any(|error| error.contains("memory budget exceeded")));
+    let sufficient = analyze_frozen_cohort(
+        &frozen,
+        &a,
+        &cache,
+        &xc_core::RunResources::new(64 << 20).unwrap(),
+        &dir,
+    )
+    .unwrap();
+    assert!(
+        sufficient.measurements.execution_complete,
+        "{:?}",
+        sufficient.operations.failures
+    );
+    assert_eq!(sufficient.operations.dense_matrix_payload_opens, 0);
+    assert!(sufficient.operations.peak_reserved_bytes >= 2052 * 131072 / 8);
 }
 #[test]
 fn explicit_cohort_invalid_or_missing_sources_are_not_replaced_or_persisted() {
@@ -359,6 +641,64 @@ fn explicit_cohort_invalid_or_missing_sources_are_not_replaced_or_persisted() {
     let mut both = a.clone();
     both.extend(b);
     assert!(freeze_member("ambiguous", &both).is_err());
+}
+
+#[test]
+fn direct_root_decoder_enforces_declared_acquisition_and_window() {
+    use xc_spectral::ccm::{retained_evidence::RetainedRoots, state_geometry::RetainedState};
+
+    let dir = xc_core::test_support::TestDir::new("direct-root-acquisition");
+    let store = FilesystemCacheStore::new("local", dir.to_path_buf(), true, CacheVisibility::Local);
+    let mut member = fixture(&store, "member", 1, "1", 8, vec!["0", "1", "0"]);
+    roots(&store, &mut member, 4, vec![Some("14")], true);
+    let state = RetainedState::from_payload(
+        &member[1],
+        &store.read_payload(&member[1]).unwrap(),
+        std::slice::from_ref(&member[1].content_digest),
+    )
+    .unwrap();
+    let secular = &member[2];
+    let root = &member[3];
+    let sec_bytes = store.read_payload(secular).unwrap();
+    let root_bytes = store.read_payload(root).unwrap();
+    let params: SemanticKeyEnvelope =
+        serde_json::from_str(&root.tags[SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
+    let allowed = |m: &ArtifactManifest| [m.content_digest.clone(), secular.content_digest.clone()];
+    RetainedRoots::from_payload(
+        root,
+        &root_bytes,
+        secular,
+        &sec_bytes,
+        &state,
+        &allowed(root),
+    )
+    .unwrap();
+    for (field, mismatched) in [
+        ("first_root_index", json!(5)),
+        ("discovery_mode", json!("independent")),
+        ("reference_seeds_used", json!(false)),
+    ] {
+        let mut raw: Value = serde_json::from_slice(&root_bytes).unwrap();
+        raw[field] = mismatched;
+        let other = put(
+            &store,
+            &root.key.kind,
+            field,
+            params.resolved_mathematical_parameters.clone(),
+            raw,
+            &[secular],
+        );
+        let err = RetainedRoots::from_payload(
+            &other,
+            &store.read_payload(&other).unwrap(),
+            secular,
+            &sec_bytes,
+            &state,
+            &allowed(&other),
+        )
+        .expect_err("the payload contradicts its declared acquisition");
+        assert!(err.to_string().contains(field), "{err}");
+    }
 }
 
 #[test]
@@ -409,6 +749,135 @@ fn explicit_cohort_root_coverage_keeps_missing_ordinals_and_acquisition() {
     );
     p.pairs[0].root_ordinals = vec![0];
     assert!(p.validate().is_err());
+}
+
+#[test]
+fn cohort_replay_and_coverage_use_the_entire_selected_source() {
+    let dir = xc_core::test_support::TestDir::new("cohort-complete-source-replay");
+    let store = FilesystemCacheStore::new("local", dir.to_path_buf(), true, CacheVisibility::Local);
+    let mut a = fixture(&store, "a", 1, "1", 8, vec!["0", "1", "0"]);
+    let mut b = a.clone();
+    roots(&store, &mut a, 1, vec![Some("14"), None], true);
+    roots(&store, &mut b, 1, vec![Some("15"), Some("21")], false);
+    let sec = &a[2];
+    let mut semantics: SemanticKeyEnvelope =
+        serde_json::from_str(&sec.tags[SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
+    semantics.resolved_mathematical_parameters["eigenpair_content_digest"] =
+        json!(ContentDigest::sha256(b"another state"));
+    semantics.resolved_mathematical_parameters["eigenpair_semantic_digest"] =
+        json!(a[1].key.parameters_digest);
+    let inconsistent = put(
+        &store,
+        &sec.key.kind,
+        "inconsistent/secular",
+        semantics.resolved_mathematical_parameters,
+        serde_json::from_slice(&store.read_payload(sec).unwrap()).unwrap(),
+        &[],
+    );
+    let mut plan = plan(&a, &b, false);
+    plan.pairs[0].root_ordinals = (1..=40).collect();
+    let mut sources = vec![inconsistent];
+    sources.extend(a);
+    sources.extend(b);
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(FilesystemCacheStore::new(
+            "local",
+            dir.to_path_buf(),
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let p = policy();
+    let cache = context(&resolver, &p);
+    let resources = xc_core::RunResources::new(64 << 20).unwrap();
+    let first = analyze_frozen_cohort(&plan, &sources, &cache, &resources, &dir).unwrap();
+    assert!(
+        first.measurements.execution_complete,
+        "{:?}",
+        first.operations.failures
+    );
+    assert_eq!(first.measurements.pairs[0]["same_source_replay"], false);
+    assert_eq!(
+        first.measurements.pairs[0]["roots"][0]["change"]["signed"],
+        "1"
+    );
+    assert_eq!(
+        first.measurements.pairs[0]["roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        40
+    );
+    assert!(!first.measurements.requested_coverage_complete);
+    sources.reverse();
+    let warm = analyze_frozen_cohort(&plan, &sources, &cache, &resources, &dir).unwrap();
+    assert_eq!(warm.cache_status, "reused");
+    assert_eq!(warm.operations.decoded_payload_bytes_opened, 0);
+
+    let report = first.artifact.unwrap();
+    let original: Value = serde_json::from_slice(&store.read_payload(&report).unwrap()).unwrap();
+    for (pointer, value, reason) in [
+        (
+            "/data/requested_coverage_complete",
+            json!(true),
+            "cached coverage mismatch",
+        ),
+        (
+            "/data/pairs/0/roots/0/change/signed",
+            json!("999"),
+            "root measurement differs from retained source replay",
+        ),
+    ] {
+        let mut record = original.clone();
+        *record.pointer_mut(pointer).unwrap() = value;
+        let invalid = store
+            .put(
+                &ArtifactDraft {
+                    schema_version: report.schema_version,
+                    key: report.key.clone(),
+                    producer_toolkit_version: report.producer_toolkit_version.clone(),
+                    minimum_reader_version: report.minimum_reader_version.clone(),
+                    maximum_reader_version: report.maximum_reader_version.clone(),
+                    quality: report.quality,
+                    visibility: report.visibility,
+                    immutable: report.immutable,
+                    dependencies: report.dependencies.clone(),
+                    tags: report.tags.clone(),
+                    provenance_digest: report.provenance_digest.clone(),
+                },
+                &serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        let mut selected = sources.clone();
+        selected.push(invalid);
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(SelectedSources {
+                store: NoMatrixReads(FilesystemCacheStore::new(
+                    "local",
+                    dir.to_path_buf(),
+                    true,
+                    CacheVisibility::Local,
+                )),
+                manifests: selected.clone(),
+            }),
+        }]);
+        let mut cache = context(&resolver, &p);
+        cache.write_on_miss = false;
+        cache.mode = ArtifactExecutionCacheMode::RequireReuse;
+        let rejected = analyze_frozen_cohort(&plan, &selected, &cache, &resources, &dir).unwrap();
+        assert!(!rejected.measurements.execution_complete);
+        assert!(
+            rejected
+                .operations
+                .failures
+                .iter()
+                .any(|error| error.contains(reason)),
+            "{:?}",
+            rejected.operations.failures
+        );
+    }
 }
 
 #[test]
@@ -557,6 +1026,86 @@ fn explicit_cohort_authentic_seeded_and_independent_producer_policy_layouts() {
                 analyze_frozen_cohort(&frozen, &manifests, &cache, &resources, &dir).unwrap();
             assert_eq!(replay.cache_status, "reused");
             assert_eq!(replay.operations.decoded_payload_bytes_opened, 0);
+            // A different producer/store alias of the exact secular bytes must
+            // work on a cold numerical read, not just a cached cohort report.
+            let alias_store =
+                FilesystemCacheStore::new("local", dir.to_path_buf(), true, CacheVisibility::Local);
+            let mut aliases = manifests.clone();
+            for secular in aliases
+                .iter_mut()
+                .filter(|m| m.key.kind == "ccm_secular_source")
+            {
+                let bytes = alias_store.read_payload(secular).unwrap();
+                let mut key = secular.key.clone();
+                key.logical_key.push_str("/equivalent-producer");
+                *secular = alias_store
+                    .put(
+                        &ArtifactDraft {
+                            schema_version: secular.schema_version,
+                            key,
+                            producer_toolkit_version: ToolkitVersion::parse("0.17.3").unwrap(),
+                            minimum_reader_version: secular.minimum_reader_version.clone(),
+                            maximum_reader_version: secular.maximum_reader_version.clone(),
+                            quality: secular.quality,
+                            visibility: secular.visibility,
+                            immutable: true,
+                            dependencies: secular.dependencies.clone(),
+                            tags: secular.tags.clone(),
+                            provenance_digest: None,
+                        },
+                        &bytes,
+                    )
+                    .unwrap();
+            }
+            assert!(aliases
+                .iter()
+                .filter(|m| m.key.kind == "ccm_secular_source")
+                .all(|s| !manifest_depends_on(root_manifest, s).unwrap()));
+            let alias_resolver = CacheResolver::new(vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(SelectedSources {
+                    store: NoMatrixReads(alias_store),
+                    manifests: aliases.clone(),
+                }),
+            }]);
+            let mut alias_cache = context(&alias_resolver, &policy);
+            alias_cache.write_on_miss = false;
+            let cold_alias =
+                analyze_frozen_cohort(&frozen, &aliases, &alias_cache, &resources, &dir).unwrap();
+            assert!(
+                cold_alias.measurements.execution_complete,
+                "{:?}",
+                cold_alias.operations.failures
+            );
+            assert!(cold_alias.operations.decoded_payload_bytes_opened > 0);
+            assert_eq!(cold_alias.operations.dense_matrix_payload_opens, 0);
+            assert_eq!(
+                serde_json::to_value(&cold_alias.measurements).unwrap(),
+                serde_json::to_value(&first.measurements).unwrap()
+            );
+            // The finite-recovery constructor shares the same numerical join.
+            for member in &frozen.members {
+                let selected: Vec<_> = aliases
+                    .iter()
+                    .filter(|m| {
+                        let s: SemanticKeyEnvelope =
+                            serde_json::from_str(&m.tags[SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
+                        let state = manifests
+                            .iter()
+                            .find(|v| {
+                                v.key.kind == member.state.kind
+                                    && v.content_digest == member.state.payload_digest
+                            })
+                            .unwrap();
+                        let expected: SemanticKeyEnvelope =
+                            serde_json::from_str(&state.tags[SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
+                        s.resolved_mathematical_parameters["n_modes"]
+                            == expected.resolved_mathematical_parameters["n_modes"]
+                    })
+                    .cloned()
+                    .collect();
+                xc_spectral::ccm::convergence_capture::finite_capture::RetainedFiniteSources::from_manifests(&selected,false,&alias_cache).unwrap();
+            }
             // Authenticate deliberately inconsistent payload bytes under their own
             // new digest: the consumer must still reject the policy mismatch.
             let mut wrong = raw.clone();

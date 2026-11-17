@@ -11,7 +11,7 @@ rust-version.workspace = true
 
 [features]
 default = []
-hp = ["dep:rug"]
+hp = ["dep:rug", "dep:gmp-mpfr-sys"]
 
 [dependencies]
 rayon = { workspace = true }
@@ -19,6 +19,10 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 rug = { workspace = true, optional = true }
 xc-core = { workspace = true }
+
+# The native UCRT lane uses the same qualified GMP/MPFR for every HP producer.
+[target.'cfg(all(windows, target_env = "gnu"))'.dependencies]
+gmp-mpfr-sys = { workspace = true, optional = true, features = ["use-system-libs"] }
 
 [dev-dependencies]
 xc-core = { workspace = true, features = ["test-support"] }

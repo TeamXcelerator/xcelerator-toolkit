@@ -11,15 +11,15 @@ rust-version.workspace = true
 
 [features]
 default = []
-hp = ["dep:rug", "dep:xc-solver", "xc-certify/hp", "xc-solver/hp-reference"]
+hp = ["dep:serde", "dep:sha2", "dep:xc-core", "dep:rug", "dep:xc-solver", "dep:xc-operator", "dep:xc-certify", "xc-certify/hp", "xc-solver/hp-reference"]
 
 [dependencies]
-serde = { workspace = true }
-sha2 = { workspace = true }
+serde = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 rug = { workspace = true, optional = true }
-xc-core = { workspace = true }
-xc-certify = { workspace = true }
-xc-operator = { workspace = true }
+xc-core = { workspace = true, optional = true }
+xc-certify = { workspace = true, optional = true }
+xc-operator = { workspace = true, optional = true }
 xc-solver = { workspace = true, optional = true }
 
 [dev-dependencies]

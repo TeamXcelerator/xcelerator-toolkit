@@ -98,16 +98,16 @@ pub(crate) static TEST_CACHE_ROOT: std::sync::Mutex<Option<std::path::PathBuf>> 
 /// cache root shared with the managed cache. The working directory is never
 /// used, so runs started inside a checkout do not write into it.
 #[cfg(feature = "hp")]
-pub(crate) fn standalone_cache_root() -> std::path::PathBuf {
+pub(crate) fn standalone_cache_root() -> Option<std::path::PathBuf> {
     #[cfg(test)]
     if let Some(root) = TEST_CACHE_ROOT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
     {
-        return root;
+        return Some(root);
     }
-    xc_core::configured_cache_root()
+    xc_core::checked_cache_root().ok()
 }
 
 /// Points [`standalone_cache_root`] at `<dir>/data` for a cache test and

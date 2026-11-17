@@ -739,7 +739,8 @@ impl EigenSolverF64 for LanczosSolverF64 {
                         problem.operator,
                         residual,
                     )?,
-                    global_target_ordering_established: basis.len() == n,
+                    global_target_ordering_established: basis.len() == n
+                        && residual <= absolute_residual,
                     eigenvalue: lambda,
                     eigenvector: vector,
                     residual_norm: residual,
@@ -2343,9 +2344,9 @@ pub fn cross_check_f64_controlled(
     cancellation: &CancellationToken,
 ) -> Result<CrossCheckedEigenpairF64, SolverError> {
     check_solver_cancellation(cancellation)?;
-    if !tolerance.is_finite() || tolerance <= 0.0 {
+    if !tolerance.is_finite() || tolerance <= 0.0 || tolerance >= 1.0 {
         return Err(SolverError::InvalidConfiguration(
-            "cross-check tolerance must be finite and positive".to_owned(),
+            "cross-check relative tolerance must be strictly between zero and one".to_owned(),
         ));
     }
     // Concrete Rust type provenance is checked before caller-supplied execution.
@@ -3095,6 +3096,14 @@ impl<'a> DenseSymmetricProblemHp<'a> {
                 matrix.len()
             )));
         }
+        if !matrix.iter().all(rug::Float::is_finite)
+            || (0..dimension)
+                .any(|i| (0..i).any(|j| matrix[i * dimension + j] != matrix[j * dimension + i]))
+        {
+            return Err(SolverError::InvalidConfiguration(
+                "dense HP matrix requires finite exactly symmetric storage".into(),
+            ));
+        }
         Ok(Self { matrix, dimension })
     }
 }
@@ -3136,6 +3145,25 @@ fn hp_parse_literal_round(
     {
         return Err(SolverError::InvalidConfiguration(
             "directed HP scalar is outside the supported range".into(),
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "hp-reference")]
+fn hp_backward_tolerance(
+    literal: &xc_core::DecimalLiteral,
+    bits: u32,
+) -> Result<rug::Float, SolverError> {
+    let value = hp_positive_threshold(
+        literal,
+        bits,
+        "scaled backward error tolerance",
+        rug::float::Round::Down,
+    )?;
+    if value >= 1 {
+        return Err(SolverError::InvalidConfiguration(
+            "scaled backward error tolerance must be below one".into(),
         ));
     }
     Ok(value)
@@ -3598,36 +3626,31 @@ pub fn solve_dense_reference_hp_controlled(
     let index = match &config.target {
         EigenTarget::AlgebraicSmallest => 0,
         EigenTarget::AlgebraicLargest => eigenvalues.len() - 1,
-        EigenTarget::SmallestMagnitude => eigenvalues
-            .iter()
-            .enumerate()
-            .min_by(|(_, left), (_, right)| {
-                (*left)
-                    .clone()
-                    .abs()
-                    .partial_cmp(&(*right).clone().abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(index, _)| index)
-            .expect("eigenvalues is nonempty"),
-        EigenTarget::ClosestTo { shift } => {
-            let shift = hp_parse_literal(shift, precision_bits)?;
-            eigenvalues
-                .iter()
-                .enumerate()
-                .min_by(|(_, left), (_, right)| {
-                    let mut left_distance = (*left).clone();
-                    left_distance -= &shift;
-                    left_distance.abs_mut();
-                    let mut right_distance = (*right).clone();
-                    right_distance -= &shift;
-                    right_distance.abs_mut();
-                    left_distance
-                        .partial_cmp(&right_distance)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(index, _)| index)
-                .expect("eigenvalues is nonempty")
+        EigenTarget::SmallestMagnitude | EigenTarget::ClosestTo { .. } => {
+            let shift = match &config.target {
+                EigenTarget::ClosestTo { shift } => hp_parse_literal(shift, precision_bits)?,
+                _ => Float::with_val(precision_bits, 0),
+            };
+            let mut best = (
+                0,
+                Float::with_val(precision_bits, &eigenvalues[0] - &shift).abs(),
+            );
+            let mut tied = false;
+            for (index, value) in eigenvalues.iter().enumerate().skip(1) {
+                let distance = Float::with_val(precision_bits, value - &shift).abs();
+                if distance < best.1 {
+                    best = (index, distance);
+                    tied = false;
+                } else if distance == best.1 {
+                    tied = true;
+                }
+            }
+            if tied {
+                return Err(SolverError::UnresolvedEigenspace(
+                    "multiple eigenvalues share the requested distance at working precision".into(),
+                ));
+            }
+            best.0
         }
         EigenTarget::IndexRange { .. } | EigenTarget::Interval { .. } => {
             return Err(SolverError::UnsupportedTarget(
@@ -3696,30 +3719,6 @@ pub fn solve_dense_reference_hp_controlled(
     let mut denominator = eigenvalue_abs.clone();
     denominator.mul_assign_round(&vector_norm, Round::Down);
     denominator.add_assign_round(&applied_norm, Round::Down);
-    let mut infinity_bound = hp_zero(verification_bits);
-    for row in 0..dimension {
-        check_solver_cancellation(cancellation)?;
-        let row_sum = Float::with_val_round(
-            verification_bits,
-            Float::sum(
-                problem.matrix[row * dimension..(row + 1) * dimension]
-                    .iter()
-                    .map(|entry| entry.clone().abs())
-                    .collect::<Vec<_>>()
-                    .iter(),
-            ),
-            Round::Down,
-        )
-        .0;
-        if row_sum > infinity_bound {
-            infinity_bound = row_sum;
-        }
-    }
-    let mut backward_denominator = infinity_bound;
-    backward_denominator.mul_assign_round(&vector_norm, Round::Down);
-    let mut eigen_term = eigenvalue_abs;
-    eigen_term.mul_assign_round(&vector_norm, Round::Down);
-    backward_denominator.add_assign_round(&eigen_term, Round::Down);
     let upper_ratio = |denominator: &Float| {
         if denominator.is_zero() {
             residual_norm.clone()
@@ -3728,7 +3727,7 @@ pub fn solve_dense_reference_hp_controlled(
         }
     };
     let relative_residual = upper_ratio(&denominator);
-    let scaled_backward_error = upper_ratio(&backward_denominator);
+    let scaled_backward_error = relative_residual.clone();
     if [&relative_residual, &scaled_backward_error]
         .iter()
         .any(|v| !v.is_finite())
@@ -5033,9 +5032,11 @@ impl DenseGeneralizedReferenceSolverF64 {
         problem.validate()?;
         if !self.scaled_backward_error_tolerance.is_finite()
             || self.scaled_backward_error_tolerance <= 0.0
+            || self.scaled_backward_error_tolerance >= 1.0
         {
             return Err(SolverError::InvalidConfiguration(
-                "generalized dense backward-error tolerance must be finite and positive".to_owned(),
+                "generalized dense backward-error tolerance must be strictly between zero and one"
+                    .to_owned(),
             ));
         }
         let n = problem.dimension;

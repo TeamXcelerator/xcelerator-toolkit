@@ -23,6 +23,10 @@ use std::time::Instant;
 #[cfg(feature = "hp")]
 pub mod hp;
 
+#[cfg(all(test, feature = "hp"))]
+#[path = "../../tests/common/published_sources.rs"]
+mod published_source_fixtures;
+
 #[cfg(feature = "hp")]
 pub mod evidence;
 
@@ -1071,6 +1075,9 @@ pub mod state_geometry;
 
 #[cfg(feature = "hp")]
 pub mod retained_evidence;
+
+#[cfg(feature = "hp")]
+pub(crate) mod source_admission;
 
 /// Explicit opt-in post-acquisition finite comparisons; never enabled by Ultra.
 #[cfg(feature = "hp")]

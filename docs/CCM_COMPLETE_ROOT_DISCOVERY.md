@@ -90,3 +90,13 @@ Applications must select the complete policy explicitly.
 A prior incomplete run is retained as historical evidence; a new invocation
 can reuse its source and add the newly acquired root window and diagnostics.
 Do not clear a cache to extend a discovery window.
+
+Reference-free discovery for more than 64 modes requires the Arb-enabled
+Toolkit build. The producer checks this capability before matrix assembly.
+Seeded refinement also checks each returned value against its assigned seed
+cell before exposing a computed or cached root window.
+
+Point-root refinements distinguish a satisfied residual from bracket-only
+convergence using `Refined` and `Approximate`. Interval certificates and
+independent cross-check evidence carry their own assurance. Certificate bundles
+accept only implemented claim types and require evidence for custom claims.

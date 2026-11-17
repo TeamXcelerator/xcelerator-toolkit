@@ -46,6 +46,15 @@ impl StoppingPolicy {
                 )));
             }
         }
+        if self
+            .scaled_backward_error
+            .cmp_numeric(&DecimalLiteral::new("1")?)?
+            != Ordering::Less
+        {
+            return Err(ConfigError::new(
+                "scaled_backward_error must be less than one",
+            ));
+        }
         if self.maximum_iterations == 0 {
             return Err(ConfigError::new("maximum_iterations must be positive"));
         }

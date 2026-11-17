@@ -47,6 +47,12 @@ fn project_even_normalized(v: &mut [Float]) -> Result<()> {
 // Dense LU factorization with partial pivoting
 // ===========================================================================
 
+/// Successful exact Schur products performed during this factorization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LuSchurExecution {
+    pub cpu_products: usize,
+    pub cuda_products: usize,
+}
 /// Output of `lu_factor`. Stores the in-place LU representation plus the
 /// row permutation produced by partial pivoting.
 ///
@@ -55,6 +61,8 @@ fn project_even_normalized(v: &mut [Float]) -> Result<()> {
 /// upper triangle holding U. The `perm` permutation records the row
 /// swaps so that `P · A = L · U`.
 pub struct LuFactors {
+    /// Present for freshly computed factors. Reopened numerical payloads carry no execution claim.
+    pub schur_execution: Option<LuSchurExecution>,
     /// Combined LU storage, row-major, length `dim²`. The strict lower
     /// triangle holds L (with implicit unit diagonal); the upper
     /// triangle (including the diagonal) holds U.
@@ -135,7 +143,11 @@ pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
             "dense LU arithmetic exceeds the finite exponent range"
         ));
     }
-    Ok(LuFactors { lu, perm })
+    Ok(LuFactors {
+        lu,
+        perm,
+        schur_execution: Some(LuSchurExecution::default()),
+    })
 }
 
 /// Explicitly round stored coefficients once before uniform-precision dense LU.
@@ -1596,7 +1608,11 @@ mod tests {
                 }
             }
         }
-        Ok(LuFactors { lu, perm })
+        Ok(LuFactors {
+            lu,
+            perm,
+            schur_execution: Some(LuSchurExecution::default()),
+        })
     }
 
     #[test]
@@ -3302,6 +3318,7 @@ mod worker_range_regression {
                 lu[i * dimension + i] = Float::with_val(precision, 1);
             }
             let factors = LuFactors {
+                schur_execution: None,
                 lu,
                 perm: (0..dimension).collect(),
             };

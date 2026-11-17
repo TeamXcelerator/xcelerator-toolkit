@@ -13,18 +13,12 @@ fn valid_scalar(value: &str, p: u32) -> bool {
                     .is_ok_and(|v| v.as_str() == "0"))
     })
 }
-fn checkpoint_identity<T: serde::Serialize>(
-    identity: &T,
-    working_bytes: u128,
-    workers: usize,
-) -> impl serde::Serialize + '_ {
+fn checkpoint_identity<T: serde::Serialize>(identity: &T) -> impl serde::Serialize + '_ {
     (
-        "retained-component-actions-v1",
+        "retained-component-actions-v2",
         identity,
         rug::float::exp_min(),
         rug::float::exp_max(),
-        working_bytes,
-        workers,
     )
 }
 pub(super) fn actions(
@@ -37,11 +31,7 @@ pub(super) fn actions(
 ) -> Result<Vec<OperatorAction>> {
     let _stage =
         xc_core::performance_stage("ccm.capture.prepared_component_actions", Default::default());
-    let checkpoints = Checkpoints::new(&checkpoint_identity(
-        identity,
-        source_working_budget()?,
-        rayon::current_num_threads(),
-    ))?;
+    let checkpoints = Checkpoints::new(&checkpoint_identity(identity))?;
     actions_with_store(&checkpoints, reuse, expected, dimension, precision, compute)
 }
 fn actions_with_store(
@@ -109,12 +99,8 @@ mod component_action_checkpoint_tests {
             .map(|v| (v.label.as_str(), &v.source_digest, v.convention.as_str()))
             .collect()
     }
-    fn store(directory: &std::path::Path, identity: &str, budget: u128) -> Checkpoints {
-        Checkpoints::local(
-            &checkpoint_identity(&identity, budget, rayon::current_num_threads()),
-            directory.to_path_buf(),
-        )
-        .unwrap()
+    fn store(directory: &std::path::Path, identity: &str, _budget: u128) -> Checkpoints {
+        Checkpoints::local(&checkpoint_identity(&identity), directory.to_path_buf()).unwrap()
     }
     fn serial(run: impl FnOnce() + Send) {
         rayon::ThreadPoolBuilder::new()
@@ -165,7 +151,7 @@ mod component_action_checkpoint_tests {
     }
 
     #[test]
-    fn component_action_checkpoint_source_budget_and_pool_changes_miss() {
+    fn component_action_checkpoint_binds_source_and_survives_budget_and_pool_changes() {
         let directory = xc_core::test_support::TestDir::new("component-action-context");
         let values = fixture();
         let expected = expected(&values);
@@ -174,10 +160,10 @@ mod component_action_checkpoint_tests {
             (1, "source-a", 8u128 << 30, 1),
             (1, "source-a", 8u128 << 30, 1),
             (1, "source-b", 8u128 << 30, 2),
-            (1, "source-a", 4u128 << 30, 3),
-            (2, "source-a", 8u128 << 30, 4),
-            (2, "source-a", 8u128 << 30, 4),
-            (1, "source-a", 8u128 << 30, 4),
+            (1, "source-a", 4u128 << 30, 2),
+            (2, "source-a", 8u128 << 30, 2),
+            (2, "source-a", 8u128 << 30, 2),
+            (1, "source-a", 8u128 << 30, 2),
         ] {
             let actual = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)

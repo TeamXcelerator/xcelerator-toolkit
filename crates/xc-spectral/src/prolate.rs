@@ -815,7 +815,7 @@ pub mod hp {
         prolate_spectrum_via_cache_model(lambda, n_grid, prec, diag, off_diag, cache, false)
     }
 
-    // The finite-Dirichlet consumer selects these two ordered source values.
+    // The finite-Dirichlet consumer uses the ordered spectrum.
     // Validate inside cache admission so corruption becomes a miss, not a sticky
     // post-load failure. This is finite-matrix index replay, not continuum accuracy.
     fn validate_fd_selected_spectrum(
@@ -843,13 +843,10 @@ pub mod hp {
             .max_by(Float::total_cmp)
             .ok_or_else(|| anyhow::anyhow!("empty prolate matrix"))?;
         let radius = (norm * (8 * d.len())) >> p;
-        for index in [0, 4] {
-            anyhow::ensure!(
-                values[index].is_finite(),
-                "nonfinite finite-Dirichlet eigenvalue"
-            );
-            let lo = Float::with_val(work, &values[index] - &radius);
-            let hi = Float::with_val(work, &values[index] + &radius);
+        for (index, value) in values.iter().enumerate() {
+            anyhow::ensure!(value.is_finite(), "nonfinite finite-Dirichlet eigenvalue");
+            let lo = Float::with_val(work, value - &radius);
+            let hi = Float::with_val(work, value + &radius);
             anyhow::ensure!(
                 xc_numerics::eigen::tridiag_sturm_count_below_hp(d, b, &lo, work)? == index
                     && xc_numerics::eigen::tridiag_sturm_count_below_hp(d, b, &hi, work)?
@@ -1210,7 +1207,7 @@ pub mod hp {
                     )?;
                     writer.write_all(&serde_json::to_vec(&artifact)?)?;
                     writer.finish()?.sync_all()?;
-                    std::fs::rename(&temporary, &path)?;
+                    xc_core::rename_replacement(&temporary, &path)?;
                     Ok(())
                 };
                 let result = write();
@@ -1770,7 +1767,7 @@ pub mod hp {
     }
 
     fn prolate_cache_dir() -> Option<std::path::PathBuf> {
-        let dir = crate::standalone_cache_root().join("prolate_eigvals_cache");
+        let dir = crate::standalone_cache_root()?.join("prolate_eigvals_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }

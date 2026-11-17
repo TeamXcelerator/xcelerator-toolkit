@@ -23,6 +23,16 @@ pub enum CaptureFailure {
     Failed { reason: String },
 }
 impl CaptureFailure {
+    fn completion_error(self, id: &str) -> CacheError {
+        let reason = match self {
+            Self::Missing { reason } | Self::Blocked { reason } | Self::Failed { reason } => reason,
+        };
+        invalid(format!(
+            "completed diagnostic {id}: {}",
+            safe_failure_reason(reason)
+        ))
+    }
+
     /// Preserve actionable errors in private receipts unless they contain secrets.
     pub fn failed(error: impl std::fmt::Display) -> Self {
         Self::Failed {
@@ -32,9 +42,15 @@ impl CaptureFailure {
 
     fn outcome(self) -> DiagnosticOutcome {
         match self {
-            Self::Missing { reason } => DiagnosticOutcome::Missing { reason },
-            Self::Blocked { reason } => DiagnosticOutcome::Blocked { reason },
-            Self::Failed { reason } => DiagnosticOutcome::Failed { reason },
+            Self::Missing { reason } => DiagnosticOutcome::Missing {
+                reason: safe_failure_reason(reason),
+            },
+            Self::Blocked { reason } => DiagnosticOutcome::Blocked {
+                reason: safe_failure_reason(reason),
+            },
+            Self::Failed { reason } => DiagnosticOutcome::Failed {
+                reason: safe_failure_reason(reason),
+            },
         }
     }
 }
@@ -45,6 +61,13 @@ fn safe_failure_reason(error: impl std::fmt::Display) -> String {
         || xc_core::validate_secret_free(&reason, "capture failure").is_err()
     {
         "diagnostic returned an empty or secret-bearing error; details omitted".into()
+    } else if crate::governance::looks_like_local_path(&reason)
+        || reason.split_whitespace().any(|word| {
+            let name = word.trim_matches(|c: char| matches!(c, '\'' | '"' | ':' | ',' | ')' | '('));
+            name.contains(['/', '\\']) && (name.ends_with(".json") || name.ends_with(".zip"))
+        })
+    {
+        "diagnostic could not use a local input or file; see the local run log".into()
     } else {
         reason
     }
@@ -103,6 +126,41 @@ impl CoverageCounts {
     }
 }
 impl NumericalCoverage {
+    fn requires_resolved_rows(id: &str) -> bool {
+        matches!(id, "directional_response_full" | "root_transport")
+    }
+
+    fn check_completion(&self, id: &str) -> Result<(), CaptureFailure> {
+        if matches!(
+            self.outcome.as_str(),
+            "missing_input" | "blocked" | "partial_certification"
+        ) {
+            let reason = self.reason.clone().unwrap_or_else(|| self.outcome.clone());
+            return Err(if self.outcome == "missing_input" {
+                CaptureFailure::Missing { reason }
+            } else {
+                CaptureFailure::Blocked { reason }
+            });
+        }
+        if Self::requires_resolved_rows(id)
+            && !(self
+                .expected_rows
+                .is_some_and(|n| n > 0 && n == self.retained_rows && n == self.resolved_rows)
+                && self.unresolved_rows == 0
+                && self.qualified_rows == 0)
+        {
+            let reason = match self.expected_rows {
+                Some(n) => format!(
+                    "{id} resolved {} of {n} requested rows ({} retained)",
+                    self.resolved_rows, self.retained_rows
+                ),
+                None => format!("{id} has no expected row count"),
+            };
+            return Err(CaptureFailure::Blocked { reason });
+        }
+        Ok(())
+    }
+
     pub fn from_value(value: &serde_json::Value) -> Self {
         let data = value.get("data").unwrap_or(value);
         let mut result = Self {
@@ -613,7 +671,15 @@ pub struct CapturedDiagnostic {
     /// references instead of a second copy of the data.
     pub value_reference: Option<(Vec<ArtifactManifest>, bool)>,
     /// Digest and coverage of the referenced value when `value` is a view.
-    reference_summary: Option<(String, NumericalCoverage)>,
+    reference_summary: Option<CaptureViewSummary>,
+}
+
+#[derive(Clone)]
+struct CaptureViewSummary {
+    value_digest: String,
+    coverage: NumericalCoverage,
+    content_digest: ContentDigest,
+    acquisition_failure: Option<CaptureFailure>,
 }
 /// Every key-like string literal of the coverage computation
 /// ([`NumericalCoverage::from_value`] and its shape helpers), a superset of the
@@ -625,6 +691,7 @@ const COVERAGE_LITERALS: &[&str] = &[
     "_upper",
     "absolute_residual_mass",
     "amplitude",
+    "blocked",
     "ccm_finite_diagnostic_analysis",
     "certified_finite_enclosure",
     "certifies_finite_ground_state_simple",
@@ -637,6 +704,8 @@ const COVERAGE_LITERALS: &[&str] = &[
     "coefficient_norm",
     "coefficients",
     "computed",
+    "computed_agreement",
+    "computed_outside_certified_rows",
     "computed_eigenvalues",
     "computed_not_certified",
     "computed_with_limitation",
@@ -646,6 +715,7 @@ const COVERAGE_LITERALS: &[&str] = &[
     "data",
     "difference_norm_squared",
     "dimension",
+    "directional_response_full",
     "distance_to_target",
     "eigenvalue_defect",
     "eigenvalue_velocity_response",
@@ -654,12 +724,14 @@ const COVERAGE_LITERALS: &[&str] = &[
     "even_simple",
     "evenness_deviation",
     "events",
+    "execution_budget_limited",
     "exact_form_bounds",
     "exact_form_lower",
     "exact_form_upper",
     "expected_rows",
     "export_checks_passed",
     "f_values",
+    "failed",
     "forced_eigenvalue",
     "full",
     "gap_log",
@@ -671,10 +743,14 @@ const COVERAGE_LITERALS: &[&str] = &[
     "levels",
     "measurements",
     "missing_count",
+    "missing_input",
     "natural_eigenvalue",
     "odd_sector",
     "outcome",
     "outcomes",
+    "outside",
+    "partial_certification",
+    "root_transport",
     "parity",
     "partial_unresolved",
     "point_measurement",
@@ -709,6 +785,37 @@ const COVERAGE_LITERALS: &[&str] = &[
 ];
 
 impl CapturedDiagnostic {
+    // A fresh callback can already hold the exact source bytes as JSON. Bind
+    // their encoding before dropping them so persistence need not reopen large
+    // payloads. Different JSON field order takes the ordinary resolver path.
+    fn binds_value_artifacts(&self) -> Result<bool, CacheError> {
+        let Some((artifacts, array)) = &self.value_reference else {
+            return Ok(false);
+        };
+        if let Some(summary) = &self.reference_summary {
+            return Ok(!array
+                && artifacts.len() == 1
+                && artifacts[0].content_digest == summary.content_digest);
+        }
+        let parts = if *array {
+            let Some(parts) = self.value.as_array() else {
+                return Ok(false);
+            };
+            parts.as_slice()
+        } else {
+            std::slice::from_ref(&self.value)
+        };
+        if parts.len() != artifacts.len() {
+            return Ok(false);
+        }
+        for (part, artifact) in parts.iter().zip(artifacts) {
+            if ContentDigest::sha256_json(part)? != artifact.content_digest {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// A measurement whose value is exactly the decoded payload of the given
     /// artifacts: one artifact, or an ordered array of payloads.
     pub fn by_reference<T: Serialize>(
@@ -756,51 +863,102 @@ impl CapturedDiagnostic {
             sources.push(artifact.clone());
         }
         let coverage = NumericalCoverage::from_value(&view);
+        let acquisition_failure = qualify_value(&view).err();
         Ok(Self {
             value: view,
             sources,
             value_reference: Some((vec![artifact], false)),
-            reference_summary: Some((digest, coverage)),
+            reference_summary: Some(CaptureViewSummary {
+                value_digest: digest,
+                coverage,
+                content_digest: ContentDigest::sha256_finite_json(value)?,
+                acquisition_failure,
+            }),
         })
     }
     /// A retained qualified-absence record must not become a completed measurement.
     pub fn qualified(self) -> Result<Self, CaptureFailure> {
-        if matches!(
-            self.value["kind"].as_str(),
-            Some(
-                "ccm_compactness_analysis"
-                    | "ccm_weighted_reference_projection"
-                    | "ccm_signed_transform_analysis"
-                    | "ccm_arithmetic_energy_analysis"
-                    | "ccm_directional_response_analysis"
-                    | "ccm_weighted_tail_analysis"
-                    | "ccm_spectral_cluster_analysis"
-                    | "ccm_resolution_budget_analysis"
-                    | "ccm_energy_allowance_analysis"
-                    | "ccm_complex_transform_analysis"
-                    | "ccm_root_transport_analysis"
-                    | "ccm_operator_cluster_analysis"
-                    | "ccm_finite_section_transfer"
-                    | "ccm_tail_operator_analysis"
-                    | "ccm_observable_budget_analysis"
-                    | "ccm_reference_projection_analysis"
-                    | "ccm_capture_preflight"
-                    | "ccm_consistency_analysis"
-                    | "ccm_configuration_comparison"
-                    | "ccm_band_reconstruction"
-                    | "ccm_transform_enclosure"
-            )
-        ) && self.value["data"]["outcome"] == "missing_input"
+        if let Some(failure) = self
+            .reference_summary
+            .as_ref()
+            .and_then(|s| s.acquisition_failure.as_ref())
         {
-            return Err(CaptureFailure::Missing {
-                reason: self.value["data"]["reason"]
-                    .as_str()
-                    .unwrap_or("required retained inputs unavailable")
-                    .to_string(),
-            });
+            return Err(failure.clone());
         }
+        qualify_value(&self.value)?;
         Ok(self)
     }
+
+    /// Apply the acquisition requirements of the requested diagnostic.
+    pub fn qualified_for(self, id: &str) -> Result<Self, CaptureFailure> {
+        let diagnostic = self.qualified()?;
+        if let Some(summary) = &diagnostic.reference_summary {
+            summary.coverage.check_completion(id)?;
+        } else if NumericalCoverage::requires_resolved_rows(id) {
+            NumericalCoverage::from_value(&diagnostic.value).check_completion(id)?;
+        }
+        Ok(diagnostic)
+    }
+}
+
+fn qualify_value(value: &serde_json::Value) -> Result<(), CaptureFailure> {
+    if let Some(parts) = value.as_array() {
+        return parts.iter().try_for_each(qualify_value);
+    }
+    if let Some(data) = value.get("data") {
+        qualify_payload(data)?;
+    }
+    qualify_payload(value)
+}
+
+fn qualify_payload(data: &serde_json::Value) -> Result<(), CaptureFailure> {
+    if data["status"] == "unresolved" && data.get("certifies_finite_ground_state_simple").is_some()
+    {
+        return Err(CaptureFailure::Blocked {
+            reason: data["reason"]
+                .as_str()
+                .unwrap_or("sector-gap certificate unresolved")
+                .into(),
+        });
+    }
+    if data["outcome"] == "partial_certification"
+        || (data["outcome"] == "certified_finite_enclosure"
+            && (data["computed_outside_certified_rows"]
+                .as_u64()
+                .is_some_and(|n| n > 0)
+                || data["rows"]
+                    .as_array()
+                    .is_some_and(|rows| rows.iter().any(|r| r["computed_agreement"] == "outside"))))
+    {
+        return Err(CaptureFailure::Blocked {
+            reason: "the requested root certificate does not cover every retained root".into(),
+        });
+    }
+    if data["execution_budget_limited"] == true {
+        return Err(CaptureFailure::Blocked {
+            reason: "diagnostic execution budget exceeded".to_owned(),
+        });
+    }
+    if data["outcome"] == "blocked" {
+        return Err(CaptureFailure::Blocked {
+            reason: data["reason"]
+                .as_str()
+                .unwrap_or("diagnostic blocked")
+                .to_owned(),
+        });
+    }
+    if data["outcome"] == "missing_input" {
+        return Err(CaptureFailure::Missing {
+            reason: data["reason"]
+                .as_str()
+                .unwrap_or("required retained inputs unavailable")
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+impl CapturedDiagnostic {
     pub fn new<T: Serialize>(
         value: &T,
         sources: Vec<ArtifactManifest>,
@@ -861,30 +1019,67 @@ pub fn measurement_value(
     policy: &CachePolicy,
 ) -> Result<serde_json::Value, CacheError> {
     let Some(reference) = &measurement.value_reference else {
+        qualify_value(&measurement.value)
+            .map_err(|failure| failure.completion_error("measurement"))?;
         return Ok(measurement.value.clone());
     };
-    let mut values = Vec::with_capacity(reference.artifacts.len());
-    for artifact in &reference.artifacts {
-        let bytes = resolver.read_exact_payload(&artifact.key, &artifact.content_digest, policy)?;
-        values.push(serde_json::from_slice::<serde_json::Value>(&bytes)?);
+    reference.read_value(|artifact| {
+        resolver.read_exact_payload_with_quality(
+            &artifact.key,
+            &artifact.content_digest,
+            artifact.required_quality,
+            policy,
+        )
+    })
+}
+
+impl MeasurementValueReference {
+    fn read_value(
+        &self,
+        mut read: impl FnMut(&DependencyRef) -> Result<Vec<u8>, CacheError>,
+    ) -> Result<serde_json::Value, CacheError> {
+        if self.artifacts.is_empty() || (!self.array && self.artifacts.len() != 1) {
+            return Err(invalid("invalid measurement reference cardinality"));
+        }
+        let mut values = Vec::with_capacity(self.artifacts.len());
+        for artifact in &self.artifacts {
+            let bytes = read(artifact)?;
+            if ContentDigest::sha256(&bytes) != artifact.content_digest {
+                return Err(invalid(
+                    "referenced measurement source content digest mismatch",
+                ));
+            }
+            values.push(serde_json::from_slice::<serde_json::Value>(&bytes)?);
+        }
+        let value = if self.array {
+            serde_json::Value::Array(values)
+        } else {
+            values
+                .pop()
+                .ok_or_else(|| invalid("measurement reference has no artifact"))?
+        };
+        self.verify_value(&value)?;
+        Ok(value)
     }
-    let value = if reference.array {
-        serde_json::Value::Array(values)
-    } else {
-        values
-            .pop()
-            .ok_or_else(|| invalid("measurement reference has no artifact"))?
-    };
-    if xc_core::research_digest_value(&value)
-        .map_err(|e| invalid(e.to_string()))?
-        .0
-        != reference.value_digest
-    {
-        return Err(invalid(
-            "referenced measurement value does not match its digest",
-        ));
+    fn verify_value(&self, value: &serde_json::Value) -> Result<(), CacheError> {
+        qualify_value(value)
+            .map_err(|failure| failure.completion_error("referenced measurement"))?;
+        if xc_core::research_digest_value(value)
+            .map_err(|e| invalid(e.to_string()))?
+            .0
+            != self.value_digest
+        {
+            return Err(invalid(
+                "referenced measurement value does not match its digest",
+            ));
+        }
+        if NumericalCoverage::from_value(value) != self.coverage {
+            return Err(invalid(
+                "referenced measurement coverage differs from its source",
+            ));
+        }
+        Ok(())
     }
-    Ok(value)
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -929,7 +1124,8 @@ fn canonical_dependencies(
 /// stored logical key is a store-local label: a parent resolved from a remote
 /// store by identity carries a synthetic `closure/...` key, so binding the
 /// label would give the same parent bytes a different identity on each
-/// workstation that did not compute it. Manifests keep their resolvable keys.
+/// workstation that did not compute it. A receipt can therefore refer to
+/// the parent's original producer draft through this portable label.
 pub fn research_identity_dependency(manifest: &ArtifactManifest) -> DependencyRef {
     DependencyRef {
         key: ArtifactKey {
@@ -953,11 +1149,23 @@ pub fn research_source_dependencies(
         if !m.quality.satisfies(CacheQuality::Validated) {
             return Err(invalid("research source quality is below validated"));
         }
-        dependencies.push(DependencyRef {
-            key: m.key.clone(),
-            content_digest: m.content_digest.clone(),
-            required_quality: CacheQuality::Validated,
-        });
+        let reference = if let Some(raw) = m.tags.get(crate::SEMANTIC_KEY_MANIFEST_TAG) {
+            let semantic: SemanticKeyEnvelope = serde_json::from_str(raw)?;
+            if semantic.artifact_kind != m.key.kind || semantic.digest()? != m.key.parameters_digest
+            {
+                return Err(invalid(
+                    "research source label does not bind its semantic identity",
+                ));
+            }
+            research_identity_dependency(m)
+        } else {
+            DependencyRef {
+                key: m.key.clone(),
+                content_digest: m.content_digest.clone(),
+                required_quality: CacheQuality::Validated,
+            }
+        };
+        dependencies.push(reference);
     }
     canonical_dependencies(dependencies)
 }
@@ -996,6 +1204,44 @@ fn measurement_evidence(
     })
 }
 impl CaptureArtifact {
+    /// Verify the receipt and materialize every value reference against admitted
+    /// source bytes. Use this when accepting a receipt from disk or another writer.
+    pub fn validate_with_sources(
+        &self,
+        resolver: &CacheResolver,
+        policy: &CachePolicy,
+    ) -> Result<(), CacheError> {
+        self.validate()?;
+        self.verify_value_references(Some(resolver), Some(policy), &BTreeSet::new())
+    }
+
+    fn verify_value_references(
+        &self,
+        resolver: Option<&CacheResolver>,
+        policy: Option<&CachePolicy>,
+        bound: &BTreeSet<String>,
+    ) -> Result<(), CacheError> {
+        for (id, measurement) in &self.measurements {
+            let Some(reference) = &measurement.value_reference else {
+                continue;
+            };
+            let resolver =
+                resolver.ok_or_else(|| invalid("referenced capture requires a cache resolver"))?;
+            let policy =
+                policy.ok_or_else(|| invalid("referenced capture requires a cache policy"))?;
+            if bound.contains(id) {
+                for dep in &reference.artifacts {
+                    if resolver.exact_dependency_manifest(dep, policy)?.is_none() {
+                        return Err(invalid(format!("capture {id} source unavailable")));
+                    }
+                }
+            } else {
+                measurement_value(measurement, resolver, policy)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Also works on historical receipts that do not embed a coverage summary.
     pub fn coverage(&self) -> BTreeMap<String, NumericalCoverage> {
         self.receipt.outcomes().iter().map(|(id, outcome)| {
@@ -1016,6 +1262,8 @@ impl CaptureArtifact {
             (id.clone(), summary)
         }).collect()
     }
+    /// Validate embedded evidence and the declared structure and coverage of
+    /// referenced evidence. Use `validate_with_sources` to authenticate its content.
     pub fn validate(&self) -> Result<(), CacheError> {
         if self.schema_version != 1 || self.semantics != CAPTURE_RECORD_SEMANTICS {
             return Err(invalid("unsupported capture record"));
@@ -1050,12 +1298,26 @@ impl CaptureArtifact {
                         if !m.value.is_null()
                             || reference.artifacts.is_empty()
                             || (!reference.array && reference.artifacts.len() != 1)
+                            || !ContentDigest(reference.value_digest.clone()).validate()
+                            || canonical_dependencies(reference.artifacts.clone())?.len()
+                                != reference.artifacts.len()
                             || reference
                                 .artifacts
                                 .iter()
                                 .any(|artifact| !m.source_dependencies.contains(artifact))
                         {
                             return Err(invalid("invalid referenced measurement value"));
+                        }
+                        reference
+                            .coverage
+                            .check_completion(id)
+                            .map_err(|f| f.completion_error(id))?;
+                    } else {
+                        qualify_value(&m.value).map_err(|f| f.completion_error(id))?;
+                        if NumericalCoverage::requires_resolved_rows(id) {
+                            NumericalCoverage::from_value(&m.value)
+                                .check_completion(id)
+                                .map_err(|f| f.completion_error(id))?;
                         }
                     }
                     completed.insert(id);
@@ -1098,6 +1360,21 @@ pub struct CaptureMeasurementRepair {
 pub fn repair_capture_measurements(
     original: &CaptureArtifact,
     repairs: Vec<CaptureMeasurementRepair>,
+) -> Result<CaptureArtifact, CacheError> {
+    repair_capture_measurements_with_sources(original, repairs, |_| {
+        Err(invalid(
+            "referenced capture repair requires its authenticated source value",
+        ))
+    })
+}
+
+/// Repair embedded or referenced measurements. Supply each retained value
+/// artifact's encoded JSON, including unchanged references carried into the
+/// new receipt. Verify their content digests, ordered values and coverage.
+pub fn repair_capture_measurements_with_sources(
+    original: &CaptureArtifact,
+    repairs: Vec<CaptureMeasurementRepair>,
+    mut read: impl FnMut(&DependencyRef) -> Result<Vec<u8>, CacheError>,
 ) -> Result<CaptureArtifact, CacheError> {
     original.validate()?;
     let mut repaired = original.clone();
@@ -1153,6 +1430,11 @@ pub fn repair_capture_measurements(
         repaired.numerical_coverage = repaired.coverage();
     }
     repaired.validate()?;
+    for measurement in repaired.measurements.values() {
+        if let Some(reference) = &measurement.value_reference {
+            reference.read_value(&mut read)?;
+        }
+    }
     Ok(repaired)
 }
 
@@ -1176,7 +1458,7 @@ where
         .map_err(|e| invalid(e.to_string()))?;
     let mut measurements = BTreeMap::new();
     for id in &requested {
-        let outcome = match execute(id).and_then(CapturedDiagnostic::qualified) {
+        let outcome = match execute(id).and_then(|diagnostic| diagnostic.qualified_for(id)) {
             Ok(diagnostic) => {
                 let measurement = (|| {
                     xc_core::validate_secret_free_value(&diagnostic.value, "capture measurement")
@@ -1190,7 +1472,9 @@ where
                         },
                         Some((artifacts, array)) => {
                             let (value_digest, coverage) = match &diagnostic.reference_summary {
-                                Some(summary) => summary.clone(),
+                                Some(summary) => {
+                                    (summary.value_digest.clone(), summary.coverage.clone())
+                                }
                                 None => (
                                     xc_core::research_digest_value(&diagnostic.value)
                                         .map_err(|e| invalid(e.to_string()))?
@@ -1271,6 +1555,28 @@ where
     T: Serialize + DeserializeOwned + Clone,
     V: Fn(&T) -> Result<(), CacheError>,
 {
+    persist_research_record(
+        kind,
+        record,
+        dependencies,
+        cache,
+        validate,
+        &BTreeSet::new(),
+    )
+}
+
+fn persist_research_record<T, V>(
+    kind: &str,
+    record: &T,
+    dependencies: &[DependencyRef],
+    cache: &ArtifactCacheContext<'_>,
+    validate: V,
+    bound: &BTreeSet<String>,
+) -> Result<ArtifactExecutionCacheResult<T>, CacheError>
+where
+    T: Serialize + DeserializeOwned + Clone,
+    V: Fn(&T) -> Result<(), CacheError>,
+{
     if !matches!(kind, CAPTURE_RECEIPT_KIND | HYPOTHESIS_EVALUATION_KIND) {
         return Err(invalid("unsupported managed research record kind"));
     }
@@ -1294,6 +1600,13 @@ where
         )
         .map_err(|e| invalid(e.to_string()))?;
         capture.validate()?;
+        if dependencies != capture.source_dependencies {
+            return Err(invalid(
+                "capture persistence dependencies differ from receipt",
+            ));
+        }
+        // The warm path below also requires the digest of this exact record.
+        capture.verify_value_references(cache.resolver, cache.acceptance, bound)?;
         let plan = capture.receipt.plan_digest();
         tags.insert("research_plan_digest".into(), plan.0.clone());
         format!(
@@ -1308,7 +1621,12 @@ where
     let semantic = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: kind.into(),
-        mathematical_semantics_version: "managed-research-record-v1".into(),
+        mathematical_semantics_version: if kind == CAPTURE_RECEIPT_KIND {
+            "capture-receipt-completion-v2"
+        } else {
+            "managed-research-record-v1"
+        }
+        .into(),
         resolved_mathematical_parameters: serde_json::json!({"record_digest": record_digest, "source_dependencies": dependencies}),
         normalization: None,
         target: Some("finite_research_evidence".into()),
@@ -1386,18 +1704,11 @@ pub fn validate_artifact_dependency_closure(
         return Err(invalid("managed research dependency closure mismatch"));
     }
     let canonical: CanonicalArtifactManifest = serde_json::from_str(encoded)?;
-    let provenance = manifest
+    manifest
         .provenance_digest
         .as_ref()
         .ok_or_else(|| invalid("managed research canonical provenance missing"))?;
-    validate_retained_canonical_binding(
-        &canonical,
-        semantic,
-        family,
-        &manifest.content_digest,
-        manifest.size_bytes,
-        Some(provenance),
-    )?;
+    validate_retained_canonical_binding(&canonical, semantic, family, manifest)?;
     let identity = |dependency: &DependencyRef| {
         (
             dependency.key.kind.clone(),
@@ -1476,7 +1787,7 @@ pub fn persist_capture(
 pub fn capture_and_persist<P, F>(
     plan: &P,
     requested: Vec<String>,
-    execute: F,
+    mut execute: F,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<ArtifactExecutionCacheResult<CaptureArtifact>, CacheError>
 where
@@ -1486,9 +1797,29 @@ where
     if cache.write_visibility == CacheVisibility::Public {
         return Err(invalid("full research records are private-only"));
     }
-    let record = collect_capture(plan, requested, execute)?;
-    persist_capture(&record, cache)
+    let mut bound = BTreeSet::new();
+    let record = collect_capture(plan, requested, |id| {
+        let diagnostic = execute(id)?;
+        if diagnostic
+            .binds_value_artifacts()
+            .map_err(CaptureFailure::failed)?
+        {
+            bound.insert(id.to_owned());
+        }
+        Ok(diagnostic)
+    })?;
+    persist_research_record(
+        CAPTURE_RECEIPT_KIND,
+        &record,
+        &record.source_dependencies,
+        cache,
+        CaptureArtifact::validate,
+        &bound,
+    )
 }
+
+#[cfg(test)]
+mod completion_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1734,7 +2065,10 @@ mod tests {
         let source = include_str!("research_artifacts.rs");
         let start = source.find("impl NumericalCoverage {").unwrap();
         let end = source.find("pub struct CapturedDiagnostic").unwrap();
-        let section = &source[start..end];
+        let qualification = &source[source.find("fn qualify_value(").unwrap()..];
+        let qualification =
+            &qualification[..qualification.find("impl CapturedDiagnostic {").unwrap()];
+        let section = format!("{}\n{}", &source[start..end], qualification);
         let mut literals = std::collections::BTreeSet::new();
         let mut parts = section.split('"');
         parts.next();
@@ -1779,9 +2113,12 @@ mod tests {
             )
             .unwrap();
             assert!(view.value.get("matrix").is_none());
-            let (digest, coverage) = view.reference_summary.clone().unwrap();
-            assert_eq!(digest, xc_core::research_digest_value(&full).unwrap().0);
-            assert_eq!(coverage, NumericalCoverage::from_value(&full));
+            let summary = view.reference_summary.as_ref().unwrap();
+            assert_eq!(
+                summary.value_digest,
+                xc_core::research_digest_value(&full).unwrap().0
+            );
+            assert_eq!(summary.coverage, NumericalCoverage::from_value(&full));
         }
         let rows = json!({
             "certifies_finite_ground_state_simple": true,

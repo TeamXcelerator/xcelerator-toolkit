@@ -30,6 +30,24 @@ pub fn default_cache_root() -> PathBuf {
 pub fn configured_cache_root() -> PathBuf {
     std::env::var_os("XC_CACHE_ROOT")
         .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("XC_TYPED_CACHE_ROOT").filter(|v| !v.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(default_cache_root)
+}
+
+/// Resolve the root for an actual cache operation. An explicitly empty override
+/// is a configuration error, so a malformed invocation cannot populate the default cache.
+pub fn checked_cache_root() -> std::io::Result<PathBuf> {
+    for name in ["XC_CACHE_ROOT", "XC_TYPED_CACHE_ROOT"] {
+        if let Some(value) = std::env::var_os(name) {
+            if value.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{name} must not be empty"),
+                ));
+            }
+            return Ok(PathBuf::from(value));
+        }
+    }
+    Ok(default_cache_root())
 }

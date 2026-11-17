@@ -190,10 +190,54 @@ pub struct GitHubBootstrapCacheStore {
     continuation_inventory_lock: Mutex<()>,
     registry_snapshot: Mutex<Option<BootstrapRegistry>>,
     family_topologies: Mutex<HashMap<String, crate::bootstrap_topology::BootstrapFamilyTopology>>,
+    read_pins: Option<std::collections::BTreeMap<String, String>>,
+    trust_policy: Option<crate::RemoteFabricTrustPolicy>,
     shard_revisions: Mutex<HashMap<String, String>>,
     historical_batches: Mutex<HistoricalBatchCache>,
     metadata_documents: Mutex<MetadataDocumentCache>,
     revocation_partitions: Mutex<HashMap<MetadataDocumentKey, Option<RevocationIndexPartition>>>,
+}
+
+/// An explicit pin set covers the registry and every shard opened by this reader.
+fn read_pins_from_environment(
+) -> Result<Option<std::collections::BTreeMap<String, String>>, CacheError> {
+    let Some(pins) =
+        read_operator_file::<std::collections::BTreeMap<String, String>>("XC_CACHE_READ_PINS")?
+    else {
+        return Ok(None);
+    };
+    if pins.is_empty()
+        || pins.values().any(|revision| {
+            !matches!(revision.len(), 40 | 64)
+                || !revision
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    {
+        return Err(CacheError::InvalidManifest(
+            "cache read pins require full lowercase Git commit IDs".into(),
+        ));
+    }
+    Ok(Some(pins))
+}
+
+fn read_operator_file<T: serde::de::DeserializeOwned>(
+    variable: &str,
+) -> Result<Option<T>, CacheError> {
+    let Some(path) = std::env::var_os(variable) else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(fs::File::open(path)?, 1024 * 1024 + 1),
+        &mut bytes,
+    )?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(CacheError::ResourceLimit(format!(
+            "{variable} exceeds one MiB"
+        )));
+    }
+    Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
 impl Drop for GitHubBootstrapCacheStore {
@@ -205,6 +249,13 @@ impl Drop for GitHubBootstrapCacheStore {
 }
 
 impl crate::bootstrap_topology::BootstrapDocumentReader for GitHubBootstrapCacheStore {
+    fn registry_revision(
+        &self,
+        _: &dyn RemoteGitStore,
+        repository: &str,
+    ) -> Result<String, CacheError> {
+        self.trusted_revision(repository, crate::TrustedRepositoryRole::Registry)
+    }
     fn read_topology_json<T: serde::de::DeserializeOwned>(
         &self,
         repository: &str,
@@ -235,7 +286,13 @@ fn first_admissible_candidate<T>(
     for entry in candidates {
         match materialize(entry) {
             Ok(Some(value)) => return Ok(Some(value)),
-            Ok(None) | Err(CacheError::InvalidManifest(_)) => continue,
+            Ok(None)
+            | Err(
+                CacheError::InvalidManifest(_)
+                | CacheError::NotFound(_)
+                | CacheError::Serialization(_)
+                | CacheError::DigestMismatch { .. },
+            ) => continue,
             Err(error) => return Err(error),
         }
     }
@@ -264,6 +321,8 @@ impl GitHubBootstrapCacheStore {
         visibility: CacheVisibility,
         required: bool,
     ) -> Result<Self, CacheError> {
+        let read_pins = read_pins_from_environment()?;
+        let trust_policy = read_operator_file("XC_CACHE_TRUST_POLICY")?;
         let owner = owner.into();
         let root = root.into();
         fs::create_dir_all(&root)?;
@@ -320,6 +379,8 @@ impl GitHubBootstrapCacheStore {
             verified_transports: Mutex::new(HashMap::new()),
             discovered_keys: Mutex::new(HashMap::new()),
             continuation_inventory_lock: Mutex::new(()),
+            read_pins,
+            trust_policy,
             registry_snapshot: Mutex::new(None),
             family_topologies: Mutex::new(HashMap::new()),
             shard_revisions: Mutex::new(HashMap::new()),
@@ -335,17 +396,14 @@ impl GitHubBootstrapCacheStore {
             .ok_or_else(|| {
                 CacheError::ResourceLimit("reader session disk size exceeds u64".to_owned())
             })?;
-        if [
-            self.resources.maximum_temporary_disk_bytes,
-            self.resources.maximum_permanent_disk_bytes,
-        ]
-        .into_iter()
-        .flatten()
-        .any(|limit| total > limit)
-        {
-            return Err(CacheError::ResourceLimit(format!(
-                "reader session requires {total} retained bytes above its configured disk limit"
-            )));
+        // This directory is ephemeral and removed when the reader closes.
+        // Persistent publication/cache stores enforce their own permanent cap.
+        if let Some(limit) = self.resources.maximum_temporary_disk_bytes {
+            if total > limit {
+                return Err(CacheError::ResourceLimit(format!(
+                    "reader session requires {total} temporary bytes (existing plus {additional} additional), exceeding the configured temporary-disk limit of {limit} bytes; this is a resource-policy ceiling, not a free-space measurement"
+                )));
+            }
         }
         Ok(())
     }
@@ -412,7 +470,8 @@ impl GitHubBootstrapCacheStore {
         let visibility_name = visibility_name(self.visibility);
         let registry_id = format!("{}/xcelerator-cache-{visibility_name}-registry", self.owner);
         let repository = format!("https://github.com/{registry_id}.git");
-        let revision = self.remote.read_ref(&repository, "main")?;
+        let revision =
+            self.trusted_revision(&repository, crate::TrustedRepositoryRole::Registry)?;
         let (registry, _): (BootstrapRegistry, _) =
             self.read_json(&repository, &revision, "registry.json")?;
         if registry.schema_version != 1
@@ -444,6 +503,42 @@ impl GitHubBootstrapCacheStore {
     }
 
     fn shard_revision(&self, repository: &str) -> Result<String, CacheError> {
+        self.trusted_revision(repository, crate::TrustedRepositoryRole::Shard)
+    }
+
+    fn optional_read<T: Default>(&self, result: Result<T, CacheError>) -> Result<T, CacheError> {
+        match result {
+            Err(error) if !self.required && error.skippable_candidate() => {
+                xc_core::progress_message!("optional remote cache read skipped: {error}");
+                Ok(T::default())
+            }
+            other => other,
+        }
+    }
+
+    fn trusted_revision(
+        &self,
+        repository: &str,
+        role: crate::TrustedRepositoryRole,
+    ) -> Result<String, CacheError> {
+        let revision = self.snapshot_revision(repository)?;
+        if let Some(policy) = &self.trust_policy {
+            let name = repository
+                .strip_prefix("https://github.com/")
+                .and_then(|url| url.strip_suffix(".git"))
+                .ok_or_else(|| {
+                    CacheError::PermissionDenied("invalid trusted repository URL".into())
+                })?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| CacheError::InvalidTransition(e.to_string()))?
+                .as_secs();
+            policy.verify_repository(role, name, "main", &revision, now)?;
+        }
+        Ok(revision)
+    }
+
+    fn snapshot_revision(&self, repository: &str) -> Result<String, CacheError> {
         if let Some(revision) = self
             .shard_revisions
             .lock()
@@ -453,12 +548,19 @@ impl GitHubBootstrapCacheStore {
         {
             return Ok(revision);
         }
-        let revision = self.remote.read_ref(repository, "main")?;
-        self.shard_revisions
+        let revision = match &self.read_pins {
+            Some(pins) => pins.get(repository).cloned().ok_or_else(|| {
+                CacheError::PermissionDenied(format!("cache read pin missing for {repository}"))
+            })?,
+            None => self.remote.read_ref(repository, "main")?,
+        };
+        Ok(self
+            .shard_revisions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(repository.to_owned(), revision.clone());
-        Ok(revision)
+            .entry(repository.to_owned())
+            .or_insert(revision)
+            .clone())
     }
 
     fn family_topology(
@@ -582,6 +684,22 @@ impl GitHubBootstrapCacheStore {
         scope: RevocationScope,
         identity: &ContentDigest,
     ) -> Result<bool, CacheError> {
+        self.revocation_at_revision(repository, revision, scope, identity)
+            .map_err(|error| match error {
+                CacheError::ResourceLimit(_) | CacheError::PermissionDenied(_) => error,
+                other => CacheError::PermissionDenied(format!(
+                    "cannot establish revocation policy at {repository}@{revision}: {other}"
+                )),
+            })
+    }
+
+    fn revocation_at_revision(
+        &self,
+        repository: &str,
+        revision: &str,
+        scope: RevocationScope,
+        identity: &ContentDigest,
+    ) -> Result<bool, CacheError> {
         if !identity.validate() {
             return Err(CacheError::InvalidManifest(
                 "revocation lookup requires a valid identity".to_owned(),
@@ -679,9 +797,11 @@ impl GitHubBootstrapCacheStore {
         let prefix = &key.parameters_digest.0[..2];
         let index_path = format!("indexes/{family}/{prefix}.json");
         let current = crate::current_toolkit_version()?;
+        let mut policy_sources = Vec::new();
         for shard in &topology.readable_shards {
             let repository = shard.repository_url.clone();
             let revision = self.shard_revision(&repository)?;
+            policy_sources.push((repository.clone(), revision.clone()));
             if self.has_active_revocation(
                 &repository,
                 &revision,
@@ -728,11 +848,18 @@ impl GitHubBootstrapCacheStore {
                     .then_with(|| right.achieved_assurance.cmp(&left.achieved_assurance))
                     .then_with(|| left.manifest_digest.cmp(&right.manifest_digest))
             });
+            if candidates.windows(2).any(|pair| {
+                pair[0].producer_toolkit_version == pair[1].producer_toolkit_version
+                    && pair[0].achieved_assurance == pair[1].achieved_assurance
+                    && pair[0].canonical_payload_digest != pair[1].canonical_payload_digest
+            }) {
+                xc_core::progress_message!("shard {} has conflicting active payloads for semantic key {} at the same producer and assurance", repository, key.parameters_digest);
+            }
+            let mut policy_rejected = entries_for_identity
+                .iter()
+                .any(|entry| entry.disposition != ArtifactDisposition::Active);
             let resolved = first_admissible_candidate(candidates, |entry| {
-                if self.entry_is_revoked(&repository, &revision, shard, &entry)? {
-                    return Ok(None);
-                }
-                self.materialize_indexed_entry(
+                let resolved = self.materialize_indexed_entry(
                     repository.clone(),
                     revision.clone(),
                     family,
@@ -740,14 +867,17 @@ impl GitHubBootstrapCacheStore {
                     &key.parameters_digest,
                     entry,
                     index_source.clone(),
-                )
+                    &policy_sources,
+                )?;
+                policy_rejected |= resolved.is_none();
+                Ok(resolved)
             })?;
             if resolved.is_some() {
                 return Ok(resolved);
             }
             // Explicit policy in a newer shard cannot be undone by falling
             // back to an older copy, including revocation-only rejections.
-            if !entries_for_identity.is_empty() {
+            if policy_rejected {
                 return Ok(None);
             }
         }
@@ -776,9 +906,11 @@ impl GitHubBootstrapCacheStore {
         };
         let index_path = format!("indexes/{family}/{prefix}.json");
         let current = crate::current_toolkit_version()?;
+        let mut policy_sources = Vec::new();
         for shard in &topology.readable_shards {
             let repository = shard.repository_url.clone();
             let revision = self.shard_revision(&repository)?;
+            policy_sources.push((repository.clone(), revision.clone()));
             let indexed =
                 match self.read_json::<ShardIndexPartition>(&repository, &revision, &index_path) {
                     Ok((index, source)) => {
@@ -901,6 +1033,7 @@ impl GitHubBootstrapCacheStore {
                 &identity.semantic_digest,
                 entry,
                 index_source,
+                &policy_sources,
             )?;
             let Some(resolved) = resolved else {
                 // Explicit rejection cannot be bypassed through an older shard.
@@ -933,15 +1066,26 @@ impl GitHubBootstrapCacheStore {
         semantic_digest: &ContentDigest,
         entry: ShardIndexEntry,
         index_source: RemoteReadReport,
+        policy_sources: &[(String, String)],
     ) -> Result<Option<ResolvedRemoteArtifact>, CacheError> {
-        if self.entry_is_revoked(&repository, &revision, shard, &entry)? {
-            return Ok(None);
+        for (policy_repo, policy_rev) in policy_sources {
+            if self.entry_is_revoked(policy_repo, policy_rev, shard, &entry)? {
+                return Ok(None);
+            }
         }
         let visibility_name = visibility_name(self.visibility);
         let manifest_path = bootstrap_manifest_path(semantic_digest, &entry.manifest_digest);
         let (manifest, manifest_source): (CanonicalArtifactManifest, _) =
             self.read_json(&repository, &revision, &manifest_path)?;
         manifest.validate()?;
+        if !crate::compatibility::supported_numerical_contract(&manifest.semantic_key) {
+            xc_core::progress_message!(
+                "cache {family}/{} skipped: obsolete numerical contract {}",
+                semantic_digest,
+                manifest.semantic_key.mathematical_semantics_version
+            );
+            return Ok(None);
+        }
         // Identity-based closure resolution does not know the artifact kind
         // until the canonical manifest is opened. Apply the same hard public
         // boundary here as the key-based path, including for historical shard
@@ -986,13 +1130,15 @@ impl GitHubBootstrapCacheStore {
             &manifest_path,
             transport_digest,
         )?;
-        if self.has_active_revocation(
-            &repository,
-            &revision,
-            RevocationScope::Policy,
-            &batch.policy_digest,
-        )? {
-            return Ok(None);
+        if let Some(policy) = &self.trust_policy {
+            policy.verify_policy_digest(&batch.policy_digest)?;
+        }
+        for (scope, identity) in batch.revocable_evidence(&entry.manifest_digest) {
+            for (policy_repo, policy_rev) in policy_sources {
+                if self.has_active_revocation(policy_repo, policy_rev, scope, identity)? {
+                    return Ok(None);
+                }
+            }
         }
         let resolved = ResolvedRemoteArtifact {
             family: family.to_owned(),
@@ -1254,6 +1400,10 @@ impl GitHubBootstrapCacheStore {
 }
 
 impl CacheStore for GitHubBootstrapCacheStore {
+    fn allows_payload_fallback(&self, error: &CacheError) -> bool {
+        !self.required && error.skippable_candidate()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1273,11 +1423,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
         // Same degradation contract as key-based candidates: an optional
         // remote that is offline or invalid yields no candidates rather than
         // failing the run.
-        let resolved = if self.required {
-            self.resolve_identity(identity)?
-        } else {
-            self.resolve_identity(identity).unwrap_or(None)
-        };
+        let resolved = self.optional_read(self.resolve_identity(identity))?;
         let Some(resolved) = resolved else {
             return Ok(Vec::new());
         };
@@ -1306,6 +1452,10 @@ impl CacheStore for GitHubBootstrapCacheStore {
         if manifests.is_empty() {
             return Ok(());
         }
+        let _materialization = self
+            .materialization_gate
+            .lock()
+            .map_err(|_| CacheError::Io("reader materialization lock poisoned".to_owned()))?;
         let resolved = self
             .resolved
             .lock()
@@ -1340,6 +1490,9 @@ impl CacheStore for GitHubBootstrapCacheStore {
             .values()
             .flat_map(BTreeMap::values)
             .fold(0u64, |total, bytes| total.saturating_add(*bytes));
+        // Refuse an inadmissible batch before Git downloads its objects.
+        // Packages and extracted parts are budgeted separately at materialization.
+        self.check_session_disk_budget(prepared_bytes)?;
         let batches = batches
             .into_iter()
             .map(|((repository, revision), paths)| {
@@ -1413,17 +1566,13 @@ impl CacheStore for GitHubBootstrapCacheStore {
         // Remote reuse is an optimization for normal consumers. An offline,
         // unavailable, or invalid public source must safely degrade to a fresh
         // local computation rather than make the research script unusable.
-        let resolved = if self.required {
-            self.resolve(key)?
-        } else {
-            self.resolve(key).unwrap_or(None)
-        };
+        let resolved = self.optional_read(self.resolve(key))?;
         let Some(resolved) = resolved else {
             return Ok(Vec::new());
         };
         let adapter_manifest = self.adapter_manifest_for(key.clone(), &resolved)?;
         let assurance = resolved.index.achieved_assurance;
-        self.record_local_continuation_entry(
+        if let Err(error) = self.record_local_continuation_entry(
             &key.logical_key,
             &resolved.manifest,
             adapter_manifest
@@ -1432,7 +1581,9 @@ impl CacheStore for GitHubBootstrapCacheStore {
                 .expect("remote adapter records canonical manifest identity"),
             assurance,
             resolved.index.disposition,
-        )?;
+        ) {
+            eprintln!("continuation inventory update skipped: {error}");
+        }
         self.remember_resolved(&adapter_manifest, resolved)?;
         Ok(vec![adapter_manifest])
     }
@@ -1519,11 +1670,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
                 .insert(cache_identity, keys.clone());
             Ok(keys)
         })();
-        if self.required {
-            result
-        } else {
-            Ok(result.unwrap_or_default())
-        }
+        self.optional_read(result)
     }
 
     fn read_payload_to(
@@ -2188,6 +2335,130 @@ mod tests {
     }
 
     #[test]
+    fn newer_shard_revocation_controls_key_and_exact_historical_reads() {
+        let root = crate::test_support::TestDir::new("cross-shard-revocation");
+        let artifact = resolved_fixture(&root, "historical", vec![]);
+        let key = ArtifactKey {
+            kind: artifact.manifest.semantic_key.artifact_kind.clone(),
+            logical_key: "fixture".into(),
+            parameters_digest: artifact.semantic_digest.clone(),
+        };
+        let id = PayloadDependencyIdentity {
+            artifact_family: artifact.family.clone(),
+            semantic_digest: artifact.semantic_digest.clone(),
+            manifest_digest: artifact.manifest.digest().unwrap(),
+            payload_digest: artifact.manifest.payload_digest.clone(),
+        };
+        let historical = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "fixture/older".into(),
+            repository_url: "older-fixture".into(),
+            shard_id: "older".into(),
+            sequence: 1,
+            writable: false,
+        };
+        let active = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "fixture/current".into(),
+            repository_url: "current-fixture".into(),
+            shard_id: "current".into(),
+            sequence: 2,
+            writable: true,
+        };
+        let prefix = &id.semantic_digest.0[..2];
+        let policy = RevocationIndexPartition {
+            schema_version: 1,
+            identity_prefix: prefix.into(),
+            records: vec![RevocationRecord {
+                schema_version: 1,
+                scope: RevocationScope::Semantic,
+                identity_digest: id.semantic_digest.clone(),
+                reason: "withdrawn".into(),
+                effective_unix_seconds: 0,
+                replacement_digest: None,
+                incident_reference: None,
+                authorizing_evidence_digest: ContentDigest::sha256(b"withdrawal"),
+            }],
+        };
+        let revision = "a".repeat(40);
+        for corrupt in [false, true] {
+            let store = GitHubBootstrapCacheStore::new(
+                "fixture",
+                root.join("metadata"),
+                CacheVisibility::Private,
+                true,
+            )
+            .unwrap();
+            store.family_topologies.lock().unwrap().insert(
+                id.artifact_family.clone(),
+                crate::bootstrap_topology::BootstrapFamilyTopology {
+                    family: id.artifact_family.clone(),
+                    visibility: CacheVisibility::Private,
+                    current_writable: active.clone(),
+                    readable_shards: vec![active.clone(), historical.clone()],
+                },
+            );
+            for shard in [&active, &historical] {
+                store
+                    .shard_revisions
+                    .lock()
+                    .unwrap()
+                    .insert(shard.repository_url.clone(), revision.clone());
+            }
+            let index = ShardIndexPartition::rebuild(
+                id.artifact_family.clone(),
+                prefix,
+                vec![artifact.index.clone()],
+            )
+            .unwrap();
+            let empty_index =
+                ShardIndexPartition::rebuild(id.artifact_family.clone(), prefix, vec![]).unwrap();
+            let mut docs = store.metadata_documents.lock().unwrap();
+            for (repo, path, bytes) in [
+                (
+                    &active.repository_url,
+                    format!("indexes/{}/{prefix}.json", id.artifact_family),
+                    canonical_json_bytes(&empty_index).unwrap(),
+                ),
+                (
+                    &historical.repository_url,
+                    format!("indexes/{}/{prefix}.json", id.artifact_family),
+                    canonical_json_bytes(&index).unwrap(),
+                ),
+                (
+                    &active.repository_url,
+                    format!("revocations/indexes/{prefix}.json"),
+                    if corrupt {
+                        b"{".to_vec()
+                    } else {
+                        canonical_json_bytes(&policy).unwrap()
+                    },
+                ),
+            ] {
+                let source = RemoteReadReport {
+                    repository_path: path.clone(),
+                    revision: revision.clone(),
+                    size_bytes: bytes.len() as u64,
+                    content_digest: ContentDigest::sha256(&bytes),
+                };
+                docs.documents.insert(
+                    (repo.clone(), revision.clone(), path),
+                    (Arc::from(bytes), source),
+                );
+            }
+            drop(docs);
+            for result in [store.resolve(&key), store.resolve_identity(&id)] {
+                if corrupt {
+                    assert!(
+                        matches!(result, Err(CacheError::PermissionDenied(ref message)) if message.contains("current-fixture")),
+                        "{result:?}"
+                    );
+                } else {
+                    assert!(matches!(result, Ok(None)), "{result:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bootstrap_revocations_block_active_and_unindexed_historical_reads() {
         let root = fresh_fixture_root("xc-bootstrap-revocation-audit");
         let artifact = resolved_fixture(&root, "revoked-history", Vec::new());
@@ -2775,6 +3046,37 @@ mod tests {
     }
 
     #[test]
+    fn reader_budget_is_temporary_and_refuses_prefetch_before_network() {
+        let scratch = crate::test_support::TestDir::new("reader-prefetch-budget");
+        let mut store =
+            GitHubBootstrapCacheStore::public("fixture-owner", scratch.join("store")).unwrap();
+        let artifact = resolved_fixture(&scratch.join("artifact"), "a", Vec::new());
+        let key = ArtifactKey {
+            kind: artifact.manifest.semantic_key.artifact_kind.clone(),
+            logical_key: "fixture".into(),
+            parameters_digest: artifact.semantic_digest.clone(),
+        };
+        let adapter = store.adapter_manifest_for(key, &artifact).unwrap();
+        store.remember_resolved(&adapter, artifact.clone()).unwrap();
+        store.resources.maximum_permanent_disk_bytes = Some(0);
+        store.resources.maximum_temporary_disk_bytes = Some(u64::MAX);
+        store.check_session_disk_budget(1).unwrap();
+        let existing = crate::git_transport::directory_size_bytes(&store.root).unwrap();
+        store.resources.maximum_temporary_disk_bytes = Some(existing);
+        // The synthetic remote is unreachable; a network call would give a
+        // different failure. Capacity must refuse the transfer first.
+        let error = store.prefetch_manifests(&[adapter]).unwrap_err();
+        assert!(matches!(error, CacheError::ResourceLimit(_)), "{error}");
+        assert!(error
+            .to_string()
+            .contains("configured temporary-disk limit"));
+        assert_eq!(
+            crate::git_transport::directory_size_bytes(&store.root).unwrap(),
+            existing
+        );
+    }
+
+    #[test]
     fn dependency_prefetch_skips_locally_available_packages_and_parts() {
         let scratch = crate::test_support::TestDir::new("bootstrap-local-prefetch");
         let root = scratch.join("root");
@@ -3058,6 +3360,25 @@ mod tests {
         assert_eq!(staged[0].manifest, resolved.manifest);
         assert_eq!(staged[0].encoding, resolved.encoding);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn optional_bootstrap_reads_enforce_operator_pins_and_permission_failures() {
+        let scratch = crate::test_support::TestDir::new("bootstrap-pinned");
+        let mut store = GitHubBootstrapCacheStore::public("example", scratch.join("root")).unwrap();
+        let url = "https://github.com/example/shard.git";
+        let revision = "a".repeat(40);
+        store.read_pins = Some(BTreeMap::from([(url.to_owned(), revision.clone())]));
+        assert_eq!(store.shard_revision(url).unwrap(), revision);
+        let result = store.shard_revision("https://github.com/example/unlisted.git");
+        assert!(matches!(
+            store.optional_read(result),
+            Err(CacheError::PermissionDenied(_))
+        ));
+        assert!(store
+            .optional_read::<Option<String>>(Err(CacheError::NotFound("offline".into())))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -643,16 +643,16 @@ pub fn tridiag_selected_eigenvalues_hp(
             "selected HP tridiagonal maximum_iterations must be positive"
         ));
     }
-    let tolerance = Float::with_val(prec, absolute_tolerance);
+    let tolerance = Float::with_val_round(prec, absolute_tolerance, rug::float::Round::Down).0;
+    if !tolerance.is_finite() || tolerance <= 0 {
+        return Err(anyhow!(
+            "HP tolerance is not representable at working precision"
+        ));
+    }
     let (global_lower, global_upper) = tridiag_gershgorin_bounds_hp(diag, off_diag, prec);
     if !global_lower.is_finite() || !global_upper.is_finite() || global_lower >= global_upper {
         return Err(anyhow!(
             "HP Gershgorin bounds exceed the finite representable range"
-        ));
-    }
-    if !tolerance.is_finite() || tolerance <= 0 {
-        return Err(anyhow!(
-            "HP tolerance is not representable at working precision"
         ));
     }
     let global_lower_count =
@@ -681,7 +681,7 @@ pub fn tridiag_selected_eigenvalues_hp(
             let mut guided = false;
             loop {
                 let (width, _) = Float::with_val_round(prec, &upper - &lower, rug::float::Round::Up);
-                if width <= *absolute_tolerance {
+                if width <= tolerance {
                     break;
                 }
                 if iterations == maximum_iterations {
@@ -695,7 +695,7 @@ pub fn tridiag_selected_eigenvalues_hp(
                         index,
                         &lower,
                         &upper,
-                        absolute_tolerance,
+                        &tolerance,
                         prec,
                     );
                 }
@@ -1200,7 +1200,7 @@ pub fn tridiag_eigenvector_for_value_hp(
     prec: u32,
     opts: TridiagEigvecOptions,
 ) -> Result<Vec<Float>> {
-    tridiag_eigenvector_with_shift_error(diag, off_diag, eigenvalue, prec, opts, None, false)
+    tridiag_eigenvector_with_shift_error(diag, off_diag, eigenvalue, prec, opts, None)
 }
 
 /// Recover a vector when the requested eigenvalue has a supplied absolute
@@ -1227,7 +1227,6 @@ pub fn tridiag_eigenvector_for_value_with_uncertainty_hp(
         prec,
         opts,
         Some(eigenvalue_uncertainty),
-        false,
     )
 }
 
@@ -1238,7 +1237,6 @@ fn tridiag_eigenvector_with_shift_error(
     prec: u32,
     opts: TridiagEigvecOptions,
     shift_error: Option<&Float>,
-    _roundoff_shift: bool,
 ) -> Result<Vec<Float>> {
     Ok(tridiag_eigenvector_for_value_detailed_hp(
         diag,

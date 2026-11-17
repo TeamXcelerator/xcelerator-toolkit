@@ -51,6 +51,7 @@ fn inverse_iteration_rejects_non_symmetric_and_non_invariant_even_requests() {
 #[test]
 fn retained_inverse_iteration_rejects_overflowing_dimensions_without_panicking() {
     let factors = LuFactors {
+        schur_execution: None,
         lu: vec![],
         perm: vec![],
     };

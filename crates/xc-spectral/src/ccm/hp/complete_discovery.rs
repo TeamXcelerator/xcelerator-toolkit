@@ -831,6 +831,14 @@ mod tests {
 /// check is not root isolation, ordinal proof, or completeness evidence; those
 /// claims require the separate exact-source discovery/certificate route.
 pub(super) fn validate_assignment(roots: &[EigenvalueResult], seeds: &[Float]) -> Result<()> {
+    let values: Vec<_> = roots.iter().map(EigenvalueResult::value).collect();
+    validate_assignment_values(&values, seeds)
+}
+
+pub(in crate::ccm) fn validate_assignment_values(
+    roots: &[Option<&Float>],
+    seeds: &[Float],
+) -> Result<()> {
     if roots.len() != seeds.len() || seeds.windows(2).any(|s| s[0] >= s[1]) {
         bail!("complete root assignment needs matching counts and strictly increasing seeds");
     }
@@ -839,30 +847,41 @@ pub(super) fn validate_assignment(roots: &[EigenvalueResult], seeds: &[Float]) -
     // Charge the retained seed rationals and conservative scalar scratch before
     // conversion, with ownership lasting through the last exact comparison.
     let bytes = boundary::rational_point_vector_workspace(
-        seeds
-            .iter()
-            .chain(roots.iter().filter_map(EigenvalueResult::value)),
+        seeds.iter().chain(roots.iter().filter_map(|value| *value)),
     )?;
     let resources = xc_core::RunResources::current();
     let maximum = resources
         .as_ref()
         .map_or(8u128 << 30, |r| u128::from(r.maximum_bytes()));
     if bytes > maximum {
-        bail!("exact root assignment exceeds the point workspace budget: required_bytes={bytes}, maximum_working_bytes={maximum}");
+        return Err(xc_cache::CacheError::ResourceLimit(format!("exact root assignment exceeds the point workspace budget: required_bytes={bytes}, maximum_working_bytes={maximum}")).into());
     }
     let _reservation = resources
         .as_ref()
-        .map(|r| r.try_reserve_working(bytes as u64))
+        .map(|r| {
+            r.try_reserve_working(bytes as u64)
+                .map_err(|err| xc_cache::CacheError::ResourceLimit(err.to_string()))
+        })
         .transpose()?;
     let seeds = seeds
         .iter()
         .map(|v| v.to_rational().expect("validated finite seed"))
         .collect::<Vec<_>>();
+    let mut previous = None;
     for (j, root) in roots.iter().enumerate() {
-        let Some(value) = root.value() else {
+        let Some(value) = *root else {
             continue;
         };
-        let value = value.to_rational().expect("validated finite root");
+        let bits = value.prec();
+        let accuracy = bits.saturating_sub(GUARD_BITS).max(bits / 2).max(2);
+        let rounded = Float::with_val(accuracy, value);
+        if previous.as_ref().is_some_and(|prior| rounded <= *prior) {
+            bail!("root ordinals are indistinguishable at the retained numerical accuracy");
+        }
+        previous = Some(rounded);
+        let value = value
+            .to_rational()
+            .ok_or_else(|| anyhow::anyhow!("nonfinite root"))?;
         let distance = (value.clone() - &seeds[j]).abs();
         for neighbor in [j.checked_sub(1), (j + 1 < seeds.len()).then_some(j + 1)]
             .into_iter()

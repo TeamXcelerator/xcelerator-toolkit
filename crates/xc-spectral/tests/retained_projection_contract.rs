@@ -64,6 +64,101 @@ fn reference(coefficients: &[&str]) -> ReferenceSpec {
             .into(),
     }
 }
+#[test]
+fn projection_reuses_canonical_reference_identity_and_preserves_ordered_basis() {
+    let primary = capture_reference(&reference(&["1", "3", "0"]), &context())
+        .unwrap()
+        .value;
+    let raw = serde_json::to_vec(&primary).unwrap();
+    let mut value = serde_json::to_value(&primary).unwrap();
+    value.sort_all_objects();
+    assert_eq!(raw, serde_json::to_vec(&value).unwrap());
+    let alternate = format!(
+        "{{\"semantics\":{},\"scope\":{},\"schema_version\":2,\"kind\":{},\"data\":{}}}",
+        value["semantics"], value["scope"], value["kind"], value["data"]
+    )
+    .into_bytes();
+    assert_ne!(alternate, raw);
+    let admit = |bytes: &[u8]| {
+        let (mut m, _) = source("ccm_reference_source", value.clone());
+        m.content_digest = ContentDigest::sha256(bytes);
+        m.size_bytes = bytes.len() as u64;
+        m.objects[0] = CacheObjectRef {
+            content_digest: m.content_digest.clone(),
+            size_bytes: m.size_bytes,
+        };
+        RetainedReference::from_payload(&m, bytes, std::slice::from_ref(&m.content_digest)).unwrap()
+    };
+    let a = admit(&raw);
+    let b = admit(&alternate);
+    let c = retained_reference(&reference(&["0", "3", "1"]));
+    let (state, _) = state(&["1", "2", "3"], "1");
+    let options = ProjectionOptions {
+        working_precision_bits: 128,
+        normalization: "unit_l2_dx".into(),
+        fixed_second_component: None,
+    };
+    let project = |r: &RetainedReference, basis: &[RetainedReference]| {
+        capture_projection(&state, r, basis, &options, &context()).unwrap()
+    };
+    let first = project(&a, &[a.clone(), c.clone()]);
+    let reordered = project(&b, &[b.clone(), c.clone()]);
+    assert_eq!(
+        first.access.semantic_digest,
+        reordered.access.semantic_digest
+    );
+    assert_eq!(
+        serde_json::to_vec(&first.value).unwrap(),
+        serde_json::to_vec(&reordered.value).unwrap()
+    );
+    assert_ne!(
+        first.access.semantic_digest,
+        project(&c, &[a.clone(), c.clone()]).access.semantic_digest
+    );
+    assert_ne!(
+        first.access.semantic_digest,
+        project(&a, &[c.clone(), b.clone()]).access.semantic_digest
+    );
+    let dir = xc_core::test_support::TestDir::new("reference-projection-reuse");
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(FilesystemCacheStore::new(
+            "local",
+            dir.to_path_buf(),
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let mut cache = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        acceptance: Some(&policy),
+        ordered_overlays: vec!["local".into()],
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        ..context()
+    };
+    let produced = capture_projection(&state, &a, &[], &options, &cache)
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+    cache.mode = ArtifactExecutionCacheMode::RequireReuse;
+    cache.write_on_miss = false;
+    let reused = capture_projection(&state, &b, &[], &options, &cache)
+        .unwrap()
+        .reused_manifest
+        .unwrap();
+    assert_eq!(produced, reused);
+    assert!(capture_projection(&state, &c, &[], &options, &cache).is_err());
+}
+
 fn retained_reference(spec: &ReferenceSpec) -> RetainedReference {
     let value = capture_reference(spec, &context()).unwrap().value;
     let (m, b) = source("ccm_reference_source", serde_json::to_value(value).unwrap());
@@ -299,8 +394,8 @@ fn roots_at(values: &[Option<&str>]) -> RetainedRoots {
         })
         .collect::<Vec<_>>();
     let (mut rm, rb) = source(
-        "ccm_root_refinement",
-        json!({"schema_version":5,"lambda_squared":"9","n_modes":1,"precision_bits":128,"force_even":true,"first_root_index":1,"discovery_mode":"reference_seeded_audit","reference_seeds_used":true,"completeness":"partial","outcomes":outcomes}),
+        "ccm_root_discovery_window",
+        json!({"schema_version":5,"lambda_squared":"9","n_modes":1,"precision_bits":128,"force_even":true,"first_root_index":1,"discovery_mode":"independent","reference_seeds_used":false,"completeness":"partial","outcomes":outcomes}),
     );
     rm.dependencies.push(dep(&sec));
     let allowed = [

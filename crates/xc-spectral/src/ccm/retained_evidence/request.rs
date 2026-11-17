@@ -55,7 +55,13 @@ parameters!(CohortSource {
 });
 parameters!(CohortMember {state:CohortSource,roots:Option<CohortSource>});
 parameters!(CohortPair {left:usize,right:usize,root_ordinals:Vec<usize>,embedded_residual:bool});
-parameters!(ExplicitCohort {semantics:String,members:Vec<CohortMember>,pairs:Vec<CohortPair>,policy_digests:Vec<ContentDigest>});
+parameters!(ExplicitCohort {
+    semantics: String,
+    members: Vec<CohortMember>,
+    pairs: Vec<CohortPair>,
+    matrices: Vec<CohortSource>,
+    policy_digests: Vec<ContentDigest>
+});
 parameters!(RootBand {
     rule: String,
     precision_bits: u32
@@ -424,7 +430,17 @@ impl RetainedRequest {
                     None if value.get("semantics").and_then(Value::as_str)
                         == Some(crate::ccm::explicit_cohort::SEMANTICS) =>
                     {
-                        Parameters::ExplicitCohort(serde_json::from_value(value.clone())?)
+                        let request: ExplicitCohort = serde_json::from_value(value.clone())?;
+                        anyhow::ensure!(
+                            request.matrices.len() == request.members.len()
+                                && request.policy_digests.len() == request.members.len()
+                                && request.policy_digests.iter().all(ContentDigest::validate)
+                                && request.matrices.iter().all(|m| {
+                                    m.kind == "ccm_tau_matrix" && m.payload_digest.validate()
+                                }),
+                            "cohort request must bind one Tau payload and policy per member"
+                        );
+                        Parameters::ExplicitCohort(request)
                     }
                     _ => bail!("finite diagnostic has no typed request contract"),
                 }

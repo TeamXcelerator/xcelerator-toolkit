@@ -233,7 +233,7 @@ pub struct CanonicalStagingProductionSink {
     /// Exact artifacts touched by this process. Existing drafts loaded from a
     /// prior process are deliberately not counted: remote execution must not
     /// succeed merely because stale staging happens to be nonempty.
-    observed_artifacts: Mutex<BTreeSet<String>>,
+    observed_artifacts: Mutex<BTreeSet<usize>>,
     /// Deliberately process-local. A reopened staging directory must walk its
     /// closure once so an interrupted predecessor cannot masquerade as a
     /// complete staging run.
@@ -252,6 +252,9 @@ struct DraftInventory {
     // matching index and select deterministically by quality then source
     // manifest identity when an older key-based API cannot name the closure.
     by_source: HashMap<String, BTreeSet<usize>>,
+    // A research receipt uses identity/<semantic digest> across workstations.
+    // Index the canonical candidates without treating their closures as equal.
+    by_semantic: HashMap<ContentDigest, Vec<usize>>,
 }
 
 impl DraftInventory {
@@ -280,6 +283,10 @@ impl DraftInventory {
             &draft.manifest.payload_digest,
         );
         self.by_identity.entry(identity).or_insert(index);
+        self.by_semantic
+            .entry(draft.manifest.semantic_digest.clone())
+            .or_default()
+            .push(index);
         self.by_source
             .entry(Self::source_key(
                 &draft.source_artifact_key,
@@ -328,7 +335,7 @@ impl DraftInventory {
         content_digest: &ContentDigest,
         minimum_quality: Option<crate::CacheQuality>,
     ) -> Option<&CanonicalProductionDraft> {
-        self.preferred_source_index(key, content_digest, minimum_quality)
+        self.preferred_source_index(key, content_digest, minimum_quality, |_| true)
             .map(|index| &self.drafts[index])
     }
 
@@ -337,16 +344,18 @@ impl DraftInventory {
         key: &ArtifactKey,
         content_digest: &ContentDigest,
         minimum_quality: Option<crate::CacheQuality>,
+        accepts: impl Fn(&CanonicalProductionDraft) -> bool,
     ) -> Option<usize> {
         let indices = self.by_source.get(&Self::source_key(key, content_digest))?;
         indices
             .iter()
             .filter(|index| {
-                minimum_quality.is_none_or(|minimum| {
-                    self.drafts[**index]
-                        .source_quality
-                        .is_some_and(|quality| quality.satisfies(minimum))
-                })
+                accepts(&self.drafts[**index])
+                    && minimum_quality.is_none_or(|minimum| {
+                        self.drafts[**index]
+                            .source_quality
+                            .is_some_and(|quality| quality.satisfies(minimum))
+                    })
             })
             .min_by(|left, right| {
                 let left = &self.drafts[**left];
@@ -413,7 +422,50 @@ trait DependencyDraftLookup {
         key: &ArtifactKey,
         content_digest: &ContentDigest,
         minimum_quality: crate::CacheQuality,
-    ) -> Option<&CanonicalProductionDraft>;
+    ) -> Result<Option<&CanonicalProductionDraft>, CacheError>;
+}
+
+fn is_research_identity(key: &ArtifactKey) -> bool {
+    key.logical_key.strip_prefix("identity/") == Some(key.parameters_digest.0.as_str())
+}
+
+fn research_dependency_draft<'a>(
+    candidates: impl Iterator<Item = &'a CanonicalProductionDraft>,
+    key: &ArtifactKey,
+    content_digest: &ContentDigest,
+    minimum_quality: crate::CacheQuality,
+) -> Result<Option<&'a CanonicalProductionDraft>, CacheError> {
+    let mut selected: Option<&CanonicalProductionDraft> = None;
+    for draft in candidates {
+        if draft.manifest.semantic_key.artifact_kind != key.kind
+            || draft.manifest.semantic_digest != key.parameters_digest
+            || draft.source_content_digest != *content_digest
+            || !draft
+                .source_quality
+                .is_some_and(|q| q.satisfies(minimum_quality))
+        {
+            continue;
+        }
+        // Bind the operational source fields to the canonical logical item.
+        // The transport digest is a digest of the packaged representation.
+        if draft.source_artifact_key.kind != key.kind
+            || draft.source_artifact_key.parameters_digest != key.parameters_digest
+            || !matches!(draft.manifest.canonical_payload.ordered_items.as_slice(),
+                [item] if item.normalized_path == "payload.json" && item.content_digest == *content_digest)
+        {
+            return Err(CacheError::InvalidManifest(
+                "staged research source disagrees with its canonical manifest".into(),
+            ));
+        }
+        if selected.is_some_and(|prior| prior.manifest != draft.manifest) {
+            return Err(CacheError::InvalidManifest(format!(
+                "ambiguous research dependency {} / {} with content {} has distinct canonical manifests",
+                key.kind, key.logical_key, content_digest
+            )));
+        }
+        selected = Some(draft);
+    }
+    Ok(selected)
 }
 
 impl DependencyDraftLookup for &[CanonicalProductionDraft] {
@@ -422,8 +474,12 @@ impl DependencyDraftLookup for &[CanonicalProductionDraft] {
         key: &ArtifactKey,
         content_digest: &ContentDigest,
         minimum_quality: crate::CacheQuality,
-    ) -> Option<&CanonicalProductionDraft> {
-        self.iter()
+    ) -> Result<Option<&CanonicalProductionDraft>, CacheError> {
+        if is_research_identity(key) {
+            return research_dependency_draft(self.iter(), key, content_digest, minimum_quality);
+        }
+        Ok(self
+            .iter()
             .filter(|draft| {
                 &draft.source_artifact_key == key
                     && &draft.source_content_digest == content_digest
@@ -445,7 +501,7 @@ impl DependencyDraftLookup for &[CanonicalProductionDraft] {
                             .0
                             .cmp(&right.source_manifest_digest.0)
                     })
-            })
+            }))
     }
 }
 
@@ -455,9 +511,42 @@ impl DependencyDraftLookup for DraftInventory {
         key: &ArtifactKey,
         content_digest: &ContentDigest,
         minimum_quality: crate::CacheQuality,
-    ) -> Option<&CanonicalProductionDraft> {
-        self.find_by_source_with_quality(key, content_digest, Some(minimum_quality))
+    ) -> Result<Option<&CanonicalProductionDraft>, CacheError> {
+        if is_research_identity(key) {
+            let indices = self.by_semantic.get(&key.parameters_digest);
+            return research_dependency_draft(
+                indices
+                    .into_iter()
+                    .flatten()
+                    .map(|&index| &self.drafts[index]),
+                key,
+                content_digest,
+                minimum_quality,
+            );
+        }
+        Ok(self.find_by_source_with_quality(key, content_digest, Some(minimum_quality)))
     }
+}
+
+fn canonical_dependency_identities(
+    dependencies: &[crate::DependencyRef],
+    drafts: &dyn DependencyDraftLookup,
+) -> Result<Vec<crate::PayloadDependencyIdentity>, CacheError> {
+    let mut identities = Vec::with_capacity(dependencies.len());
+    for dep in dependencies {
+        let draft = drafts
+            .dependency_draft(&dep.key, &dep.content_digest, dep.required_quality)?
+            .ok_or_else(|| {
+                CacheError::NotFound(format!(
+                    "canonical dependency draft meeting {:?} is missing for {} / {} / {}",
+                    dep.required_quality, dep.key.kind, dep.key.logical_key, dep.content_digest
+                ))
+            })?;
+        identities.push(crate::source_binding::identity(&draft.manifest)?);
+    }
+    identities.sort_unstable();
+    identities.dedup();
+    Ok(identities)
 }
 
 /// Where the logical payload bytes of a staging record come from.
@@ -754,17 +843,17 @@ fn validate_reopened_draft_location(
 }
 
 /// Select the transport identity already authorized by a retained manifest.
-/// The short-lived first v0.14.2 build tagged unchanged single-entry ZIP bytes
-/// as V2. If those exact bytes and parts reproduce a published V1 transport
-/// digest, retain the published label instead of creating a duplicate identity.
+/// Older producers and migrations used either supported schema for unique
+/// parts, and either ZIP profile label for single-entry packages. Accept an
+/// alternate label only when the entire encoding, including exact package and
+/// ordered part identities, reproduces a digest authorized by the manifest.
 fn bind_retained_transport_encoding(
     canonical_payload: &CanonicalPayloadEnvelope,
     retained: &CanonicalArtifactManifest,
-    mut encoding: TransportEncodingRecord,
+    encoding: TransportEncodingRecord,
 ) -> Result<TransportEncodingRecord, CacheError> {
-    if retained.transport_digests.contains(&encoding.digest()?) {
-        return Ok(encoding);
-    }
+    encoding.validate()?;
+    let mut profiles = vec![encoding.encoder_profile.clone()];
     if canonical_payload.ordered_items.len() == 1 {
         let alternate_profile = match encoding.encoder_profile.as_str() {
             DETERMINISTIC_ZIP64_PROFILE_V1 => Some(DETERMINISTIC_ZIP64_PROFILE_V2),
@@ -772,9 +861,20 @@ fn bind_retained_transport_encoding(
             _ => None,
         };
         if let Some(alternate_profile) = alternate_profile {
-            encoding.encoder_profile = alternate_profile.to_owned();
-            if retained.transport_digests.contains(&encoding.digest()?) {
-                return Ok(encoding);
+            profiles.push(alternate_profile.to_owned());
+        }
+    }
+    for schema in [encoding.schema_version, 1, 2] {
+        for profile in &profiles {
+            let mut candidate = encoding.clone();
+            candidate.schema_version = schema;
+            candidate.encoder_profile = profile.clone();
+            // Schema 1 cannot describe repeated paths. Never downgrade such
+            // an encoding, even if a malformed retained digest asks for it.
+            if candidate.validate().is_ok()
+                && retained.transport_digests.contains(&candidate.digest()?)
+            {
+                return Ok(candidate);
             }
         }
     }
@@ -876,16 +976,47 @@ impl CanonicalStagingProductionSink {
             })
     }
 
-    fn mark_observed(&self, manifest: &ArtifactManifest) -> Result<(), CacheError> {
+    /// Only the exact records touched by this session and their staged dependencies.
+    pub fn observed_drafts(&self) -> Result<Vec<CanonicalProductionDraft>, CacheError> {
+        let inventory = self
+            .drafts
+            .lock()
+            .map_err(|_| CacheError::Io("staging inventory lock poisoned".into()))?;
+        let mut selected = self
+            .observed_artifacts
+            .lock()
+            .map_err(|_| CacheError::Io("staging observation lock poisoned".into()))?
+            .clone();
+        let mut pending: Vec<_> = selected.iter().copied().collect();
+        while let Some(index) = pending.pop() {
+            for edge in &inventory.drafts[index]
+                .manifest
+                .canonical_payload
+                .dependencies
+            {
+                if let Some(parent) = inventory.find_identity_index(
+                    &edge.artifact_family,
+                    &edge.semantic_digest,
+                    &edge.manifest_digest,
+                    &edge.payload_digest,
+                ) {
+                    if selected.insert(parent) {
+                        pending.push(parent);
+                    }
+                }
+            }
+        }
+        Ok(selected
+            .into_iter()
+            .map(|i| inventory.drafts[i].clone())
+            .collect())
+    }
+
+    fn mark_observed(&self, index: usize) -> Result<(), CacheError> {
         self.observed_artifacts
             .lock()
-            .map_err(|_| {
-                CacheError::Io("canonical staging observation lock is poisoned".to_owned())
-            })?
-            .insert(DraftInventory::source_key(
-                &manifest.key,
-                &manifest.content_digest,
-            ));
+            .map_err(|_| CacheError::Io("staging observation lock poisoned".into()))?
+            .insert(index);
         Ok(())
     }
 
@@ -911,32 +1042,6 @@ impl CanonicalStagingProductionSink {
             .drafts
             .lock()
             .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
-        // A warm source shortcut must not erase a newly supplied operational
-        // dependency requirement. Check it before returning an existing draft.
-        if !record
-            .manifest
-            .tags
-            .contains_key(REMOTE_CANONICAL_MANIFEST_TAG)
-        {
-            for dependency in &record.manifest.dependencies {
-                if inventory
-                    .dependency_draft(
-                        &dependency.key,
-                        &dependency.content_digest,
-                        dependency.required_quality,
-                    )
-                    .is_none()
-                {
-                    return Err(CacheError::NotFound(format!(
-                        "canonical dependency draft meeting {:?} is missing for {} / {} / {}",
-                        dependency.required_quality,
-                        dependency.key.kind,
-                        dependency.key.logical_key,
-                        dependency.content_digest,
-                    )));
-                }
-            }
-        }
         // Deduplicate by exact published identity as well as by source key.
         // The key-based and identity-based closure walks can meet on a
         // diamond: the same artifact staged first through an identity
@@ -956,9 +1061,7 @@ impl CanonicalStagingProductionSink {
                 &canonical,
                 record.semantic_key,
                 family,
-                &record.manifest.content_digest,
-                record.manifest.size_bytes,
-                record.manifest.provenance_digest.as_ref(),
+                record.manifest,
             )?;
             let manifest_digest = canonical.digest()?;
             if let Some(index) = inventory
@@ -977,9 +1080,16 @@ impl CanonicalStagingProductionSink {
                 let existing = &inventory.drafts[index];
                 // Prefer real adapter provenance over a synthetic identity
                 // closure key when the key-based walk later reaches it.
-                if existing.source_operation == "cache.dependency.closure"
+                if (existing.source_operation == "cache.dependency.closure"
                     && record.operation != "cache.dependency.closure"
-                    && existing.source_artifact_key != record.manifest.key
+                    && existing.source_artifact_key != record.manifest.key)
+                    || (matches!(
+                        existing.source_operation.as_str(),
+                        "cache.dependency.closure" | "cache.dependency.resolve"
+                    ) && !matches!(
+                        record.operation,
+                        "cache.dependency.closure" | "cache.dependency.resolve"
+                    ))
                 {
                     let mut promoted = existing.clone();
                     promoted.source_operation = record.operation.to_owned();
@@ -1000,32 +1110,26 @@ impl CanonicalStagingProductionSink {
                     crate::atomic_replace(&draft_path, &serde_json::to_vec_pretty(&promoted)?)?;
                     inventory.replace(index, promoted);
                 }
-                self.mark_observed(record.manifest)?;
+                self.mark_observed(index)?;
                 return Ok(());
             }
-        }
-        // A retained canonical identity is stronger than the adapter's local
-        // source key. Two published artifacts may intentionally have the same
-        // semantic key and payload.json bytes while carrying different exact
-        // dependency closures. Their adapter manifests then share one source
-        // key/content pair, but their canonical payload and manifest digests
-        // differ. Only use the source shortcut for artifacts that do not
-        // carry a retained published identity; the identity block above has
-        // already handled every legitimate duplicate on the remote route.
-        if !record
-            .manifest
-            .tags
-            .contains_key(REMOTE_CANONICAL_MANIFEST_TAG)
-            && inventory
-                .find_by_source_with_quality(
-                    &record.manifest.key,
-                    &record.manifest.content_digest,
-                    Some(record.manifest.quality),
-                )
-                .is_some()
+        } else if inventory
+            .find_by_source(&record.manifest.key, &record.manifest.content_digest)
+            .is_some()
         {
-            self.mark_observed(record.manifest)?;
-            return Ok(());
+            // A native source key and its item bytes can survive a change of
+            // ancestry. Reuse a staged child only with the requested parents.
+            let parents =
+                canonical_dependency_identities(&record.manifest.dependencies, &*inventory)?;
+            if let Some(index) = inventory.preferred_source_index(
+                &record.manifest.key,
+                &record.manifest.content_digest,
+                Some(record.manifest.quality),
+                |draft| draft.manifest.canonical_payload.dependencies == parents,
+            ) {
+                self.mark_observed(index)?;
+                return Ok(());
+            }
         }
         let draft = stage_record(
             record,
@@ -1039,8 +1143,9 @@ impl CanonicalStagingProductionSink {
             &self.resources,
             &self.cancellation,
         )?;
+        let index = inventory.drafts.len();
         inventory.push(draft)?;
-        self.mark_observed(record.manifest)?;
+        self.mark_observed(index)?;
         Ok(())
     }
 }
@@ -1133,9 +1238,7 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
             .drafts
             .lock()
             .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
-        let Some(draft) =
-            inventory.find_by_source_with_quality(key, content_digest, Some(minimum_quality))
-        else {
+        let Some(draft) = inventory.dependency_draft(key, content_digest, minimum_quality)? else {
             return Ok(None);
         };
         draft.manifest.validate()?;
@@ -1749,7 +1852,12 @@ fn stage_record(
         .resolved_mathematical_parameters
         .get("scalar_backend")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("canonical_json")
+        .unwrap_or(match record.semantic_key.artifact_kind.as_str() {
+            "ccm_root_discovery_window" | "ccm_root_refinement" | "ccm_secular_source" => {
+                "rug_mpfr"
+            }
+            _ => "canonical_json",
+        })
         .to_owned();
     let retained_remote_manifest = record
         .manifest
@@ -1773,9 +1881,7 @@ fn stage_record(
             remote,
             record.semantic_key,
             family,
-            &logical_digest,
-            logical_size_bytes,
-            record.manifest.provenance_digest.as_ref(),
+            record.manifest,
         )?;
         if remote.semantic_digest != semantic_digest {
             return Err(CacheError::InvalidManifest(
@@ -1785,44 +1891,6 @@ fn stage_record(
         }
         remote.canonical_payload.clone()
     } else {
-        let mut dependencies = Vec::new();
-        for dependency in &record.manifest.dependencies {
-            let draft = dependency_drafts
-                .dependency_draft(
-                    &dependency.key,
-                    &dependency.content_digest,
-                    dependency.required_quality,
-                )
-                .ok_or_else(|| {
-                    CacheError::NotFound(format!(
-                        "canonical dependency draft meeting {:?} is missing for {} / {} / {}",
-                        dependency.required_quality,
-                        dependency.key.kind,
-                        dependency.key.logical_key,
-                        dependency.content_digest
-                    ))
-                })?;
-            dependencies.push(crate::PayloadDependencyIdentity {
-                artifact_family: draft.family.clone(),
-                semantic_digest: draft.manifest.semantic_digest.clone(),
-                manifest_digest: draft.manifest.digest()?,
-                payload_digest: draft.manifest.payload_digest.clone(),
-            });
-        }
-        dependencies.sort_by(|left, right| {
-            (
-                &left.artifact_family,
-                &left.semantic_digest,
-                &left.manifest_digest,
-                &left.payload_digest,
-            )
-                .cmp(&(
-                    &right.artifact_family,
-                    &right.semantic_digest,
-                    &right.manifest_digest,
-                    &right.payload_digest,
-                ))
-        });
         CanonicalPayloadEnvelope {
             schema_version: produced_schema,
             scalar_backend,
@@ -1836,7 +1904,10 @@ fn stage_record(
                 content_digest: logical_digest.clone(),
                 size_bytes: logical_size_bytes,
             }],
-            dependencies,
+            dependencies: canonical_dependency_identities(
+                &record.manifest.dependencies,
+                dependency_drafts,
+            )?,
         }
     };
     let payload_digest = canonical_payload.digest()?;
@@ -2285,6 +2356,67 @@ mod tests {
     }
 
     #[test]
+    fn hp_secular_and_root_envelopes_have_a_stable_backend_without_a_key_override() {
+        let root = crate::test_support::TestDir::new("hp-source-envelope");
+        for kind in [
+            "ccm_secular_source",
+            "ccm_root_discovery_window",
+            "ccm_root_refinement",
+        ] {
+            let mut source = record();
+            source.semantic_key.artifact_kind = kind.into();
+            source.semantic_key.resolved_mathematical_parameters = json!({"precision_bits": 128});
+            source.manifest.key.kind = kind.into();
+            source.manifest.key.parameters_digest = source.semantic_key.digest().unwrap();
+            let staged = stage_produced_artifact(
+                &source,
+                &root,
+                &TransportPolicy::default(),
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(staged.manifest.canonical_payload.scalar_backend, "rug_mpfr");
+            assert_eq!(staged.manifest.canonical_payload.precision_bits, Some(128));
+        }
+    }
+
+    #[test]
+    fn reopened_staging_only_publishes_observed_drafts() {
+        use crate::ArtifactProductionSink;
+        let dir = crate::test_support::TestDir::new("staging-session");
+        let open = || {
+            CanonicalStagingProductionSink::new(
+                dir.to_path_buf(),
+                TransportPolicy::default(),
+                xc_core::ResourcePolicy::default(),
+                xc_core::CancellationToken::new(),
+            )
+            .unwrap()
+        };
+        let prior = open();
+        prior.record(record()).unwrap();
+        drop(prior);
+        let current = open();
+        assert!(current.observed_drafts().unwrap().is_empty());
+        let mut fresh = record();
+        fresh.payload.extend_from_slice(b" ");
+        fresh.manifest.size_bytes = fresh.payload.len() as u64;
+        fresh.manifest.content_digest = ContentDigest::sha256(&fresh.payload);
+        fresh.manifest.objects = vec![crate::CacheObjectRef {
+            size_bytes: fresh.manifest.size_bytes,
+            content_digest: fresh.manifest.content_digest.clone(),
+        }];
+        current.record(fresh).unwrap();
+        assert_eq!(current.drafts().unwrap().len(), 2);
+        assert_eq!(current.observed_drafts().unwrap().len(), 1);
+        assert_eq!(
+            current.observed_drafts().unwrap()[0].manifest,
+            current.drafts().unwrap().last().unwrap().manifest
+        );
+    }
+
+    #[test]
     fn schema_two_staging_reuses_content_across_exact_parent_producers() {
         let root = crate::test_support::temporary_root("content-model-staging");
         let mut parent = record();
@@ -2636,6 +2768,56 @@ mod tests {
             expected_v2
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retained_transport_reconciles_schema_only_for_authorized_exact_bytes() {
+        let scratch = crate::test_support::TestDir::new("transport-schema-reuse");
+        let draft = stage_produced_artifact(
+            &record(),
+            &scratch.join("original"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        for schema in [1, 2] {
+            for profile in [
+                DETERMINISTIC_ZIP64_PROFILE_V1,
+                DETERMINISTIC_ZIP64_PROFILE_V2,
+            ] {
+                let mut expected = draft.encoding.clone();
+                expected.schema_version = schema;
+                expected.encoder_profile = profile.into();
+                let mut manifest = draft.manifest.clone();
+                manifest.transport_digests = vec![expected.digest().unwrap()];
+                assert_eq!(
+                    bind_retained_transport_encoding(
+                        &manifest.canonical_payload,
+                        &manifest,
+                        draft.encoding.clone()
+                    )
+                    .unwrap(),
+                    expected
+                );
+                let mut corrupt = draft.encoding.clone();
+                corrupt.package_digest = ContentDigest::sha256(b"different bytes");
+                assert!(bind_retained_transport_encoding(
+                    &manifest.canonical_payload,
+                    &manifest,
+                    corrupt
+                )
+                .is_err());
+                let mut corrupt = draft.encoding.clone();
+                corrupt.ordered_parts[0].content_digest = ContentDigest::sha256(b"different part");
+                assert!(bind_retained_transport_encoding(
+                    &manifest.canonical_payload,
+                    &manifest,
+                    corrupt
+                )
+                .is_err());
+            }
+        }
     }
 
     #[test]
@@ -3651,6 +3833,200 @@ mod tests {
             Some(ArtifactAssuranceState::CrossChecked)
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_stages_research_identity_from_a_named_parent_and_reuses_after_reopen() {
+        use crate::{ArtifactExecutionCacheMode, ArtifactProductionSink};
+        let root = crate::test_support::TestDir::new("capture-staging");
+        let open = || {
+            CanonicalStagingProductionSink::new(
+                root.join("drafts-root"),
+                TransportPolicy::default(),
+                ResourcePolicy::default(),
+                CancellationToken::new(),
+            )
+            .unwrap()
+        };
+        let mut parent = record();
+        parent.manifest.tags.insert(
+            crate::SEMANTIC_KEY_MANIFEST_TAG.into(),
+            serde_json::to_string(&parent.semantic_key).unwrap(),
+        );
+        let sink = open();
+        sink.record(parent.clone()).unwrap();
+        let capture =
+            crate::collect_capture(&json!({"cutoff": 2}), vec!["spectrum".into()], |_| {
+                crate::CapturedDiagnostic::new(&json!(1), vec![parent.manifest.clone()])
+                    .map_err(crate::CaptureFailure::failed)
+            })
+            .unwrap();
+        assert_ne!(capture.source_dependencies[0].key, parent.manifest.key);
+        let resolver = crate::CacheResolver::new(vec![crate::CacheLayer {
+            precedence: 0,
+            store: Box::new(crate::FilesystemCacheStore::new(
+                "workstation",
+                root.join("cache"),
+                true,
+                crate::CacheVisibility::Local,
+            )),
+        }]);
+        let policy = crate::CachePolicy {
+            current_toolkit_version: crate::current_toolkit_version().unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![crate::CacheVisibility::Local],
+        };
+        let persist = |sink: &CanonicalStagingProductionSink, mode: ArtifactExecutionCacheMode| {
+            crate::persist_capture(
+                &capture,
+                &crate::ArtifactCacheContext {
+                    resolver: Some(&resolver),
+                    reference_resolver: None,
+                    acceptance: Some(&policy),
+                    ordered_overlays: vec!["workstation".into()],
+                    mode,
+                    write_on_miss: !mode.requires_reuse(),
+                    write_visibility: crate::CacheVisibility::Local,
+                    requested_assurance: AssuranceLevel::Computed,
+                    certification_failure_policy:
+                        crate::CertificationFailurePolicy::RetainComputedFailRun,
+                    production_sink: Some(sink),
+                },
+            )
+            .unwrap()
+        };
+        let cold = persist(&sink, ArtifactExecutionCacheMode::PreferReuse);
+        assert!(cold.produced_manifest.is_some());
+        let drafts = sink.drafts().unwrap();
+        assert_eq!(drafts.len(), 2);
+        assert_eq!(
+            drafts[1].manifest.canonical_payload.dependencies,
+            vec![crate::source_binding::identity(&drafts[0].manifest).unwrap()]
+        );
+        drop(sink);
+        let reopened = open();
+        let warm = persist(&reopened, ArtifactExecutionCacheMode::RequireReuse);
+        assert_eq!(cold.produced_manifest, warm.reused_manifest);
+        assert_eq!(reopened.drafts().unwrap().len(), 2);
+        assert_eq!(reopened.observed_drafts().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn research_alias_requires_exact_content_quality_and_one_canonical_manifest() {
+        let root = crate::test_support::TestDir::new("canonical-research-alias");
+        let source = record();
+        let parent = stage_produced_artifact(
+            &source,
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let named = crate::DependencyRef {
+            key: source.manifest.key.clone(),
+            content_digest: source.manifest.content_digest.clone(),
+            required_quality: CacheQuality::Validated,
+        };
+        let reference = crate::research_identity_dependency(&source.manifest);
+        let mut other = parent.clone();
+        other.source_artifact_key.logical_key = "another/label".into();
+        let candidates = [parent.clone(), other.clone()];
+        let one = canonical_dependency_identities(
+            &[reference.clone(), named.clone()],
+            &candidates.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            one,
+            vec![crate::source_binding::identity(&parent.manifest).unwrap()]
+        );
+        for bad in [
+            crate::DependencyRef {
+                required_quality: CacheQuality::Certified,
+                ..reference.clone()
+            },
+            crate::DependencyRef {
+                content_digest: ContentDigest::sha256(b"other bytes"),
+                ..reference.clone()
+            },
+            crate::DependencyRef {
+                key: ArtifactKey {
+                    kind: "other".into(),
+                    ..reference.key.clone()
+                },
+                ..reference.clone()
+            },
+            crate::DependencyRef {
+                key: ArtifactKey {
+                    logical_key: "identity/incorrect".into(),
+                    ..reference.key.clone()
+                },
+                ..reference.clone()
+            },
+        ] {
+            assert!(matches!(
+                canonical_dependency_identities(&[bad], &candidates.as_slice()),
+                Err(CacheError::NotFound(_))
+            ));
+        }
+        other.manifest.claim_scope = "different canonical provenance".into();
+        let variants = [parent, other];
+        let mut inventory = DraftInventory::default();
+        for draft in &variants {
+            inventory.push(draft.clone()).unwrap();
+        }
+        let slice = variants.as_slice();
+        for lookup in [&inventory as &dyn DependencyDraftLookup, &slice] {
+            let error = canonical_dependency_identities(std::slice::from_ref(&reference), lookup)
+                .unwrap_err();
+            assert!(error.to_string().contains("ambiguous research dependency"));
+            assert_eq!(
+                canonical_dependency_identities(std::slice::from_ref(&named), lookup).unwrap(),
+                one
+            );
+        }
+    }
+
+    #[test]
+    fn staged_child_with_equal_bytes_and_new_parent_is_bound_to_the_new_closure() {
+        use crate::ArtifactProductionSink;
+        let root = crate::test_support::TestDir::new("changed-parent");
+        let sink = CanonicalStagingProductionSink::new(
+            &*root,
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let mut parent = record();
+        parent.semantic_key.artifact_kind = "gauss_legendre_rule".into();
+        parent.manifest.key.kind = parent.semantic_key.artifact_kind.clone();
+        parent.manifest.key.parameters_digest = parent.semantic_key.digest().unwrap();
+        sink.record(parent.clone()).unwrap();
+        let mut child = record();
+        sink.record(child.clone()).unwrap();
+        child
+            .manifest
+            .dependencies
+            .push(crate::research_identity_dependency(&parent.manifest));
+        sink.record(child.clone()).unwrap();
+        sink.record(child).unwrap();
+        let drafts = sink.drafts().unwrap();
+        assert_eq!(drafts.len(), 3);
+        assert_eq!(drafts[1].source_artifact_key, drafts[2].source_artifact_key);
+        assert_eq!(
+            drafts[1].source_content_digest,
+            drafts[2].source_content_digest
+        );
+        assert!(drafts[1].manifest.canonical_payload.dependencies.is_empty());
+        assert_eq!(
+            drafts[2].manifest.canonical_payload.dependencies,
+            vec![crate::source_binding::identity(&drafts[0].manifest).unwrap()]
+        );
     }
 
     #[test]

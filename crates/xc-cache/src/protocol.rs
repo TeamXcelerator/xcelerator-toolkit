@@ -49,7 +49,7 @@ pub struct LogicalPayloadItem {
     pub size_bytes: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayloadDependencyIdentity {
     pub artifact_family: String,
@@ -137,12 +137,7 @@ impl CanonicalPayloadEnvelope {
             }
             previous_path = Some(&item.normalized_path);
         }
-        let mut previous_dependency: Option<(
-            &str,
-            &ContentDigest,
-            &ContentDigest,
-            &ContentDigest,
-        )> = None;
+        let mut previous_dependency = None;
         for dependency in &self.dependencies {
             if dependency.artifact_family.trim().is_empty()
                 || !dependency.semantic_digest.validate()
@@ -153,18 +148,12 @@ impl CanonicalPayloadEnvelope {
                     "payload dependency contains an invalid digest".to_owned(),
                 ));
             }
-            let identity = (
-                dependency.artifact_family.as_str(),
-                &dependency.semantic_digest,
-                &dependency.manifest_digest,
-                &dependency.payload_digest,
-            );
-            if previous_dependency.is_some_and(|previous| previous >= identity) {
+            if previous_dependency.is_some_and(|previous| previous >= dependency) {
                 return Err(CacheError::InvalidManifest(
                     "payload dependencies must be unique and canonically ordered".to_owned(),
                 ));
             }
-            previous_dependency = Some(identity);
+            previous_dependency = Some(dependency);
         }
         Ok(())
     }

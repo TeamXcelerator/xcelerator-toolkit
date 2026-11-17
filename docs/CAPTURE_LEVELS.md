@@ -15,6 +15,20 @@ available for other diagnostics. Pass `retained_even_sources` to the shared
 runner for prefix, checkpoint, and budgeted reduction capture. Finalize the
 managed session after retaining the receipt.
 
+A completed measurement must pass the same acquisition checks during collection,
+repair and cache reuse. Full directional response and root transport require a
+positive expected row count and a resolved measurement for each requested row.
+Other diagnostics can retain a qualified or partial numerical result when their
+contract permits it. Missing inputs, execution refusals and a root report
+whose computed value falls outside its own certified ordinal block completion
+of the affected diagnostic.
+
+Use `CaptureArtifact::validate_with_sources` when accepting an imported receipt.
+It verifies the exact referenced payloads, their ordered value digest and the
+coverage derived from those values. For an offline repair that changes a value
+reference or retains one, use `repair_capture_measurements_with_sources` and
+supply the encoded bytes of each referenced artifact in the resulting receipt.
+
 The adapter preserves primary parity and root acquisition. Natural/adaptive
 states cannot supply even-state response diagnostics or checkpoint exports.
 `distance::hp::capture_ccm_profile_via_cache` retains an eigenfunction profile

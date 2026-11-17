@@ -716,8 +716,10 @@ impl CaptureReceipt {
         Ok(())
     }
     pub fn is_complete(&self) -> bool {
-        self.outcomes
-            .values()
-            .all(|s| matches!(s, DiagnosticOutcome::Completed { .. }))
+        !self.outcomes.is_empty()
+            && self
+                .outcomes
+                .values()
+                .all(|s| matches!(s, DiagnosticOutcome::Completed { .. }))
     }
 }

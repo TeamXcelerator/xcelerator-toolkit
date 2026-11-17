@@ -7,13 +7,20 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-## Native Windows and retained research with v0.17.1
+## Optional CPU execution with v0.17.2
 
-Version 0.17.1 adds a native Windows high-precision build lane and updates
+Version 0.17.2 adds optional exact packed, AVX2 and AVX-512 integer products,
+contiguous residue storage and Rust 1.100.0 qualification. Portable kernels
+and build settings remain the default on Windows and Linux. See
+[CPU execution tuning](docs/CPU_EXECUTION.md) for opt-in controls. Compatible
+artifacts keep their numerical identities and reader floors; upgrading alone
+does not require another upload.
+
+Version 0.17.1 introduced a native Windows high-precision build lane and updated
 Rust and selected library dependencies. The bounded Windows/Linux native-port
 comparison reproduced numerical payloads and complete cache ZIP objects byte
 for byte. Numerical and compression upgrades that changed those bytes were
-excluded. It preserves the retained-research execution and recovery
+excluded. It preserved the retained-research execution and recovery
 capabilities introduced in 0.17.0.
 Optional [compact sector certificates](docs/CCM_COMPACT_SECTOR_CERTIFICATES.md)
 retain exact results and reconstruction recipes while omitting dense proof
@@ -64,7 +71,7 @@ sums and searchable scalar exports are described in the
 ## Getting started
 
 The minimum supported Rust version is 1.99. Development pins stable Rust
-1.99.1 in `rust-toolchain.toml`. Record the exact compiler version
+1.100.0 in `rust-toolchain.toml`. Record the exact compiler version
 for reproducible experiments.
 
 ```bash
@@ -247,7 +254,7 @@ Please report proposed changes upstream so they can be reviewed and incorporated
 
 If you use Xcelerator Toolkit in research, please cite the exact version or Git commit. Citation metadata is also provided in [CITATION.cff](CITATION.cff).
 
-The citation metadata and example below describe v0.17.1. For a development
+The citation metadata and example below describe v0.17.2. For a development
 snapshot or an amended release, also cite its exact Git commit.
 
 ```bibtex
@@ -255,7 +262,7 @@ snapshot or an amended release, also cite its exact Git commit.
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.17.1},
+  version = {0.17.2},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }

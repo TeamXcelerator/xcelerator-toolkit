@@ -14,11 +14,11 @@ default = []
 # High-precision tier via rug (MPFR/GMP).
 # Build: cargo build --release --features hp
 # Requires: sudo apt install build-essential m4 libgmp-dev libmpfr-dev libmpc-dev
-hp = ["dep:rug", "dep:serde", "dep:serde_json", "dep:zip", "dep:xc-cache", "dep:sha2", "cuda-product"]
+hp = ["dep:rug", "dep:gmp-mpfr-sys", "dep:serde", "dep:serde_json", "dep:zip", "dep:xc-cache", "dep:sha2", "cuda-product"]
 # Opt-in certified quadrature using a separately installed FLINT 3 library.
 # FLINT and Rug must use the same GMP/MPFR libraries. Cargo unifies this
-# dependency with Rug's; builds without Arb retain Rug's bundled defaults.
-arb = ["hp", "dep:cc", "dep:gmp-mpfr-sys"]
+# dependency with Rug's. HP-only builds use bundled libraries outside Windows GNU.
+arb = ["hp", "dep:cc", "gmp-mpfr-sys/use-system-libs"]
 # Exact integer products. CUDA libraries are discovered at runtime so HP
 # binaries also run on CPU-only hosts without installing CUDA.
 modular-product = ["dep:num-bigint", "dep:num-integer", "dep:num-traits"]
@@ -28,7 +28,7 @@ cuda-product = ["modular-product"]
 anyhow = { workspace = true }
 rayon = { workspace = true }
 rug = { workspace = true, optional = true }
-gmp-mpfr-sys = { version = "~1.7", default-features = false, features = ["mpfr", "use-system-libs"], optional = true }
+gmp-mpfr-sys = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
@@ -41,6 +41,10 @@ num-traits = { version = "=0.2.19", optional = true }
 
 [build-dependencies]
 cc = { version = "1.11.1", optional = true }
+
+# The native UCRT lane uses the same qualified GMP/MPFR for every HP producer.
+[target.'cfg(all(windows, target_env = "gnu"))'.dependencies]
+gmp-mpfr-sys = { workspace = true, optional = true, features = ["use-system-libs"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

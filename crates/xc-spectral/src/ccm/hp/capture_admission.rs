@@ -196,7 +196,11 @@ impl RetainedCcmRun {
             |roots| {
                 Ok(*root == roots.manifest
                     && *secular == roots.secular_manifest
-                    && xc_cache::manifest_depends_on(&roots.secular_manifest, &state.manifest)?)
+                    && crate::ccm::source_admission::secular_matches_state(
+                        &roots.secular_manifest,
+                        &state.manifest,
+                        None,
+                    )?)
             },
             || {
                 let _stage = xc_core::performance_stage(

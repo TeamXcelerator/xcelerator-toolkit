@@ -25,6 +25,8 @@ mod enabled {
         Receipt {
             receipt: PathBuf,
             repairs: Vec<Replacement>,
+            #[serde(default)]
+            source_shards: Vec<PathBuf>,
             output: PathBuf,
             read: LocalShardReadOptions,
         },
@@ -269,10 +271,18 @@ mod enabled {
             Request::Receipt {
                 receipt,
                 repairs,
+                mut source_shards,
                 output,
                 read,
             } => {
                 let original = read_local_shard_json(&receipt, &read)?;
+                let path = receipt.canonicalize()?;
+                source_shards.push(
+                    path.ancestors()
+                        .nth(3)
+                        .context("invalid receipt shard path")?
+                        .to_owned(),
+                );
                 if original.manifest.key.kind != CAPTURE_RECEIPT_KIND
                     || original.manifest.visibility == CacheVisibility::Public
                 {
@@ -281,6 +291,7 @@ mod enabled {
                 let record: CaptureArtifact = serde_json::from_slice(&original.payload)?;
                 record.validate()?;
                 let mut updates = Vec::new();
+                let mut replacement_payloads = Vec::new();
                 let mut dependencies = canonical(&original)?.canonical_payload.dependencies;
                 for replacement in repairs {
                     let source = read_local_shard_json(&replacement.original, &read)?;
@@ -365,21 +376,35 @@ mod enabled {
                                 );
                             }
                             let original_reference = &reference.artifacts[0];
+                            if original_reference.key.kind != source.manifest.key.kind
+                                || original_reference.key.parameters_digest != old.semantic_digest
+                                || original_reference.content_digest
+                                    != source.manifest.content_digest
+                            {
+                                bail!("capture reference names a different source artifact");
+                            }
                             let repaired_reference = replacement_dependencies
                                 .iter()
                                 .find(|dep| {
                                     dep.key.kind == original_reference.key.kind
+                                        && dep.key.parameters_digest
+                                            == draft.manifest.semantic_digest
                                         && dep.content_digest == draft.source_content_digest
                                 })
                                 .context("repaired capture reference not bound")?
                                 .clone();
                             let value = wrap(repaired_payload);
-                            Some(MeasurementValueReference {
+                            replacement_payloads.push((
+                                repaired_reference.clone(),
+                                replacement.repaired.join("payload.json"),
+                            ));
+                            let reference = MeasurementValueReference {
                                 artifacts: vec![repaired_reference],
                                 array: reference.array,
                                 value_digest: xc_core::research_digest(&value)?.0,
                                 coverage: NumericalCoverage::from_value(&value),
-                            })
+                            };
+                            Some(reference)
                         }
                     };
                     updates.push(CaptureMeasurementRepair {
@@ -410,7 +435,40 @@ mod enabled {
                 if updates.is_empty() {
                     bail!("no capture measurements selected for repair");
                 }
-                let repaired = repair_capture_measurements(&record, updates)?;
+                let repaired = repair_capture_measurements_with_sources(&record, updates, |dep| {
+                    if let Some((_, path)) = replacement_payloads
+                        .iter()
+                        .find(|(source, _)| source == dep)
+                    {
+                        return Ok(fs::read(path)?);
+                    }
+                    for parent in dependencies
+                        .iter()
+                        .filter(|p| p.semantic_digest == dep.key.parameters_digest)
+                    {
+                        for shard in &source_shards {
+                            let path = shard
+                                .join("manifests")
+                                .join(&parent.semantic_digest.0[..2])
+                                .join(format!("{}.json", parent.manifest_digest));
+                            if !path.try_exists()? {
+                                continue;
+                            }
+                            let retained = read_local_shard_json(&path, &read)?;
+                            if retained.canonical_manifest_digest == parent.manifest_digest
+                                && retained.manifest.key.kind == dep.key.kind
+                                && retained.manifest.content_digest == dep.content_digest
+                                && retained.manifest.quality.satisfies(dep.required_quality)
+                            {
+                                return Ok(retained.payload);
+                            }
+                        }
+                    }
+                    Err(CacheError::InvalidManifest(format!(
+                        "missing retained capture source {} in configured shards",
+                        dep.content_digest
+                    )))
+                })?;
                 dependencies.sort_by(|a, b| {
                     (
                         &a.artifact_family,

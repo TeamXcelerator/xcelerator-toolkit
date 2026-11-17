@@ -28,8 +28,11 @@ use num_traits::{One, ToPrimitive};
 use rayon::prelude::*;
 use std::time::Instant;
 
+mod cpu;
 #[cfg(feature = "cuda-product")]
 mod cuda;
+
+pub use cpu::{CpuExecutionOptions, CpuProductKernel, ResidueLayout};
 
 /// Automatic selection falls back only before any GPU computation. A selected
 /// device's numerical or transfer error is always returned.
@@ -47,7 +50,12 @@ pub enum ProductBackend {
 pub struct CudaStatus {
     pub available: bool,
     pub driver_version: Option<i32>,
+    /// Version returned by cudaRuntimeGetVersion.
     pub runtime_version: Option<i32>,
+    /// Loaded runtime library basename, plus its file version on Windows when available.
+    pub runtime_library: Option<String>,
+    /// Loaded cuBLAS library basename, plus its file version on Windows when available.
+    pub cublas_library: Option<String>,
     pub cublas_version: Option<i32>,
     pub devices: Vec<CudaDeviceInfo>,
     pub unavailable_reason: Option<String>,
@@ -714,9 +722,12 @@ pub(crate) fn multiply_wide_entries(
     columns: usize,
     backend: ProductBackend,
     limits: ProductLimits,
+    observe: &mut impl FnMut(ProductBackend),
 ) -> Result<Vec<BigInt>> {
     multiply_wide_entries_with(left, right, rows, inner, columns, limits, |a, b, limits| {
-        Ok(multiply(a, b, rows, inner, columns, backend, limits)?.entries)
+        let product = multiply(a, b, rows, inner, columns, backend, limits)?;
+        observe(product.backend_used);
+        Ok(product.entries)
     })
 }
 
@@ -873,19 +884,55 @@ fn cpu_residue_product(a: &[u16], b: &[u16], m: usize, k: usize, n: usize, p: u3
         .collect()
 }
 
-fn converted(values: &[BigInt], tree: &Tree, primes: usize) -> Vec<Vec<u16>> {
-    values
-        .par_iter()
-        .map(|value| {
-            let mut residues = vec![0; primes];
-            tree.residues(
-                value.magnitude(),
-                value.sign() == Sign::Minus,
-                &mut residues,
-            );
-            residues
-        })
-        .collect()
+enum ConvertedResidues {
+    Nested(Vec<Vec<u16>>),
+    Flat { data: Vec<u16>, primes: usize },
+}
+
+impl ConvertedResidues {
+    fn prime(&self, index: usize) -> Vec<u16> {
+        match self {
+            Self::Nested(values) => values.iter().map(|v| v[index]).collect(),
+            Self::Flat { data, primes } => data.chunks_exact(*primes).map(|v| v[index]).collect(),
+        }
+    }
+}
+
+fn converted(
+    values: &[BigInt],
+    tree: &Tree,
+    primes: usize,
+    layout: ResidueLayout,
+) -> Result<ConvertedResidues> {
+    if layout == ResidueLayout::Nested {
+        return Ok(ConvertedResidues::Nested(
+            values
+                .par_iter()
+                .map(|value| {
+                    let mut residues = vec![0; primes];
+                    tree.residues(
+                        value.magnitude(),
+                        value.sign() == Sign::Minus,
+                        &mut residues,
+                    );
+                    residues
+                })
+                .collect(),
+        ));
+    }
+    // The established nested-layout reservation also bounds this flat layout:
+    // equal residue count, fewer allocations/headers, no second full copy.
+    let length = values
+        .len()
+        .checked_mul(primes)
+        .context("flat residue shape overflow")?;
+    let mut data = vec![0; length];
+    data.par_chunks_mut(primes)
+        .zip(values.par_iter())
+        .for_each(|(residues, value)| {
+            tree.residues(value.magnitude(), value.sign() == Sign::Minus, residues);
+        });
+    Ok(ConvertedResidues::Flat { data, primes })
 }
 
 // Reuse the caller's pool when it already has the requested concurrency. A
@@ -1070,6 +1117,33 @@ pub fn multiply(
     backend: ProductBackend,
     limits: ProductLimits,
 ) -> Result<ExactModularProduct> {
+    multiply_with_execution(
+        left,
+        right,
+        rows,
+        inner,
+        columns,
+        backend,
+        limits,
+        CpuExecutionOptions::from_environment()?,
+    )
+}
+
+/// Exact product with explicit execution settings, independent of environment.
+/// Portable/nested defaults preserve the established implementation. CPU ISA
+/// requirements are checked only when the selected backend is CPU. All layouts
+/// retain the same conservative workspace bound and complete integer result.
+#[allow(clippy::too_many_arguments)]
+pub fn multiply_with_execution(
+    left: &[BigInt],
+    right: &[BigInt],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    backend: ProductBackend,
+    limits: ProductLimits,
+    execution: CpuExecutionOptions,
+) -> Result<ExactModularProduct> {
     let start = Instant::now();
     ensure!(
         rows > 0 && inner > 0 && columns > 0,
@@ -1175,8 +1249,14 @@ pub fn multiply(
                 .context("invalid XC_CUDA_MIN_SCALAR_PRODUCTS")?,
             Err(_) => 0,
         };
+        let cuda_reduction_ok = cuda::padded_reduction(inner)
+            .is_ok_and(|k| (k as u128) * 127 * 127 <= i32::MAX as u128);
+        ensure!(
+            backend != ProductBackend::Cuda || cuda_reduction_ok,
+            "CUDA padded reduction exceeds integer accumulation domain"
+        );
         if backend == ProductBackend::Cuda
-            || (backend == ProductBackend::Auto && operations >= threshold)
+            || (backend == ProductBackend::Auto && cuda_reduction_ok && operations >= threshold)
         {
             let (requested, adaptive) = cuda::ExecutionMode::for_product(primes.len())?;
             cuda_execution = if adaptive {
@@ -1249,14 +1329,16 @@ pub fn multiply(
                 workspace += u128::from(per_device_bytes) * cuda_devices.len() as u128;
                 cuda_logging::admission(|| {
                     format!(
-                    "[CUDA] exact integer product {}x{}x{}; admitted devices {:?}; runtime {:?}, driver {:?}, cuBLAS {:?}; execution {:?}; admitted workspace {} bytes",
+                    "[CUDA] exact integer product {}x{}x{}; admitted devices {:?}; runtime {:?} ({:?}), driver {:?}, cuBLAS {:?} ({:?}); execution {:?}; admitted workspace {} bytes",
                     rows,
                     inner,
                     columns,
                     cuda_devices,
                     status.runtime_version,
+                    status.runtime_library,
                     status.driver_version,
                     status.cublas_version,
+                    status.cublas_library,
                     cuda_execution,
                     workspace
                 )
@@ -1266,6 +1348,30 @@ pub fn multiply(
     }
     #[cfg(not(feature = "cuda-product"))]
     let _ = backend;
+    let cpu_kernel = if backend_used == ProductBackend::Cpu {
+        execution.kernel.resolve()?
+    } else {
+        CpuProductKernel::Portable
+    };
+    if execution != CpuExecutionOptions::default() {
+        static REPORTED: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        let selected = (backend_used == ProductBackend::Cpu).then_some(cpu_kernel);
+        let index = match selected {
+            Some(kernel) => {
+                kernel as u8
+                    + if execution.residue_layout == ResidueLayout::Flat {
+                        4
+                    } else {
+                        0
+                    }
+            }
+            None => 8 + u8::from(execution.residue_layout == ResidueLayout::Flat),
+        };
+        let bit = 1 << index;
+        if REPORTED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+            xc_core::progress_message!("[CPU execution] selected CPU kernel={:?}; residues={:?}; actual product backend={:?}", selected, execution.residue_layout, backend_used);
+        }
+    }
     let tree = Tree::build(&primes, 0);
     let pool = ProductPool::new(limits.workers)?;
     let mut timings = ProductTimings {
@@ -1273,12 +1379,12 @@ pub fn multiply(
         ..Default::default()
     };
     let start = Instant::now();
-    let (a, b) = pool.install(|| {
-        (
-            converted(left, &tree, primes.len()),
-            converted(right, &tree, primes.len()),
-        )
-    });
+    let (a, b) = pool.install(|| -> Result<_> {
+        Ok((
+            converted(left, &tree, primes.len(), execution.residue_layout)?,
+            converted(right, &tree, primes.len(), execution.residue_layout)?,
+        ))
+    })?;
     timings.conversion_seconds = start.elapsed().as_secs_f64();
     let start = Instant::now();
     let residues = match backend_used {
@@ -1295,8 +1401,8 @@ pub fn multiply(
                         primes.len(),
                         initialize,
                         |engine, index| {
-                            let aa: Vec<u16> = a.iter().map(|v| v[index]).collect();
-                            let bb: Vec<u16> = b.iter().map(|v| v[index]).collect();
+                            let aa: Vec<u16> = a.prime(index);
+                            let bb: Vec<u16> = b.prime(index);
                             engine.product(&aa, &bb, primes[index])
                         },
                         cuda::Engine::finish,
@@ -1311,8 +1417,8 @@ pub fn multiply(
                         let operands: Vec<_> = indices
                             .iter()
                             .map(|&index| {
-                                let aa: Vec<u16> = a.iter().map(|v| v[index]).collect();
-                                let bb: Vec<u16> = b.iter().map(|v| v[index]).collect();
+                                let aa: Vec<u16> = a.prime(index);
+                                let bb: Vec<u16> = b.prime(index);
                                 (aa, bb, primes[index])
                             })
                             .collect();
@@ -1337,10 +1443,15 @@ pub fn multiply(
         _ => {
             let mut residues = Vec::with_capacity(primes.len());
             for (index, &p) in primes.iter().enumerate() {
-                let aa: Vec<u16> = a.iter().map(|v| v[index]).collect();
-                let bb: Vec<u16> = b.iter().map(|v| v[index]).collect();
-                residues
-                    .push(pool.install(|| cpu_residue_product(&aa, &bb, rows, inner, columns, p)));
+                let aa: Vec<u16> = a.prime(index);
+                let bb: Vec<u16> = b.prime(index);
+                residues.push(pool.install(|| {
+                    if cpu_kernel == CpuProductKernel::Portable {
+                        Ok(cpu_residue_product(&aa, &bb, rows, inner, columns, p))
+                    } else {
+                        cpu::packed_product(&aa, &bb, rows, inner, columns, p, cpu_kernel)
+                    }
+                })?);
             }
             residues
         }
@@ -1414,6 +1525,101 @@ pub fn multiply(
 mod tests {
     use super::*;
     use num_traits::Zero;
+
+    #[test]
+    fn optional_execution_variants_match_bigint_oracle_and_default_admission() {
+        for (m, k, n, bits) in [(1, 1, 1, 0), (3, 17, 5, 97), (2, 33, 3, 511), (3, 65, 4, 0)] {
+            let value = |i: usize| (BigInt::from((i * 17 % 23) as i64 - 11) << bits) + (i % 7);
+            let a: Vec<_> = (0..m * k).map(value).collect();
+            let b: Vec<_> = (0..k * n).map(|i| value(i + 5)).collect();
+            let expected: Vec<BigInt> = (0..m * n)
+                .map(|entry| {
+                    (0..k)
+                        .map(|t| &a[entry / n * k + t] * &b[t * n + entry % n])
+                        .sum()
+                })
+                .collect();
+            let baseline = multiply_with_execution(
+                &a,
+                &b,
+                m,
+                k,
+                n,
+                ProductBackend::Cpu,
+                limits(),
+                CpuExecutionOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(baseline.entries, expected);
+            for kernel in [
+                CpuProductKernel::Portable,
+                CpuProductKernel::Packed,
+                CpuProductKernel::Avx2,
+                CpuProductKernel::Avx512,
+                CpuProductKernel::Auto,
+            ] {
+                if kernel.resolve().is_err() {
+                    continue;
+                }
+                for residue_layout in [ResidueLayout::Nested, ResidueLayout::Flat] {
+                    let execution = CpuExecutionOptions {
+                        kernel,
+                        residue_layout,
+                    };
+                    let actual = multiply_with_execution(
+                        &a,
+                        &b,
+                        m,
+                        k,
+                        n,
+                        ProductBackend::Cpu,
+                        limits(),
+                        execution,
+                    )
+                    .unwrap();
+                    assert_eq!(actual.entries, expected, "{execution:?}");
+                    assert_eq!(actual.moduli, baseline.moduli);
+                    assert_eq!(actual.reconstruction_bits, baseline.reconstruction_bits);
+                    assert_eq!(
+                        actual.estimated_workspace_bytes,
+                        baseline.estimated_workspace_bytes
+                    );
+                    let tight = ProductLimits {
+                        max_workspace_bytes: actual.estimated_workspace_bytes - 1,
+                        ..limits()
+                    };
+                    assert!(multiply_with_execution(
+                        &a,
+                        &b,
+                        m,
+                        k,
+                        n,
+                        ProductBackend::Cpu,
+                        tight,
+                        execution
+                    )
+                    .is_err());
+                }
+            }
+        }
+        // Zero magnitudes still produce a nonempty, valid residue family.
+        let zeros = vec![BigInt::zero(); 33];
+        let result = multiply_with_execution(
+            &zeros,
+            &zeros,
+            1,
+            33,
+            1,
+            ProductBackend::Cpu,
+            limits(),
+            CpuExecutionOptions {
+                kernel: CpuProductKernel::Auto,
+                residue_layout: ResidueLayout::Flat,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.entries, vec![BigInt::zero()]);
+    }
 
     #[test]
     fn product_pool_reuses_caller_workers_and_honors_smaller_limits() {
@@ -1661,7 +1867,9 @@ mod tests {
         let mut budget = limits();
         budget.max_workspace_bytes = 512 << 20;
         budget.max_input_bits = 50_000;
-        let actual = multiply_wide_entries(&a, &b, 2, 3, 2, ProductBackend::Cpu, budget).unwrap();
+        let actual =
+            multiply_wide_entries(&a, &b, 2, 3, 2, ProductBackend::Cpu, budget, &mut |_| {})
+                .unwrap();
         let expected: Vec<BigInt> = (0..4)
             .map(|i| (0..3).map(|k| &a[i / 2 * 3 + k] * &b[k * 2 + i % 2]).sum())
             .collect();

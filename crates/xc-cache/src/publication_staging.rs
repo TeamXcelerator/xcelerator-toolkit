@@ -1068,7 +1068,7 @@ pub(crate) mod tests {
             }
             .to_owned(),
             mathematical_semantics_version: "fixture-v1".to_owned(),
-            resolved_mathematical_parameters: json!({"case": "staging"}),
+            resolved_mathematical_parameters: json!({"precision_bits": 128}),
             normalization: None,
             target: None,
             subspace: None,
@@ -1130,7 +1130,7 @@ pub(crate) mod tests {
             minimum_reader_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: AssuranceLevel::Computed,
-            claim_scope: "fixture".to_owned(),
+            claim_scope: "validated typed numerical cache artifact".to_owned(),
             assumptions: Vec::new(),
         };
         let manifest_digest = manifest.digest().unwrap();
@@ -1142,8 +1142,11 @@ pub(crate) mod tests {
             policy_digest: ContentDigest::sha256(b"policy"),
             execution_fingerprint_digest: ContentDigest::sha256(b"fingerprint"),
             producer_toolkit_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
-            dependency_versions: BTreeMap::from([("xc-cache".to_owned(), "0.16.0".to_owned())]),
-            source_revision: "toolkit-revision".to_owned(),
+            dependency_versions: BTreeMap::from([(
+                "xcelerator-toolkit".to_owned(),
+                "0.16.0".to_owned(),
+            )]),
+            source_revision: "a".repeat(40),
             event_unix_seconds: 1,
             location: None,
             evidence_digests: vec![ContentDigest::sha256(b"evidence")],

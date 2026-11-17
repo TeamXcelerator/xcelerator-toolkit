@@ -119,7 +119,7 @@ fn sorted_dependencies(mut dependencies: Vec<DependencyRef>) -> Vec<DependencyRe
     dependencies
 }
 fn admits(m: &ArtifactManifest, b: &[u8], allowed: &[ContentDigest], kind: &str) -> Result<()> {
-    m.validate()?;
+    super::source_admission::admit_manifest(m, None)?;
     if m.key.kind != kind
         || !m.immutable
         || m.quality.admissible_rank() < CacheQuality::Validated.admissible_rank()
@@ -210,38 +210,48 @@ where
         annotations,
         numerical_inputs,
         |req, scope, dependencies, identities| {
-            let mut result = resolve_or_compute_json_artifact_with_dependencies(
-                req,
-                || {
-                    let data = compute().map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
-                    Ok((
-                        ResearchRecord {
-                            schema_version: 2,
-                            semantics: req.semantic_key.mathematical_semantics_version.clone(),
-                            kind: kind.into(),
-                            scope: scope.into(),
-                            source_dependencies: identities.clone(),
-                            request: request.clone(),
-                            data,
-                        },
-                        dependencies.clone(),
-                    ))
-                },
-                |r| {
-                    if r.schema_version != 2
-                        || r.semantics != req.semantic_key.mathematical_semantics_version
-                        || r.kind != kind
-                        || r.scope != scope
-                        || r.request.get("expected_rows").and_then(Value::as_u64)
-                            != request.get("expected_rows").and_then(Value::as_u64)
-                    {
-                        return Err(CacheError::InvalidManifest(
-                            "retained research identity mismatch".into(),
-                        ));
-                    }
-                    validate(&r.data).map_err(|e| CacheError::InvalidManifest(e.to_string()))
-                },
-            )?;
+            let compute_record = || {
+                let data = compute().map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                Ok((
+                    ResearchRecord {
+                        schema_version: 2,
+                        semantics: req.semantic_key.mathematical_semantics_version.clone(),
+                        kind: kind.into(),
+                        scope: scope.into(),
+                        source_dependencies: identities.clone(),
+                        request: request.clone(),
+                        data,
+                    },
+                    dependencies.clone(),
+                ))
+            };
+            let validate_record = |r: &ResearchRecord<T>| {
+                if r.schema_version != 2
+                    || r.semantics != req.semantic_key.mathematical_semantics_version
+                    || r.kind != kind
+                    || r.scope != scope
+                    || r.request.get("expected_rows").and_then(Value::as_u64)
+                        != request.get("expected_rows").and_then(Value::as_u64)
+                {
+                    return Err(CacheError::InvalidManifest(
+                        "retained research identity mismatch".into(),
+                    ));
+                }
+                validate(&r.data).map_err(|e| CacheError::InvalidManifest(e.to_string()))
+            };
+            let mut result = if numerical_inputs.is_some_and(|inputs| inputs.is_empty()) {
+                xc_cache::resolve_or_compute_self_contained_json_artifact(
+                    req,
+                    || compute_record().map(|(record, _)| record),
+                    validate_record,
+                )?
+            } else {
+                resolve_or_compute_json_artifact_with_dependencies(
+                    req,
+                    compute_record,
+                    validate_record,
+                )?
+            };
             result.value.source_dependencies = identities;
             result.value.request = request.clone();
             Ok(result)
@@ -279,7 +289,18 @@ fn with_managed_request<R>(
     } else {
         SCOPE
     };
-    let mut provenance = provenance_for_numerical_inputs(kind, sources, Vec::new())?;
+    let mut receipts = Vec::new();
+    if annotations.contains_key("cohort_source_selection") {
+        for source in sources {
+            if let Some(provenance) = xc_cache::retained_canonical_manifest(source)?
+                .and_then(|m| m.provenance)
+                .or(xc_cache::local_manifest_provenance_v2(source)?)
+            {
+                receipts.extend(provenance.producer_receipts);
+            }
+        }
+    }
+    let mut provenance = provenance_for_numerical_inputs(kind, sources, receipts)?;
     provenance.producer_annotations = annotations.clone();
     let public = provenance.disclosure == ArtifactDisclosure::PublicInputs;
     if cache.write_visibility == CacheVisibility::Public
@@ -297,19 +318,17 @@ fn with_managed_request<R>(
         contract.payload_codec == "retained-research-v2",
         "kind does not use the retained research request/codec contract"
     );
-    let inputs = sources
-        .iter()
-        .enumerate()
-        .map(|(index, source)| NumericalInputIdentity {
-            role: format!("source-{index}"),
-            kind: source.key.kind.clone(),
-            meaning: "validated-typed-source-content-v1".into(),
-            content_digest: source.content_digest.clone(),
-        })
-        .collect::<Vec<_>>();
+    let default_inputs;
+    let inputs = match numerical_inputs {
+        Some(inputs) => inputs,
+        None => {
+            default_inputs = retained_inputs(sources);
+            &default_inputs
+        }
+    };
     let semantic = numerical_request_key(
         &request::RetainedRequest::new(contract.kind, request)?,
-        numerical_inputs.unwrap_or(&inputs),
+        inputs,
     )?;
     let key = ContentDigest::sha256(&serde_json::to_vec(&semantic)?);
     let logical = format!("ccm/research/{kind}/{}", key.0);
@@ -339,6 +358,37 @@ fn with_managed_request<R>(
         production_sink: cache.production_sink,
     };
     resolve(&req, scope, dependencies, identities)
+}
+
+pub(super) fn retained_inputs(sources: &[ArtifactManifest]) -> Vec<NumericalInputIdentity> {
+    sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let meaning = if source.key.kind == "ccm_tau_matrix" {
+                "consumed-tau-matrix-v2"
+            } else {
+                "validated-typed-source-content-v1"
+            };
+            numerical_source_identity(source, format!("source-{index}"), meaning)
+        })
+        .collect()
+}
+
+/// The exact dependency stays in the manifest. Only its numerical input
+/// identity changes, after the caller has authenticated the proof bytes.
+pub(super) fn compact_certificate_inputs(
+    sources: &[ArtifactManifest],
+    proof_digest: &ContentDigest,
+) -> Vec<NumericalInputIdentity> {
+    let mut inputs = retained_inputs(sources);
+    for input in &mut inputs {
+        if input.kind == "ccm_sector_gap_certificate" {
+            input.meaning = "compact-sector-gap-proof-v1".into();
+            input.content_digest = proof_digest.clone();
+        }
+    }
+    inputs
 }
 
 fn admitted_record_header<T>(record: &ResearchRecord<T>) -> bool {
@@ -492,8 +542,19 @@ pub fn capture_reference(
 pub struct RetainedReference {
     manifest: ArtifactManifest,
     spec: ReferenceSpec,
+    value_digest: ContentDigest,
 }
 impl RetainedReference {
+    /// Apply caller source restrictions before authenticating or decoding bytes.
+    pub fn from_payload_with_policy(
+        m: &ArtifactManifest,
+        b: &[u8],
+        allowed: &[ContentDigest],
+        policy: &CachePolicy,
+    ) -> Result<Self> {
+        super::source_admission::admit_manifest(m, Some(policy))?;
+        Self::from_payload(m, b, allowed)
+    }
     pub fn spec(&self) -> &ReferenceSpec {
         &self.spec
     }
@@ -520,6 +581,9 @@ impl RetainedReference {
         }
         Ok(Self {
             manifest: m.clone(),
+            // Schema 2 hashes to the exact canonical writer bytes, including
+            // when a previously admitted writer used another object order.
+            value_digest: xc_cache::canonical_digest(&r)?,
             spec: r.data.spec,
         })
     }
@@ -628,6 +692,16 @@ pub struct RetainedDataset {
     spec: DatasetSpec,
 }
 impl RetainedDataset {
+    /// Apply caller source restrictions before authenticating or decoding bytes.
+    pub fn from_payload_with_policy(
+        m: &ArtifactManifest,
+        b: &[u8],
+        allowed: &[ContentDigest],
+        policy: &CachePolicy,
+    ) -> Result<Self> {
+        super::source_admission::admit_manifest(m, Some(policy))?;
+        Self::from_payload(m, b, allowed)
+    }
     pub fn spec(&self) -> &DatasetSpec {
         &self.spec
     }
@@ -663,6 +737,21 @@ pub struct RetainedRoots {
     pub(crate) modes: usize,
 }
 impl RetainedRoots {
+    /// Apply caller restrictions to every consumed source before decoding.
+    pub fn from_payload_with_policy(
+        m: &ArtifactManifest,
+        b: &[u8],
+        secular: &ArtifactManifest,
+        secular_bytes: &[u8],
+        state: &RetainedState,
+        allowed: &[ContentDigest],
+        policy: &CachePolicy,
+    ) -> Result<Self> {
+        for source in [m, secular, &state.manifest] {
+            super::source_admission::admit_manifest(source, Some(policy))?;
+        }
+        Self::from_payload(m, b, secular, secular_bytes, state, allowed)
+    }
     pub fn from_payload(
         m: &ArtifactManifest,
         b: &[u8],
@@ -684,8 +773,9 @@ impl RetainedRoots {
                 .ok_or_else(|| anyhow::anyhow!("missing {name}"))?
                 .to_owned())
         };
-        if !xc_cache::manifest_depends_on(m, secular)?
-            || !xc_cache::manifest_depends_on(secular, &state.manifest)?
+        let declared = super::source_admission::declared_root_secular_matches(m, secular, None)?;
+        if !(declared || xc_cache::manifest_depends_on(m, secular)?)
+            || !super::source_admission::secular_matches_state(secular, &state.manifest, None)?
             || sec["eigenpair_content_digest"].as_str() != Some(&state.manifest.content_digest.0)
             || r["lambda_squared"].as_str() != Some(&state.cutoff)
             || sec["lambda_squared"] != r["lambda_squared"]
@@ -711,6 +801,11 @@ impl RetainedRoots {
             || r["reference_seeds_used"].as_bool().is_none()
         {
             bail!("unsupported root schema or acquisition policy");
+        }
+        if declared {
+            let semantic = super::source_admission::semantic(m, None)?
+                .ok_or_else(|| anyhow::anyhow!("retained roots lack their declared semantics"))?;
+            super::source_admission::authenticate_root_policy(m, &semantic, &r)?;
         }
         let acquisition = json!({"source_schema":r["schema_version"],"discovery_mode":r["discovery_mode"],"reference_seeds_used":r["reference_seeds_used"],"root_domain":r.get("root_domain").cloned().unwrap_or(json!("positive")),"force_even":r["force_even"],"parity_policy":r["parity_policy"],"root_precision_policy":r["root_precision_policy"]});
         // Adaptive solver metadata describes work and accuracy, never storage.
@@ -765,6 +860,38 @@ impl RetainedRoots {
                 value,
                 source_status: status,
             });
+        }
+        if let Some(seeds) = r["starting_points"].as_array() {
+            anyhow::ensure!(
+                seeds.len() == points.len(),
+                "root window seed count mismatch"
+            );
+            let seeds = seeds
+                .iter()
+                .map(|v| {
+                    scalar(
+                        v.as_str()
+                            .ok_or_else(|| anyhow::anyhow!("invalid root seed"))?,
+                        root_precision,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let values = points
+                .iter()
+                .map(|point| {
+                    point
+                        .value
+                        .as_ref()
+                        .map(|v| scalar(v, root_precision))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            super::hp::complete_discovery::validate_assignment_values(
+                &values.iter().map(Option::as_ref).collect::<Vec<_>>(),
+                &seeds,
+            )?;
+        } else if m.key.kind == "ccm_root_refinement" && r["reference_seeds_used"] == true {
+            bail!("seeded retained root window lacks starting points");
         }
         let dataset = DatasetSpec {
             schema_version: 1,
@@ -878,7 +1005,16 @@ fn validate_root_window(r: &RootWindowData, roots: &RetainedRoots) -> Result<()>
     // Replay cheap finite statistics from the admitted source points. A matching
     // count total or recognized status alone does not authenticate a conclusion.
     let expected = root_window_data(roots)?;
-    if r != &expected {
+    let mut comparable = r.clone();
+    // Older migrated summaries retain the seed dataset's attribution here.
+    // It is producer provenance, not a consumed value. Keep every acquisition
+    // decision, source schema, point and finite statistic in the replay check.
+    comparable
+        .source_acquisition
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("root acquisition must be an object"))?
+        .remove("reference_dataset");
+    if comparable != expected {
         bail!("root_window summary disagrees with source replay");
     }
     Ok(())
@@ -1169,7 +1305,8 @@ fn transforms_with_guard_limit(
             for (row, input) in r.rows.iter().zip(&dataset.points) {
                 if row.ordinal != input.ordinal
                     || row.source_status != input.source_status
-                    || row.t != input.value
+                    || row.t.as_deref().map(canonical_decimal).transpose()?
+                        != input.value.as_deref().map(canonical_decimal).transpose()?
                     || row.newton_remainder
                         != "not_bounded; local_Newton_diagnostic_not_a_zero_error_certificate"
                 {
@@ -1215,7 +1352,11 @@ pub fn capture_transforms_at_roots(
     o: &TransformOptions,
     c: &ArtifactCacheContext<'_>,
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<TransformData>>> {
-    if !xc_cache::manifest_depends_on(&r.secular_manifest, &s.manifest)? {
+    if !super::source_admission::secular_matches_state(
+        &r.secular_manifest,
+        &s.manifest,
+        c.acceptance,
+    )? {
         bail!("transform roots belong to another state");
     }
     transforms(
@@ -1306,6 +1447,29 @@ fn retained_matrix_resources() -> Result<xc_core::RunResources> {
     }
 }
 impl<'a> RetainedMatrix<'a> {
+    /// Apply caller source restrictions before authenticating or decoding bytes.
+    pub fn from_payload_with_policy(
+        m: &ArtifactManifest,
+        b: &[u8],
+        allowed: &[ContentDigest],
+        policy: &CachePolicy,
+    ) -> Result<Self> {
+        super::source_admission::admit_manifest(m, Some(policy))?;
+        Self::from_payload(m, b, allowed)
+    }
+
+    /// Stream under caller source restrictions and an explicit shared budget.
+    /// Admission occurs before any read, seek or payload allocation.
+    pub fn from_reader_with_resources_and_policy<R: std::io::Read + std::io::Seek>(
+        m: &ArtifactManifest,
+        reader: &mut R,
+        allowed: &[ContentDigest],
+        resources: &xc_core::RunResources,
+        policy: &CachePolicy,
+    ) -> Result<Self> {
+        super::source_admission::admit_manifest(m, Some(policy))?;
+        Self::from_reader_with_resources(m, reader, allowed, resources)
+    }
     pub fn from_payload(m: &ArtifactManifest, b: &[u8], allowed: &[ContentDigest]) -> Result<Self> {
         // Preserve byte-slice authentication before inspecting payload syntax.
         admits(m, b, allowed, "ccm_tau_matrix")?;
@@ -1332,7 +1496,7 @@ impl<'a> RetainedMatrix<'a> {
         allowed: &[ContentDigest],
         resources: &xc_core::RunResources,
     ) -> Result<Self> {
-        m.validate()?;
+        super::source_admission::admit_manifest(m, None)?;
         if m.key.kind != "ccm_tau_matrix"
             || !m.immutable
             || m.quality.admissible_rank() < CacheQuality::Validated.admissible_rank()
@@ -1340,7 +1504,15 @@ impl<'a> RetainedMatrix<'a> {
         {
             bail!("unapproved or invalid retained research source");
         }
-        let r = matrix_decode::decode_reader(reader, m.size_bytes, &m.content_digest, resources)?;
+        let r = matrix_decode::decode_reader(
+            reader,
+            m.size_bytes,
+            &m.content_digest,
+            resources,
+            |cutoff, modes, precision| {
+                super::source_admission::check_payload_shape(m, cutoff, modes, precision)
+            },
+        )?;
         for i in 0..r.dimension {
             for j in 0..i {
                 if r.entries[i * r.dimension + j] != r.entries[j * r.dimension + i] {
@@ -1368,8 +1540,9 @@ impl<'a> RetainedMatrix<'a> {
         precision: u32,
         entries: &'a [Float],
     ) -> Result<Self> {
-        m.validate()?;
+        super::source_admission::admit_manifest(&m, None)?;
         retained_matrix_shape(modes, precision, entries.len())?;
+        super::source_admission::check_payload_shape(&m, &cutoff, modes, precision)?;
         super::research::ExactCutoff::parse(&cutoff)?;
         if m.key.kind != "ccm_tau_matrix"
             || !m.immutable
@@ -1447,13 +1620,26 @@ pub(super) fn matrix_ancestry(
     provided: &[ArtifactManifest],
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<Vec<ArtifactManifest>> {
-    let mut queue = vec![(s.manifest.clone(), Vec::new())];
+    matrix_ancestry_manifests(&s.manifest, &m.manifest, provided, cache)
+}
+
+/// Admit source metadata before opening a potentially large matrix payload.
+pub(super) fn matrix_ancestry_manifests(
+    state: &ArtifactManifest,
+    matrix: &ArtifactManifest,
+    provided: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<Vec<ArtifactManifest>> {
+    super::source_admission::admit_manifest(state, cache.acceptance)?;
+    super::source_admission::admit_manifest(matrix, cache.acceptance)?;
+    super::source_admission::declared_tau_matches(state, matrix, cache.acceptance)?;
+    let mut queue = vec![(state.clone(), Vec::new())];
     let mut visited = std::collections::HashSet::new();
     while let Some((parent, path)) = queue.pop() {
         if path.len() > 16 || visited.len() > 64 {
             bail!("matrix ancestry exceeds metadata budget");
         }
-        if xc_cache::manifest_depends_on(&parent, &m.manifest)? {
+        if super::source_admission::tau_edge_matches(&parent, matrix)? {
             return Ok(path);
         }
         for next in xc_cache::resolve_manifest_sources(&parent, provided, cache)? {
@@ -1468,6 +1654,7 @@ pub(super) fn matrix_ancestry(
                 continue;
             }
             let mut chain = path.clone();
+            super::source_admission::admit_manifest(&next, cache.acceptance)?;
             chain.push(next.clone());
             queue.push((next, chain));
         }
@@ -1492,8 +1679,8 @@ pub fn capture_operator_energy_with_ancestry(
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<EnergyData>>> {
     m.match_state(s)?;
-    let mut sources = matrix_ancestry(s, m, parents, cache)?;
-    sources.extend([s.manifest.clone(), m.manifest.clone()]);
+    matrix_ancestry(s, m, parents, cache)?;
+    let sources = [s.manifest.clone(), m.manifest.clone()];
     let p = s.precision.saturating_add(32).min(1_000_000);
     precision(p)?;
     managed(
@@ -1624,11 +1811,20 @@ pub fn capture_projection(
     }
     let mut sources = vec![state.manifest.clone(), reference.manifest.clone()];
     sources.extend(basis.iter().map(|b| b.manifest.clone()));
-    managed(
+    let mut inputs = retained_inputs(&sources);
+    for (input, source) in inputs[1..]
+        .iter_mut()
+        .zip(std::iter::once(reference).chain(basis))
+    {
+        input.content_digest = source.value_digest.clone();
+    }
+    managed_with_input_identities(
         "ccm_reference_projection_analysis",
-        json!({"options":o,"reference":reference.manifest.content_digest,"ordered_basis":basis.iter().map(|b|&b.manifest.content_digest).collect::<Vec<_>>(),"metric":"full_support_L2_dx; finite_Fourier_coefficients","projection_arithmetic":"stable_normalization_interval_gram_v1","maximum_additional_guard_bits":4096,"projection_output":"midpoints_with_outward_decimal_enclosures_v1"}),
+        json!({"options":o,"reference":reference.value_digest,"ordered_basis":basis.iter().map(|b|&b.value_digest).collect::<Vec<_>>(),"metric":"full_support_L2_dx; finite_Fourier_coefficients","projection_arithmetic":"stable_normalization_interval_gram_v1","maximum_additional_guard_bits":4096,"projection_output":"midpoints_with_outward_decimal_enclosures_v1"}),
         &sources,
         cache,
+        &BTreeMap::new(),
+        Some(&inputs),
         || projection::calculate(state, reference, basis, o),
         |r| {
             if ![
@@ -1933,12 +2129,27 @@ impl ResearchInputs {
 }
 fn admitted_reference(
     result: ArtifactExecutionCacheResult<ResearchRecord<ReferenceData>>,
+    cache: &ArtifactCacheContext<'_>,
 ) -> Result<RetainedReference> {
     let m = result
         .produced_manifest
         .or(result.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("reference capture requires a managed manifest"))?;
-    let bytes = serde_json::to_vec(&result.value)?;
+    let mut bytes = serde_json::to_vec(&result.value)?;
+    if ContentDigest::sha256(&bytes) != m.content_digest {
+        // JSON field order and whitespace are not preserved by typed decoding.
+        // Authenticate the original cache bytes, never a reserialization
+        // against the original byte digest.
+        let resolver = cache.resolver.ok_or_else(|| {
+            anyhow::anyhow!("reference capture requires its original authenticated payload")
+        })?;
+        let policy = cache.acceptance.ok_or_else(|| {
+            anyhow::anyhow!("reference capture requires a cache admission policy")
+        })?;
+        bytes = resolver
+            .resolve_exact(&m.key, &m.content_digest, m.quality, policy)?
+            .payload;
+    }
     RetainedReference::from_payload(&m, &bytes, std::slice::from_ref(&m.content_digest))
 }
 pub fn capture_configured_projection(
@@ -1947,11 +2158,11 @@ pub fn capture_configured_projection(
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<CapturedDiagnostic> {
     input.validate()?;
-    let reference = admitted_reference(capture_reference(&input.reference, cache)?)?;
+    let reference = admitted_reference(capture_reference(&input.reference, cache)?, cache)?;
     let basis = input
         .basis
         .iter()
-        .map(|b| admitted_reference(capture_reference(b, cache)?))
+        .map(|b| admitted_reference(capture_reference(b, cache)?, cache))
         .collect::<Result<Vec<_>>>()?;
     Ok(CapturedDiagnostic::from_cached(capture_projection(
         state,
@@ -2063,14 +2274,15 @@ mod exhaustive_resumed_validation_contract {
         sec.dependencies.push(dep(&sm));
         let outcomes = values
             .iter()
-            .map(|v| match v {
-                Some(v) => json!({"status":"converged","details":{"value":v}}),
+            .enumerate()
+            .map(|(index, v)| match v {
+                Some(_) => json!({"status":"converged","details":{"value":(index+1).to_string()}}),
                 None => json!({"status":"failed","details":{"reason":"missing"}}),
             })
             .collect::<Vec<_>>();
         let (mut rm, rb) = source(
             "ccm_root_refinement",
-            json!({"schema_version":5,"lambda_squared":"9","n_modes":1,"precision_bits":128,"force_even":true,"first_root_index":1,"discovery_mode":"reference_seeded_audit","reference_seeds_used":true,"completeness":"partial","outcomes":outcomes}),
+            json!({"schema_version":5,"lambda_squared":"9","n_modes":1,"precision_bits":128,"force_even":true,"first_root_index":1,"discovery_mode":"reference_seeded_audit","reference_seeds_used":true,"completeness":"partial","outcomes":outcomes,"starting_points":(1..=values.len()).map(|index| index.to_string()).collect::<Vec<_>>()}),
         );
         rm.dependencies.push(dep(&sec));
         let allowed = [
@@ -2078,7 +2290,12 @@ mod exhaustive_resumed_validation_contract {
             sec.content_digest.clone(),
             rm.content_digest.clone(),
         ];
-        RetainedRoots::from_payload(&rm, &rb, &sec, &sb, &s, &allowed).unwrap()
+        let mut roots = RetainedRoots::from_payload(&rm, &rb, &sec, &sb, &s, &allowed).unwrap();
+        // Exercise report classification separately from root-window source admission.
+        for (row, value) in roots.dataset.points.iter_mut().zip(values) {
+            row.value = value.map(str::to_owned);
+        }
+        roots
     }
 
     #[test]

@@ -84,7 +84,7 @@ A single Ultra run cannot supply a cohort and does not request stabilization.
 
 ## Live capture
 
-New shared Ultra plans use `ccm-measurement-capture-plan-v6`. They add
+The current shared Ultra plan uses `ccm-measurement-capture-plan-v8`. They add
 `state_geometry`, `indexed_transform`, `operator_energy` and `root_band` to
 the existing requests. Lower levels retain their previous default requests.
 The v6 plan also requests the twenty [extended groups](EXTENDED_RESEARCH.md),
@@ -111,8 +111,52 @@ repositories or their pinned versions.
 Transforms parallelize independent rows; total-energy capture parallelizes
 matrix rows. Each row and final reduction use a fixed summation order. State
 geometry uses fixed chunks and reusable recurrence scratch. Live energy capture
-borrows the already admitted Tau matrix and checks factorization/sector ancestry
-through exact manifest metadata, without rereading or recomputing a factorization.
+borrows the already admitted Tau matrix. A declared numerical Tau identity binds
+the consumed payload even when publication provenance or store aliases differ.
+Legacy Tau references also bind the semantic digest; sources without either
+declaration still require exact factorization/sector ancestry. Invalid declared
+identities fail rather than falling back to ancestry. No factorization payload
+is reread or recomputed.
+
+Retained recovery validates the requested state/matrix and root/secular joins
+before payload I/O or matrix allocation. Admission checks immutable validated
+manifests, supported reader versions, caller visibility policy, semantic
+envelopes, normalization, dimensions and precision. Payload checksums and decoded
+source contracts are checked when loaded. Publication provenance checks remain
+exact and separate from this numerical admission.
+
+Seeded and independently discovered root windows bind their declared secular
+payload bytes. Different producer versions or store aliases do not invalidate
+that numerical join. Kind, acquisition mode, dimensions, precision, parity and
+normalization remain checked; sources without a numerical declaration require
+their exact historical publication ancestry. A present but invalid declaration
+cannot fall back to provenance.
+
+Direct state, matrix, root, reference, dataset and prefix readers also enforce
+the current Toolkit's reader window, producer compatibility floor, immutable
+validated evidence and canonical binding. Their existing entry points allow
+all storage visibilities. Use `from_payload_with_policy` (or
+`RetainedSeededRootSource::from_payloads_with_policy`) to add caller restrictions.
+For streamed matrices, `from_reader_with_resources_and_policy` applies admission
+before any read or seek. Approved digest lists and payload checks remain required.
+
+At the cache layer, `admit_retained_source` exposes the same full-policy check,
+and `resolve_manifest_sources` applies it while choosing supplied parents and
+after resolver lookup. An inadmissible supplied alias cannot hide an admissible
+exact source. Rejections identify the artifact kind, semantic/payload digests
+and specific policy reasons. Read admission does not grant publication permission.
+Adopted sources must agree with the canonical producer version. An adapter may
+tighten the canonical reader window or disclosure classification. Direct root
+decoding checks the stored acquisition policy and window against the semantic
+declaration when the source declares its secular payload digest.
+Direct state and Tau readers check declared cutoff, dimensions, and precision
+against decoded values. Historical manifests may omit those declarations.
+
+`RetainedSeededRootSource` accepts current numerical Tau identities and explicit
+legacy references. Both routes still require the established even-sector ground
+source, unchanged coefficients and arithmetic policy, and adaptive root precision.
+It does not reload Tau or repeat the original ground-state proof. Secular sources
+continue to bind both eigenpair bytes and the eigenpair semantic digest.
 
 Fresh geometry costs O(N times grid length); transforms O(N times row count);
 energy O(N squared); projection O(N times basis count squared). Warm validation

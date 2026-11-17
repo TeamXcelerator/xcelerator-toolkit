@@ -100,6 +100,9 @@ pub struct RunOnceInputs {
     pub uncertainty: Option<SourceUncertainty>,
     #[serde(default)]
     pub producer_notes: Vec<String>,
+    /// A requested automatic response could not be computed or decoded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub automatic_u_flow_failed: bool,
 }
 impl RunOnceInputs {
     pub fn validate(&self, dim: usize, p: u32) -> Result<()> {
@@ -822,7 +825,7 @@ pub mod finite_capture {
         }
     }
     impl std::error::Error for ResourceLimited {}
-    pub const SEMANTICS: &str = "ccm-finite-diagnostic-capture-v7";
+    pub const SEMANTICS: &str = "ccm-finite-diagnostic-capture-v8";
     const PROFILE_RECIPE: &str = "paired_center_and_bounded_functional_complex_profiles_v3";
     const BASIS: &str = "centered_full_V_fourier";
     const NORMALIZATION: &str =
@@ -6169,13 +6172,12 @@ pub mod finite_capture {
         let (Some(roots), Some(certificate)) = (roots, certificate) else {
             return Ok(empty(id,s,"missing_input","requires retained root outcomes and the run's explicitly requested sector-gap certificate"));
         };
-        if s.modes > 512 || roots.dataset.points.len() > 256 || certificate.precision_bits() > 65536
-        {
+        if roots.dataset.points.len() > 256 || certificate.precision_bits() > 65536 {
             return Ok(empty(
                 id,
                 s,
                 "blocked",
-                "analytic root transfer exceeds its validated dimension, row or precision limit",
+                "analytic root transfer exceeds its validated row or precision limit",
             ));
         }
         let p = s.precision.max(certificate.precision_bits());
@@ -6260,6 +6262,7 @@ pub mod finite_capture {
         root_payload: Option<Vec<u8>>,
         secular_payload: Option<Vec<u8>>,
         resources: xc_core::RunResources,
+        certificate_required: bool,
         _source_reservations: Vec<xc_core::MemoryReservation>,
     }
     /// A cohort assembled entirely after acquisition. Retained values and
@@ -6381,6 +6384,12 @@ pub mod finite_capture {
     }
 
     impl RetainedFiniteSources {
+        /// Bind replay to a certificate explicitly requested in the original capture.
+        pub fn require_sector_gap_certificate(mut self) -> Self {
+            self.certificate_required = true;
+            self
+        }
+
         /// Inspect the exact profile request produced from authenticated retained
         /// state and unchanged prepared inputs. No profile analysis, primary
         /// solve, cache mutation, or publication is performed.
@@ -6455,7 +6464,7 @@ pub mod finite_capture {
                 include_matrix,
                 cache,
                 &resources,
-                &std::env::temp_dir(),
+                &xc_core::checked_cache_root()?.join("decoded-scratch"),
             )
         }
         /// Read immutable retained sources under a caller-owned budget. Pass the
@@ -6486,6 +6495,10 @@ pub mod finite_capture {
                 }
                 Ok(found.first().copied())
             };
+            let disk_limit = xc_cache::managed_resource_policy_from_environment()?
+                .maximum_temporary_disk_bytes
+                .or_else(|| xc_core::ResourcePolicy::default().maximum_temporary_disk_bytes)
+                .ok_or_else(|| anyhow::anyhow!("temporary disk allowance unavailable"))?;
             let read = |m: &ArtifactManifest| -> Result<(Vec<u8>, xc_core::MemoryReservation)> {
                 use std::io::Read;
                 let length = usize::try_from(m.size_bytes)?;
@@ -6502,7 +6515,7 @@ pub mod finite_capture {
                     m.quality,
                     acceptance,
                     scratch_directory,
-                    m.size_bytes,
+                    m.size_bytes.min(disk_limit),
                 )?;
                 let mut bytes = Vec::new();
                 bytes.try_reserve_exact(length)?;
@@ -6511,6 +6524,37 @@ pub mod finite_capture {
             };
             let em = find(&["ccm_weil_eigenpair"])?
                 .ok_or_else(|| anyhow::anyhow!("retained eigenpair manifest missing"))?;
+            // Validate the whole requested source join before any payload I/O,
+            // including before allocating the large retained Tau matrix.
+            super::super::source_admission::admit_manifest(em, cache.acceptance)?;
+            if include_matrix {
+                if let Some(matrix) = find(&["ccm_tau_matrix"])? {
+                    super::super::retained_evidence::matrix_ancestry_manifests(
+                        em, matrix, manifests, cache,
+                    )?;
+                }
+            }
+            if let Some(root) = find(&["ccm_root_refinement", "ccm_root_discovery_window"])? {
+                let secular = find(&["ccm_secular_source"])?
+                    .ok_or_else(|| anyhow::anyhow!("retained secular source manifest missing"))?;
+                super::super::source_admission::admit_manifest(root, cache.acceptance)?;
+                super::super::source_admission::admit_manifest(secular, cache.acceptance)?;
+                if !super::super::source_admission::secular_matches_state(
+                    secular,
+                    em,
+                    cache.acceptance,
+                )? {
+                    bail!("retained secular definition has another state parent");
+                }
+                if !super::super::source_admission::declared_root_secular_matches(
+                    root,
+                    secular,
+                    cache.acceptance,
+                )? && !xc_cache::manifest_depends_on(root, secular)?
+                {
+                    bail!("retained roots have another secular parent");
+                }
+            }
             let mut source_reservations = Vec::new();
             let (state, state_payload) = {
                 let (bytes, _buffer) = read(em)?;
@@ -6534,35 +6578,6 @@ pub mod finite_capture {
                     std::slice::from_ref(&em.content_digest),
                 )?;
                 (state, bytes)
-            };
-            let matrix = if include_matrix {
-                find(&["ccm_tau_matrix"])?
-                    .map(|m| -> Result<_> {
-                        let spool_workspace = resources.try_reserve_working(2 << 20)?;
-                        let mut source = resolver.open_exact_payload(
-                            &m.key,
-                            &m.content_digest,
-                            m.quality,
-                            acceptance,
-                            scratch_directory,
-                            m.size_bytes,
-                        )?;
-                        drop(spool_workspace);
-                        let matrix = RetainedMatrix::from_reader_with_resources(
-                            m,
-                            &mut source.payload,
-                            std::slice::from_ref(&m.content_digest),
-                            resources,
-                        )?;
-                        matrix.match_state(&state)?;
-                        super::super::retained_evidence::matrix_ancestry(
-                            &state, &matrix, manifests, cache,
-                        )?;
-                        Ok(matrix)
-                    })
-                    .transpose()?
-            } else {
-                None
             };
             let root_sources = find(&["ccm_root_refinement", "ccm_root_discovery_window"])?
                 .map(|m| -> Result<_> {
@@ -6591,6 +6606,32 @@ pub mod finite_capture {
                 Some((roots, root, secular)) => (Some(roots), Some(root), Some(secular)),
                 None => (None, None, None),
             };
+            let matrix = if include_matrix {
+                find(&["ccm_tau_matrix"])?
+                    .map(|m| -> Result<_> {
+                        let spool_workspace = resources.try_reserve_working(2 << 20)?;
+                        let mut source = resolver.open_exact_payload(
+                            &m.key,
+                            &m.content_digest,
+                            m.quality,
+                            acceptance,
+                            scratch_directory,
+                            m.size_bytes.min(disk_limit),
+                        )?;
+                        drop(spool_workspace);
+                        let matrix = RetainedMatrix::from_reader_with_resources(
+                            m,
+                            &mut source.payload,
+                            std::slice::from_ref(&m.content_digest),
+                            resources,
+                        )?;
+                        matrix.match_state(&state)?;
+                        Ok(matrix)
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             Ok(Self {
                 state,
                 matrix,
@@ -6599,6 +6640,7 @@ pub mod finite_capture {
                 root_payload,
                 secular_payload,
                 resources: resources.clone(),
+                certificate_required: false,
                 _source_reservations: source_reservations,
             })
         }
@@ -6607,7 +6649,7 @@ pub mod finite_capture {
             Ok(CohortObservation {schema_version:1,
                 scope:"authenticated finite stored point roots; identical ordinal labels are not an independent branch-matching or global-index certificate".into(),
                 source_eigenpair:self.state.manifest.content_digest.clone(),source_roots:roots.map(|r|r.manifest.content_digest.clone()),
-                source_matrix:self.matrix.as_ref().map(|m|m.manifest.content_digest.clone()).or_else(||self.state.manifest.dependencies.iter().find(|d|d.key.kind=="ccm_tau_matrix").map(|d|d.content_digest.clone())),
+                source_matrix:self.matrix.as_ref().map(|m|m.manifest.content_digest.clone()).or(super::super::source_admission::declared_tau_digest(&self.state.manifest, None)?).or_else(||self.state.manifest.dependencies.iter().find(|d|d.key.kind=="ccm_tau_matrix").map(|d|d.content_digest.clone())),
                 eigenvalue:exact(&Float::with_val(self.state.precision,Float::parse(&self.state.eigenvalue)?))?.to_string(),
                 lambda_squared:self.state.cutoff.clone(),n_modes:self.state.modes,precision_bits:self.state.precision,
                 root_precision_bits:roots.map(|r|r.dataset.precision_bits),selection_policy:self.state.selection_policy.clone(),
@@ -6621,7 +6663,14 @@ pub mod finite_capture {
         /// Validate a supplemental input against the authenticated retained state.
         /// This route has no primary acquisition or root-solving fallback.
         pub fn validate_recovery_input(&self, input: &ExternalResearchInputs) -> Result<()> {
-            input.matches(&self.state)
+            input.matches(&self.state)?;
+            if let Some(assessment) = &input.cluster_preparation_assessment {
+                let matrix = self.matrix.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("cluster preparation assessment requires retained Tau")
+                })?;
+                assessment.matches(&self.state, matrix)?;
+            }
+            Ok(())
         }
 
         /// Restore the live route's explicitly finite reference jets from the
@@ -6722,11 +6771,13 @@ pub mod finite_capture {
             &self,
             base: Option<&ExternalResearchInputs>,
         ) -> Result<ExternalResearchInputs> {
+            if let Some(base) = base {
+                self.validate_recovery_input(base)?;
+            }
             let mut arithmetic = self.prepare_recovery_arithmetic_inputs()?;
             let Some(base) = base else {
                 return Ok(arithmetic);
             };
-            self.validate_recovery_input(base)?;
             let mut input = base.clone();
             super::super::research_completion::align_input_precisions(&mut input, &mut arithmetic)?;
             if input.atoms.is_empty() {
@@ -6812,9 +6863,55 @@ pub mod finite_capture {
             cache: &ArtifactCacheContext<'_>,
             response_options: Option<&super::super::hp::response_repair::RetainedResponseOptions>,
         ) -> std::result::Result<xc_cache::CapturedDiagnostic, xc_cache::CaptureFailure> {
+            let needs_actions = matches!(
+                id.trim_end_matches("_full"),
+                "directional_response" | "root_transport"
+            ) && input
+                .run_once
+                .as_ref()
+                .is_none_or(|r| r.derivative_actions.is_empty() || r.automatic_u_flow_failed);
+            let mut flows = research_sources
+                .iter()
+                .filter(|m| m.key.kind == "ccm_u_flow_response_analysis");
+            let flow = flows.next();
+            if needs_actions
+                && (input
+                    .run_once
+                    .as_ref()
+                    .is_some_and(|r| r.automatic_u_flow_failed)
+                    || flow.is_none()
+                    || flows.next().is_some())
+            {
+                return Err(xc_cache::CaptureFailure::Blocked {
+                    reason: "required derivative actions unavailable during response recovery"
+                        .into(),
+                });
+            }
             let attempt = || -> Result<xc_cache::CapturedDiagnostic> {
                 let _scope = self.resources.enter();
                 self.validate_recovery_input(input)?;
+                let mut restored;
+                let _reservation;
+                let input = if let Some(manifest) = flow.filter(|_| needs_actions) {
+                    _reservation = self.resources.try_reserve_working(
+                        manifest
+                            .size_bytes
+                            .checked_mul(16)
+                            .ok_or_else(|| anyhow::anyhow!("u-flow recovery size overflow"))?,
+                    )?;
+                    let actions = super::super::hp::response_repair::read_retained_actions(
+                        &self.response_sources()?,
+                        manifest,
+                        cache,
+                    )?;
+                    restored = input.clone();
+                    let run = restored.run_once.get_or_insert_with(Default::default);
+                    run.derivative_actions = actions;
+                    run.log_cutoff_velocity = Some("1".into());
+                    &restored
+                } else {
+                    input
+                };
                 if id == "indexed_transform" {
                     let roots = self.roots.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("indexed transform requires its authenticated root window")
@@ -6894,42 +6991,92 @@ pub mod finite_capture {
                     && input.cluster_preparation_assessment.is_some()))
                 .then_some(self.matrix.as_ref())
                 .flatten();
-                let result = super::super::extended_research::capture_extended(
-                    normalized,
-                    &self.state,
-                    matrix,
-                    roots,
-                    (normalized != "compactness").then_some(input),
-                    &options,
+                let result = self.with_recovery_certificate(
+                    matches!(normalized, "transform_enclosure" | "capture_preflight"),
                     research_sources,
                     cache,
+                    |certificate| {
+                        super::super::extended_research::capture_extended_prepared_ref(
+                            normalized,
+                            &self.state,
+                            matrix,
+                            roots,
+                            (normalized != "compactness").then_some(input),
+                            certificate,
+                            &options,
+                            research_sources,
+                            cache,
+                            None,
+                        )
+                    },
                 )?;
                 Ok(xc_cache::CapturedDiagnostic::from_cached(result)?)
             };
             let result =
                 attempt().map_err(super::super::hp::response_repair::retained_capture_failure)?;
-            // Match RetainedCcmRun's outcome adapter. Qualified numerical
-            // limitations remain measurements; missing prerequisites do not.
-            if result.value["data"]["outcome"] == "missing_input" {
-                return Err(xc_cache::CaptureFailure::Missing {
-                    reason: result.value["data"]["reason"]
-                        .as_str()
-                        .unwrap_or("required retained inputs unavailable")
-                        .into(),
-                });
+            result.qualified_for(id)
+        }
+
+        /// Open exactly the journal's certificate and keep its workspace reservation
+        /// alive throughout replay, for either on-disk representation.
+        fn with_recovery_certificate<T>(
+            &self,
+            requested: bool,
+            sources: &[ArtifactManifest],
+            cache: &ArtifactCacheContext<'_>,
+            replay: impl FnOnce(Option<(SectorGapCertificateRef<'_>, &ArtifactManifest)>) -> Result<T>,
+        ) -> Result<T> {
+            if !requested {
+                return replay(None);
             }
-            if result.value["kind"] == "ccm_finite_diagnostic_analysis"
-                && result.value_reference.is_none()
-                && result.value["data"]["outcome"] == "blocked"
-            {
-                return Err(xc_cache::CaptureFailure::Blocked {
-                    reason: result.value["data"]["reason"]
-                        .as_str()
-                        .unwrap_or("diagnostic resource limit")
-                        .into(),
-                });
+            use super::super::sector_gap_certificate::{
+                compact::CompactCcmSectorGapCertificate, PortableCcmSectorGapCertificate,
+            };
+            let mut selected = sources
+                .iter()
+                .filter(|m| m.key.kind == "ccm_sector_gap_certificate");
+            if let Some(manifest) = selected.next() {
+                anyhow::ensure!(
+                    selected.next().is_none(),
+                    "ambiguous retained sector-gap certificate"
+                );
+                let resolver = cache.resolver.ok_or_else(|| {
+                    anyhow::anyhow!("retained sector-gap certificate requires a resolver")
+                })?;
+                let acceptance = cache.acceptance.ok_or_else(|| {
+                    anyhow::anyhow!("retained sector-gap certificate requires an acceptance policy")
+                })?;
+                let bytes = manifest
+                    .size_bytes
+                    .checked_mul(16)
+                    .ok_or_else(|| anyhow::anyhow!("retained certificate size overflow"))?;
+                let _reservation = self.resources.try_reserve_working(bytes)?;
+                let raw = resolver.read_exact_payload(
+                    &manifest.key,
+                    &manifest.content_digest,
+                    acceptance,
+                )?;
+                #[derive(serde::Deserialize)]
+                struct Header {
+                    reconstruction_semantics: Option<String>,
+                }
+                let header: Header = serde_json::from_slice(&raw)?;
+                let compact;
+                let full;
+                let certificate = if header.reconstruction_semantics.is_some() {
+                    compact = serde_json::from_slice::<CompactCcmSectorGapCertificate>(&raw)?;
+                    SectorGapCertificateRef::Compact(&compact)
+                } else {
+                    full = serde_json::from_slice::<PortableCcmSectorGapCertificate>(&raw)?;
+                    SectorGapCertificateRef::Full(&full)
+                };
+                return replay(Some((certificate, manifest)));
             }
-            Ok(result)
+            anyhow::ensure!(
+                !self.certificate_required,
+                "requested sector-gap certificate unavailable during recovery"
+            );
+            replay(None)
         }
         pub fn capture(
             &self,
@@ -6957,6 +7104,16 @@ pub mod finite_capture {
             )
             .then_some(self.roots.as_ref())
             .flatten();
+            if id == "finite_root_budget" {
+                return self.with_recovery_certificate(true, research_sources, cache, |certificate| {
+                    let execution = ExecutionContext {
+                        policy: super::super::capture_runtime::CaptureResourcePolicy::from_environment()?,
+                        ..Default::default()
+                    };
+                    capture_with_prepared_ref(id, &self.state, matrix, roots, input, certificate,
+                        research_sources, cache, &execution, None)
+                });
+            }
             capture(
                 id,
                 &self.state,
@@ -7089,17 +7246,17 @@ pub mod finite_capture {
                     bail!("execution resource limit; do not retain");
                 }
             };
-            if id == "finite_root_budget" && certificate.is_none() {
-                if let Some(reason) = &execution.certificate_error {
-                    let mut a = empty(
-                        id,
-                        s,
-                        "blocked",
-                        &format!("requested sector-gap certificate failed: {reason}"),
-                    );
-                    a.input_preparation_error = execution.input_preparation_error.clone();
-                    return Ok(a);
-                }
+            if id == "finite_root_budget"
+                && certificate.is_none()
+                && execution.certificate_error.is_some()
+            {
+                let a = empty(
+                    id,
+                    s,
+                    "blocked",
+                    "requested sector-gap certificate unavailable",
+                );
+                return Ok(a);
             }
             let result = compute_with_certificate_ref(
                 id,
@@ -7238,7 +7395,6 @@ pub mod finite_capture {
                     }
                 }
             }
-            a.input_preparation_error = execution.input_preparation_error.clone();
             if serde_json::to_vec(&a)?.len() as u64 > policy.maximum_output_bytes {
                 *limited.borrow_mut() = Some(empty(
                     id,
@@ -7390,11 +7546,15 @@ pub mod finite_capture {
         let mut sources = vec![s.manifest.clone()];
         if let Some(m) = m {
             m.match_state(s)?;
-            sources.extend(matrix_ancestry(s, m, parents, cache)?);
+            matrix_ancestry(s, m, parents, cache)?;
             sources.push(m.manifest.clone());
         }
         if let Some(r) = roots {
-            if !xc_cache::manifest_depends_on(&r.secular_manifest, &s.manifest)? {
+            if !super::super::source_admission::secular_matches_state(
+                &r.secular_manifest,
+                &s.manifest,
+                cache.acceptance,
+            )? {
                 bail!("root source mismatch");
             }
             sources.extend([r.manifest.clone(), r.secular_manifest.clone()]);
@@ -7461,8 +7621,7 @@ pub mod finite_capture {
             None
         };
         let mut request = json!({"semantics":SEMANTICS,"diagnostic":id,"input_digest":input_digest,
-            "certificate_failure":if id == "finite_root_budget" && certificate.is_none() { execution.certificate_error.as_ref() } else { None },
-            "input_preparation_failure":execution.input_preparation_error,
+            "certificate_failure":if id == "finite_root_budget" && certificate.is_none() { execution.certificate_error.as_ref().map(|_| "certificate_unavailable") } else { None },
             "arb_enabled":cfg!(feature="arb"),
             "matrix_policy":"exact rational symmetric part of retained Tau","root_window_policy":"2^-clamp(precision/8,16,256)"});
         if matches!(id, "trial_vector_energy" | "trial_vector_parity") {
@@ -7479,9 +7638,16 @@ pub mod finite_capture {
         ) {
             request["convergence_defaults"] = json!(cv::Options::default());
         }
-        if matches!(certificate, Some((SectorGapCertificateRef::Compact(_), _))) {
+        let compact_digest = if let Some((SectorGapCertificateRef::Compact(proof), _)) = certificate
+        {
             request["sector_certificate_representation"] = json!("compact_analytic_replay_v1");
-        }
+            Some(proof.proof_digest()?)
+        } else {
+            None
+        };
+        let proof_inputs = compact_digest.as_ref().map(|digest| {
+            super::super::retained_evidence::compact_certificate_inputs(&sources, digest)
+        });
         request["automatic_recipe"] = json!("retained_primary_then_finite_analysis_v1");
         request["profile_recipe"] = json!(if matches!(
             id,
@@ -7543,9 +7709,41 @@ pub mod finite_capture {
             {
                 bail!("invalid finite diagnostic acquisition record");
             }
+            // An automatic root budget names the proof and exact windows used.
+            // Check the cached report against those bindings on a warm read too.
+            if let Some(proof) = &compact_digest {
+                let supplied_problem = input
+                    .and_then(|i| i.finite_diagnostics.as_ref())
+                    .is_some_and(|extra| extra.convergence.contains_key(id));
+                if a.outcome == "computed" && !supplied_problem {
+                    use super::super::sector_gap_certificate::compact;
+                    let state = &s.manifest.content_digest;
+                    let windows = &a.result["request"];
+                    let report = &a.result["report"];
+                    let digest = compact::root_budget_request_digest(state, proof, windows)?;
+                    if !windows.is_object()
+                        || report["semantics"] != compact::ROOT_BUDGET_SEMANTICS
+                        || report["source_digest"] != state.0
+                        || report["matrix_certificate_digest"] != proof.0
+                        || report["request_digest"] != digest.0
+                    {
+                        bail!("compact root-budget report differs from its bound proof, state or request");
+                    }
+                }
+            }
             Ok(())
         };
-        let first = managed(KIND, request.clone(), &sources, cache, compute, validate);
+        let annotations = BTreeMap::new();
+        let first = super::super::retained_evidence::managed_with_input_identities(
+            KIND,
+            request.clone(),
+            &sources,
+            cache,
+            &annotations,
+            proof_inputs.as_deref(),
+            compute,
+            validate,
+        );
         let limited = limited.into_inner();
         match (first, limited) {
             (Err(_), Some(data)) => {
@@ -7562,7 +7760,16 @@ pub mod finite_capture {
                     certification_failure_policy: cache.certification_failure_policy,
                     production_sink: None,
                 };
-                managed(KIND, request, &sources, &unretained, || Ok(data), validate)
+                super::super::retained_evidence::managed_with_input_identities(
+                    KIND,
+                    request,
+                    &sources,
+                    &unretained,
+                    &annotations,
+                    proof_inputs.as_deref(),
+                    || Ok(data),
+                    validate,
+                )
             }
             (first, _) => first,
         }
@@ -7674,6 +7881,7 @@ pub mod finite_capture {
                     root_payload: None,
                     secular_payload: None,
                     resources: xc_core::RunResources::with_worker_limit(256 << 20, 2).unwrap(),
+                    certificate_required: false,
                     _source_reservations: vec![],
                 },
                 original,

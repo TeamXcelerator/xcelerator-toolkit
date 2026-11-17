@@ -57,7 +57,6 @@ struct Measurement {
     rows: Vec<Values>,
     precision: u32,
     complete: bool,
-    budget_limited: bool,
     /// Which step left an incomplete measurement unresolved.
     unresolved: Option<&'static str>,
     selected: Vec<usize>,
@@ -577,15 +576,14 @@ fn calculate(
         rows,
         precision: p,
         complete: false,
-        budget_limited: workspace > limit,
         unresolved: Some(unresolved),
         selected: basis.selected.clone(),
     };
     if workspace > limit {
-        return Ok(Some(partial(
-            rows,
-            "complement interval workspace exceeds working-byte budget",
-        )));
+        xc_core::progress_message!(
+            "warning: operator_cluster estimated dense workspace {workspace} bytes exceeds the \
+             working budget of {limit} bytes at {p} bits (dimension {n}). Continuing with the verified solve."
+        );
     }
     let mut right = du.clone();
     for a in 0..b {
@@ -700,7 +698,6 @@ fn calculate(
         rows,
         precision: p,
         complete: true,
-        budget_limited: false,
         unresolved: None,
         selected: basis.selected,
     }))
@@ -788,14 +785,13 @@ pub(super) fn analyze(
                     "cluster guard vector scratch exceeds working-byte budget before any measurement",
                 ));
             };
-            measured.budget_limited = true;
             measured.unresolved = Some("cluster guard vector scratch exceeds working-byte budget");
             break;
         }
         if let Some(measured) =
             calculate(s, m, &raw, o, input, limit, requested, requested + guard)?
         {
-            let done = measured.complete || measured.budget_limited;
+            let done = measured.complete;
             accepted = Some(measured);
             if done {
                 break;

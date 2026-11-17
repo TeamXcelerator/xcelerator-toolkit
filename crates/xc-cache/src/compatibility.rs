@@ -26,6 +26,38 @@ pub fn current_toolkit_version() -> Result<ToolkitVersion, CacheError> {
     ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))
 }
 
+/// These computations changed within the same patch release. Exact reads of
+/// their previous envelopes must respect the same contract as ordinary lookup.
+pub(crate) fn supported_numerical_contract(key: &crate::SemanticKeyEnvelope) -> bool {
+    let contract = key.mathematical_semantics_version.as_str();
+    match key.artifact_kind.as_str() {
+        "ccm_transform_enclosure" | "ccm_finite_diagnostic_analysis" => {
+            contract == format!("{}/value-v2", key.artifact_kind)
+        }
+        "research_capture_receipt" => contract == "capture-receipt-completion-v2",
+        "ccm_assembly_error_analysis" => {
+            contract == "ccm-assembly-error-exact-form-v4"
+                && key.resolved_mathematical_parameters["root_selection_digest"]
+                    .as_str()
+                    .is_some_and(|digest| crate::ContentDigest(digest.to_owned()).validate())
+        }
+        "ccm_u_flow_response_analysis" => contract == "ccm-u-flow-response-generated-quadrature-v5",
+        "ccm_root_discovery_window"
+            if key
+                .algorithm_semantics
+                .as_deref()
+                .is_some_and(|s| s.contains("+adaptive_root_precision")) =>
+        {
+            matches!(
+                contract,
+                "ccm-complete-positive-adaptive-v16" | "ccm-root-discovery-adaptive-v3"
+            )
+        }
+        "ccm_root_refinement" => contract != "ccm-root-range-v0.15.2-v12",
+        _ => true,
+    }
+}
+
 /// Return the release policy for a managed cache family.
 ///
 /// Families use the current canonical baseline unless an explicit override is
@@ -127,12 +159,13 @@ pub fn artifact_compatibility_policy(
         "ccm_state_geometry_analysis" | "research_observation_packet" | "research_reference_dataset"
         | "ccm_reference_source" | "ccm_reference_projection_analysis" | "ccm_indexed_transform_analysis"
         | "ccm_operator_energy_analysis" | "ccm_root_band_analysis" | "ccm_stabilization_analysis" => CLEAN_SLATE,
-        "ccm_compactness_analysis" | "ccm_arithmetic_energy_analysis" | "ccm_directional_response_analysis" | "ccm_weighted_tail_analysis" | "ccm_spectral_cluster_analysis" | "ccm_resolution_budget_analysis" | "ccm_energy_allowance_analysis" | "ccm_weighted_reference_projection" | "ccm_signed_transform_analysis" | "ccm_external_research_source" | "ccm_complex_transform_analysis" | "ccm_root_transport_analysis" | "ccm_operator_cluster_analysis" | "ccm_finite_section_transfer" | "ccm_tail_operator_analysis" | "ccm_observable_budget_analysis" | "ccm_capture_preflight" | "ccm_consistency_analysis" | "ccm_configuration_comparison" | "ccm_band_reconstruction" | "ccm_finite_diagnostic_analysis" | "ccm_transform_enclosure" => CLEAN_SLATE,
-        "research_capture_receipt" | "research_hypothesis_evaluation" => CLEAN_SLATE,
+        "ccm_compactness_analysis" | "ccm_arithmetic_energy_analysis" | "ccm_directional_response_analysis" | "ccm_weighted_tail_analysis" | "ccm_spectral_cluster_analysis" | "ccm_resolution_budget_analysis" | "ccm_energy_allowance_analysis" | "ccm_weighted_reference_projection" | "ccm_signed_transform_analysis" | "ccm_external_research_source" | "ccm_complex_transform_analysis" | "ccm_root_transport_analysis" | "ccm_operator_cluster_analysis" | "ccm_finite_section_transfer" | "ccm_tail_operator_analysis" | "ccm_observable_budget_analysis" | "ccm_capture_preflight" | "ccm_consistency_analysis" | "ccm_configuration_comparison" | "ccm_band_reconstruction" => CLEAN_SLATE,
+        "research_hypothesis_evaluation" => CLEAN_SLATE,
         "ccm_root_conditioning_analysis" => CLEAN_SLATE,
         "ccm_deviation_decomposition" => CLEAN_SLATE,
         "ccm_prime_power_response_analysis" => CLEAN_SLATE,
-        "ccm_u_flow_response_analysis" => CLEAN_SLATE,
+        "ccm_u_flow_response_analysis" | "ccm_finite_diagnostic_analysis"
+        | "ccm_transform_enclosure" | "research_capture_receipt" => "0.17.2",
         "ccm_sector_gap_certificate" => CLEAN_SLATE,
         "ccm_cross_check_record" => CLEAN_SLATE,
         "ccm_validation_record" => CLEAN_SLATE,
@@ -236,6 +269,80 @@ mod tests {
     }
 
     #[test]
+    fn same_release_rejects_superseded_contracts_for_affected_computations() {
+        for (kind, old, current) in [
+            (
+                "ccm_transform_enclosure",
+                "ccm_transform_enclosure/value-v1",
+                "ccm_transform_enclosure/value-v2",
+            ),
+            (
+                "ccm_finite_diagnostic_analysis",
+                "ccm_finite_diagnostic_analysis/value-v1",
+                "ccm_finite_diagnostic_analysis/value-v2",
+            ),
+            (
+                "research_capture_receipt",
+                "managed-research-record-v1",
+                "capture-receipt-completion-v2",
+            ),
+            (
+                "ccm_u_flow_response_analysis",
+                "ccm-u-flow-response-v4",
+                "ccm-u-flow-response-generated-quadrature-v5",
+            ),
+            (
+                "ccm_root_refinement",
+                "ccm-root-range-v0.15.2-v12",
+                "ccm-adaptive-root-range-v13",
+            ),
+        ] {
+            let mut key = crate::SemanticKeyEnvelope {
+                schema_version: 1,
+                artifact_kind: kind.into(),
+                mathematical_semantics_version: old.into(),
+                resolved_mathematical_parameters: serde_json::json!({}),
+                normalization: None,
+                target: None,
+                subspace: None,
+                algorithm_semantics: None,
+                source_data_identities: Default::default(),
+            };
+            assert!(!supported_numerical_contract(&key), "{kind}");
+            key.mathematical_semantics_version = current.into();
+            assert!(supported_numerical_contract(&key), "{kind}");
+        }
+    }
+
+    #[test]
+    fn assembly_error_contract_requires_a_root_selection_digest() {
+        let mut key = crate::SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_assembly_error_analysis".into(),
+            mathematical_semantics_version: "ccm-assembly-error-exact-form-v4".into(),
+            resolved_mathematical_parameters: serde_json::json!({}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            algorithm_semantics: None,
+            source_data_identities: Default::default(),
+        };
+        assert!(!supported_numerical_contract(&key));
+        key.resolved_mathematical_parameters["root_selection_digest"] = "bad digest".into();
+        assert!(!supported_numerical_contract(&key));
+        key.resolved_mathematical_parameters["root_selection_digest"] =
+            crate::ContentDigest::sha256(b"[]").0.into();
+        assert!(supported_numerical_contract(&key));
+        for old in [
+            "ccm-assembly-error-exact-form-v2",
+            "ccm-assembly-error-exact-form-v3",
+        ] {
+            key.mathematical_semantics_version = old.into();
+            assert!(!supported_numerical_contract(&key));
+        }
+    }
+
+    #[test]
     fn every_managed_family_has_an_explicit_policy() {
         for family in MANAGED_FAMILIES {
             assert_eq!(
@@ -259,10 +366,21 @@ mod tests {
             assert!(!kinds.is_empty(), "{family}");
             for kind in kinds {
                 let policy = artifact_compatibility_policy(family, kind).unwrap();
-                assert_eq!(policy.minimum_producer_version, floor, "{family}/{kind}");
+                let expected = if matches!(
+                    *kind,
+                    "ccm_finite_diagnostic_analysis"
+                        | "ccm_transform_enclosure"
+                        | "ccm_u_flow_response_analysis"
+                        | "research_capture_receipt"
+                ) {
+                    version("0.17.2")
+                } else {
+                    floor.clone()
+                };
+                assert_eq!(policy.minimum_producer_version, expected, "{family}/{kind}");
                 assert_eq!(policy.minimum_reader_version, floor, "{family}/{kind}");
                 assert!(policy
-                    .validate_manifest_versions(1, &floor, &floor, None)
+                    .validate_manifest_versions(1, &expected, &floor, None)
                     .is_ok());
                 let earlier_producer = policy
                     .validate_manifest_versions(1, &version("0.15.2"), &floor, None)

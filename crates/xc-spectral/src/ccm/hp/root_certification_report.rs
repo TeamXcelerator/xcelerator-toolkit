@@ -9,6 +9,15 @@ use super::super::certified_roots::{
     PartialIndependentCcmRootCertification,
 };
 use super::*;
+mod reference_labels;
+
+fn scope(route: ReportRoute) -> &'static str {
+    if route == ReportRoute::ReferenceLabels {
+        "ordinal is the reference label; computed_matches_certified_ordinal is the independently counted positive finite-source rank of the enclosure containing the converged point"
+    } else {
+        ROOT_CERTIFICATION_REPORT_SCOPE
+    }
+}
 
 pub const ROOT_CERTIFICATION_REPORT_SEMANTICS: &str = "ccm-root-certification-report-v0.16.0-v1";
 pub const COMPLETE_POSITIVE_ROOT_CERTIFICATION_REPORT_SEMANTICS: &str =
@@ -20,6 +29,7 @@ const ROOT_CERTIFICATION_REPORT_SCOPE: &str = "certified rows are interval enclo
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReportRoute {
     PoleSpan,
+    ReferenceLabels,
     TightPoleSpan,
     CompletePositive,
 }
@@ -27,6 +37,7 @@ impl ReportRoute {
     fn semantics(self) -> &'static str {
         match self {
             Self::PoleSpan => ROOT_CERTIFICATION_REPORT_SEMANTICS,
+            Self::ReferenceLabels => "ccm-reference-label-to-certified-finite-rank-v1",
             Self::TightPoleSpan => TIGHT_ROOT_CERTIFICATION_REPORT_SEMANTICS,
             Self::CompletePositive => COMPLETE_POSITIVE_ROOT_CERTIFICATION_REPORT_SEMANTICS,
         }
@@ -34,6 +45,7 @@ impl ReportRoute {
     fn algorithm(self) -> &'static str {
         match self {
             Self::PoleSpan => "whole_range_then_bisected_flint_arb_or_pole_gap_census_isolation_and_interval_newton_v2",
+            Self::ReferenceLabels => "independent_prefix_census_unique_ordered_point_membership_v1",
             Self::TightPoleSpan => "exact_cumulative_finite_source_counts_then_flint_arb_tight_boxes_and_interval_newton_v1",
             Self::CompletePositive => "exact_cauchy_bound_whole_positive_numerator_flint_arb_isolation_and_interval_newton_v1",
         }
@@ -56,7 +68,8 @@ pub struct CcmRootCertificationRow {
     pub certified_precision_bits: Option<u32>,
     /// `inside`, `outside`, `no_computed_value`, or `not_certified`.
     pub computed_agreement: String,
-    /// When a computed value lies in another ordinal's certified enclosure.
+    /// Matched independent rank. For reference-label reports this is present
+    /// on every certified row and `ordinal` denotes the reference label.
     pub computed_matches_certified_ordinal: Option<usize>,
     pub reason: Option<String>,
 }
@@ -103,8 +116,15 @@ impl CcmRootCertificationReport {
     pub fn complete_certificate(
         &self,
     ) -> Option<&super::super::certified_roots::ProductionIndependentCcmRootCertificate> {
-        (self.outcome == "certified_finite_enclosure" && self.certification.certificates.len() == 1)
-            .then(|| &self.certification.certificates[0])
+        (self.outcome == "certified_finite_enclosure"
+            && self.certification.certificates.len() == 1
+            && (self.semantics != ReportRoute::ReferenceLabels.semantics()
+                || self.certification.certificates[0].target == self.request.target
+                    && self
+                        .rows
+                        .iter()
+                        .all(|r| r.computed_matches_certified_ordinal == Some(r.ordinal))))
+        .then(|| &self.certification.certificates[0])
     }
 }
 
@@ -115,6 +135,32 @@ fn computed_status(result: &EigenvalueResult) -> &'static str {
         EigenvalueResult::Approximate(_) => "approximate",
         EigenvalueResult::Failed { .. } => "failed",
     }
+}
+
+/// Replay certification of reference-labelled points using only the retained
+/// primary state. The independent census uses the exact stored secular weights.
+/// Standalone reports carry no cache manifest identities.
+pub fn certify_retained_reference_roots(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    primary: &HighPrecResult,
+    options: &CcmRootCertificationOptions,
+) -> Result<CcmRootCertificationReport> {
+    anyhow::ensure!(cfg.precision_bits == primary.precision_bits && primary.xi.len() == params.matrix_size()
+        && !matches!(options.target, IndependentCcmRootTarget::PositiveHeightWindow { .. }),
+        "reference-labelled certification requires matching primary dimensions, precision and an explicit label range");
+    Ok(resolve_report_with_route(
+        params,
+        cfg,
+        primary,
+        &primary.xi,
+        None,
+        None,
+        options,
+        None,
+        ReportRoute::ReferenceLabels,
+    )?
+    .0)
 }
 
 fn requested_ordinals(
@@ -242,6 +288,7 @@ fn unavailable(
 }
 
 /// Build the per-root report without a cache.
+#[cfg(all(test, feature = "arb"))]
 pub(super) fn build_root_certification_report(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -278,7 +325,12 @@ fn build_root_certification_report_with_route(
     if first == 0 || first > last {
         bail!("CCM root certification request has no ordinal range");
     }
-    let mut certification = certify_partially(params, cfg, weights, options, first, last, route)?;
+    let seeded = route == ReportRoute::ReferenceLabels;
+    let mut certification = if seeded {
+        reference_labels::certify(params, cfg, primary, weights, options, first, last)?
+    } else {
+        certify_partially(params, cfg, weights, options, first, last, route)?
+    };
     let mut enclosures = BTreeMap::new();
     for certificate in &certification.certificates {
         let start = certificate.first_selected_positive_index.ok_or_else(|| {
@@ -304,74 +356,78 @@ fn build_root_certification_report_with_route(
             .and_then(|offset| primary.eigenvalues_pos.get(offset))
     };
     let mut rows = Vec::with_capacity(last - first + 1);
-    for ordinal in first..=last {
-        let computed = computed_at(ordinal);
-        let value = computed.and_then(EigenvalueResult::value);
-        let mut row = CcmRootCertificationRow {
-            ordinal,
-            outcome: String::new(),
-            computed_status: computed.map_or("absent", computed_status).to_owned(),
-            computed_value: value.map(lossless_hp_decimal),
-            certified_lower: None,
-            certified_upper: None,
-            certified_precision_bits: None,
-            computed_agreement: "not_certified".to_owned(),
-            computed_matches_certified_ordinal: None,
-            reason: None,
-        };
-        if let Some(root) = enclosures.get(&ordinal) {
-            row.outcome = "certified_finite_enclosure".to_owned();
-            row.certified_lower = Some(root.lower.clone());
-            row.certified_upper = Some(root.upper.clone());
-            row.certified_precision_bits = Some(root.precision_bits);
-            row.computed_agreement = match value {
-                None => "no_computed_value".to_owned(),
-                Some(v)
-                    if stored_root_in_decimal_interval(
-                        v,
-                        &root.lower,
-                        &root.upper,
-                        root.precision_bits,
-                    )? =>
-                {
-                    "inside".to_owned()
-                }
-                Some(_) => "outside".to_owned(),
+    if seeded {
+        rows = reference_labels::rows(primary, first, last, &certification)?;
+    } else {
+        for ordinal in first..=last {
+            let computed = computed_at(ordinal);
+            let value = computed.and_then(EigenvalueResult::value);
+            let mut row = CcmRootCertificationRow {
+                ordinal,
+                outcome: String::new(),
+                computed_status: computed.map_or("absent", computed_status).to_owned(),
+                computed_value: value.map(lossless_hp_decimal),
+                certified_lower: None,
+                certified_upper: None,
+                certified_precision_bits: None,
+                computed_agreement: "not_certified".to_owned(),
+                computed_matches_certified_ordinal: None,
+                reason: None,
             };
-        } else {
-            row.outcome = if value.is_some() {
-                "computed_not_certified"
-            } else {
-                "not_computed_not_certified"
-            }
-            .to_owned();
-            row.reason = certification.uncertified.get(&ordinal).cloned();
-        }
-        if row.computed_agreement == "outside" || row.computed_agreement == "not_certified" {
-            if let Some(v) = value {
-                for (other, root) in &enclosures {
-                    if *other != ordinal
-                        && stored_root_in_decimal_interval(
+            if let Some(root) = enclosures.get(&ordinal) {
+                row.outcome = "certified_finite_enclosure".to_owned();
+                row.certified_lower = Some(root.lower.clone());
+                row.certified_upper = Some(root.upper.clone());
+                row.certified_precision_bits = Some(root.precision_bits);
+                row.computed_agreement = match value {
+                    None => "no_computed_value".to_owned(),
+                    Some(v)
+                        if stored_root_in_decimal_interval(
                             v,
                             &root.lower,
                             &root.upper,
                             root.precision_bits,
-                        )?
+                        )? =>
                     {
-                        row.computed_matches_certified_ordinal = Some(*other);
-                        break;
+                        "inside".to_owned()
+                    }
+                    Some(_) => "outside".to_owned(),
+                };
+            } else {
+                row.outcome = if value.is_some() {
+                    "computed_not_certified"
+                } else {
+                    "not_computed_not_certified"
+                }
+                .to_owned();
+                row.reason = certification.uncertified.get(&ordinal).cloned();
+            }
+            if row.computed_agreement == "outside" || row.computed_agreement == "not_certified" {
+                if let Some(v) = value {
+                    for (other, root) in &enclosures {
+                        if *other != ordinal
+                            && stored_root_in_decimal_interval(
+                                v,
+                                &root.lower,
+                                &root.upper,
+                                root.precision_bits,
+                            )?
+                        {
+                            row.computed_matches_certified_ordinal = Some(*other);
+                            break;
+                        }
                     }
                 }
             }
+            rows.push(row);
         }
-        rows.push(row);
     }
     let count = |outcome: &str| rows.iter().filter(|row| row.outcome == outcome).count();
     let certified_rows = count("certified_finite_enclosure");
     Ok(CcmRootCertificationReport {
         schema_version: 1,
         semantics: route.semantics().to_owned(),
-        claim_scope: ROOT_CERTIFICATION_REPORT_SCOPE.to_owned(),
+        claim_scope: scope(route).to_owned(),
         lambda_squared: lambda_squared_cache_identity(params),
         n_modes: params.n_modes,
         precision_bits: cfg.precision_bits,
@@ -386,7 +442,9 @@ fn build_root_certification_report_with_route(
             isolation_bits: options.isolation_bits,
             interval_newton: options.interval_newton.clone(),
         },
-        outcome: if certified_rows == rows.len() {
+        outcome: if certified_rows == rows.len()
+            && rows.iter().all(|row| row.computed_agreement != "outside")
+        {
             "certified_finite_enclosure"
         } else {
             "partial_certification"
@@ -422,7 +480,7 @@ fn validate_root_certification_report(
     let invalid = |reason: &str| Err(CacheError::InvalidManifest(reason.to_owned()));
     if report.schema_version != 1
         || report.semantics != route.semantics()
-        || report.claim_scope != ROOT_CERTIFICATION_REPORT_SCOPE
+        || report.claim_scope != scope(route)
         || report.lambda_squared != lambda_squared_cache_identity(params)
         || report.n_modes != params.n_modes
         || report.precision_bits != cfg.precision_bits
@@ -494,12 +552,15 @@ fn validate_new_report_evidence(
         weights,
         cfg.precision_bits,
     )?;
+    if report.semantics == ReportRoute::ReferenceLabels.semantics() {
+        return reference_labels::validate(report, primary, &expected_weights);
+    }
     let mut witnesses = BTreeMap::new();
     for certificate in &report.certification.certificates {
         anyhow::ensure!(certificate.source_weights_digest == expected_weights
             && certificate.isolation_bits == report.request.isolation_bits
             && certificate.interval_newton == report.request.interval_newton
-            && certificate.target == report.request.target,
+            && (certificate.target == report.request.target || (report.semantics == ROOT_CERTIFICATION_REPORT_SEMANTICS && matches!(certificate.target, IndependentCcmRootTarget::IndexRange { first, last } if first >= report.request.first_index && last <= report.request.last_index && first <= last))),
             "root report certificate differs from the actual retained source or requested proof policy");
         let first = certificate
             .first_selected_positive_index
@@ -512,7 +573,8 @@ fn validate_new_report_evidence(
         }
     }
     anyhow::ensure!(
-        report.certification.certificates.len() <= 1,
+        report.semantics == ROOT_CERTIFICATION_REPORT_SEMANTICS
+            || report.certification.certificates.len() <= 1,
         "new root report route must retain one whole-request certificate"
     );
     let expected_available =
@@ -526,7 +588,8 @@ fn validate_new_report_evidence(
             None
         };
     anyhow::ensure!(
-        report.certification.available_positive_roots == expected_available,
+        report.semantics == ROOT_CERTIFICATION_REPORT_SEMANTICS
+            || report.certification.available_positive_roots == expected_available,
         "root report total-positive count differs from its whole-positive certificate scope"
     );
     let expected_uncertified = (report.request.first_index..=report.request.last_index)
@@ -645,7 +708,9 @@ fn validate_new_report_evidence(
                     .filter(|row| row.computed_agreement == "outside")
                     .count()
             && report.outcome
-                == if report.certified_rows == report.rows.len() {
+                == if report.certified_rows == report.rows.len()
+                    && report.computed_outside_certified_rows == 0
+                {
                     "certified_finite_enclosure"
                 } else {
                     "partial_certification"
@@ -678,7 +743,16 @@ pub(super) fn resolve_root_certification_report_via_cache(
         secular_manifest,
         options,
         cache,
-        ReportRoute::PoleSpan,
+        if root_manifest.is_some_and(|m| m.key.kind == "ccm_root_refinement")
+            && !matches!(
+                options.target,
+                IndependentCcmRootTarget::PositiveHeightWindow { .. }
+            )
+        {
+            ReportRoute::ReferenceLabels
+        } else {
+            ReportRoute::PoleSpan
+        },
     )
 }
 
@@ -751,18 +825,7 @@ fn resolve_report_with_route(
             |manifest| manifest.content_digest.clone(),
         )
     };
-    let compute = || {
-        if route == ReportRoute::PoleSpan {
-            return build_root_certification_report(
-                params,
-                cfg,
-                primary,
-                weights,
-                options,
-                &digest(secular_manifest),
-                &digest(root_manifest),
-            );
-        }
+    let compute = || -> Result<CcmRootCertificationReport> {
         let report = build_root_certification_report_with_route(
             params,
             cfg,
@@ -887,10 +950,6 @@ fn resolve_report_with_route(
             ))
         },
         |report| {
-            if route != ReportRoute::PoleSpan {
-                validate_new_report_evidence(report, primary, weights, cfg)
-                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-            }
             validate_root_certification_report(
                 report,
                 params,
@@ -900,7 +959,9 @@ fn resolve_report_with_route(
                 &digest(root_manifest),
                 &selection_digest,
                 route,
-            )
+            )?;
+            validate_new_report_evidence(report, primary, weights, cfg)
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))
         },
     )?;
     let manifest = resolved.produced_manifest.or(resolved.reused_manifest);
@@ -1101,6 +1162,57 @@ mod tests {
             .reason
             .unwrap()
             .contains("has 1 positive movable roots"));
+    }
+
+    #[test]
+    fn seeded_labels_require_unique_independently_counted_enclosures() {
+        let params = CcmParams::from_lambda_sq_integer(13, 10);
+        let (cfg, mut primary) = source_only(&params);
+        primary.first_positive_root_index = 7;
+        let independent = report(
+            &params,
+            &cfg,
+            &primary,
+            &CcmRootCertificationOptions::for_decimal_digits(
+                IndependentCcmRootTarget::Prefix { count: 2 },
+                30,
+            )
+            .unwrap(),
+        );
+        let value = midpoint(&independent.rows[1], cfg.precision_bits);
+        primary.eigenvalues_pos = vec![computed("converged", value.clone())];
+        let options = CcmRootCertificationOptions::for_decimal_digits(
+            IndependentCcmRootTarget::IndexRange { first: 7, last: 7 },
+            30,
+        )
+        .unwrap();
+        let result = certify_retained_reference_roots(&params, &cfg, &primary, &options).unwrap();
+        assert_eq!(result.certified_rows, 1);
+        assert_eq!(result.rows[0].ordinal, 7);
+        assert_eq!(result.rows[0].computed_matches_certified_ordinal, Some(2));
+        let mut forged = result;
+        forged.rows[0].computed_matches_certified_ordinal = Some(7);
+        assert!(validate_new_report_evidence(&forged, &primary, &primary.xi, &cfg).is_err());
+        primary
+            .eigenvalues_pos
+            .push(computed("converged", value.clone()));
+        let options = CcmRootCertificationOptions::for_decimal_digits(
+            IndependentCcmRootTarget::IndexRange { first: 7, last: 8 },
+            30,
+        )
+        .unwrap();
+        let duplicate =
+            certify_retained_reference_roots(&params, &cfg, &primary, &options).unwrap();
+        assert_eq!(duplicate.outcome, "partial_certification");
+        assert_eq!(duplicate.certified_rows, 1);
+        primary.eigenvalues_pos[0] = computed("stagnated", value);
+        assert_eq!(
+            certify_retained_reference_roots(&params, &cfg, &primary, &options)
+                .unwrap()
+                .rows[0]
+                .computed_agreement,
+            "not_certified"
+        );
     }
 
     #[test]

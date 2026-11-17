@@ -298,6 +298,31 @@ pub fn plan_publication_batches(
     let mut batches = Vec::new();
     let mut current_parts = Vec::new();
     let mut current_bytes = 0u64;
+    // Stage objects freely, then publish metadata and live references in a single commit.
+    let metadata_start = parts
+        .iter()
+        .position(|part| !part.repository_path.starts_with("objects/"));
+    let metadata_group = if parts
+        .iter()
+        .any(|part| part.repository_path.starts_with("indexes/"))
+    {
+        let start = metadata_start.expect("an index is metadata");
+        let bytes = parts[start..]
+            .iter()
+            .try_fold(0u64, |sum, part| sum.checked_add(part.size_bytes));
+        Some((
+            start,
+            bytes
+                .filter(|bytes| *bytes <= policy.maximum_batch_payload_bytes)
+                .ok_or_else(|| {
+                    CacheError::ResourceLimit(
+                        "atomic publication metadata exceeds the commit budget".into(),
+                    )
+                })?,
+        ))
+    } else {
+        None
+    };
     for (index, part) in parts.iter().enumerate() {
         if part.sequence != index as u64
             || part.size_bytes == 0
@@ -325,7 +350,11 @@ pub fn plan_publication_batches(
             continue;
         }
         if !current_parts.is_empty()
-            && current_bytes.saturating_add(part.size_bytes) > policy.maximum_batch_payload_bytes
+            && current_bytes.saturating_add(
+                metadata_group
+                    .filter(|(start, _)| *start == index)
+                    .map_or(part.size_bytes, |(_, bytes)| bytes),
+            ) > policy.maximum_batch_payload_bytes
         {
             batches.push(PublicationBatchPlan {
                 sequence: batches.len() as u64,

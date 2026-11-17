@@ -578,22 +578,10 @@ mod energy_extension_tests {
             &execution,
         )
         .unwrap();
-        assert!(replay.produced_manifest.is_some());
-        assert!(first
-            .value
-            .data
-            .reason
-            .as_ref()
-            .unwrap()
-            .contains("path one"));
-        assert!(replay
-            .value
-            .data
-            .reason
-            .as_ref()
-            .unwrap()
-            .contains("path two"));
-        assert_ne!(first.value.data, replay.value.data);
+        assert!(replay.reused_manifest.is_some());
+        assert_eq!(first.value.data, replay.value.data);
+        let persisted = serde_json::to_string(&first.value).unwrap();
+        assert!(!persisted.contains("path one") && !persisted.contains("path two"));
         let identical = f::capture_with_context(
             "finite_root_budget",
             &s,
@@ -697,6 +685,33 @@ fn run(
     .unwrap()
     .value
     .data
+}
+#[test]
+fn refused_automatic_u_flow_blocks_both_dependent_measurements_after_serialization() {
+    let (state, manifest, matrix) = fixture();
+    let mut input = inputs(&manifest);
+    input
+        .run_once
+        .get_or_insert_with(Default::default)
+        .automatic_u_flow_failed = true;
+    let restored = serde_json::from_slice(&serde_json::to_vec(&input).unwrap()).unwrap();
+    for diagnostic in ["directional_response", "root_transport"] {
+        let result = capture_extended(
+            diagnostic,
+            &state,
+            Some(&matrix),
+            None,
+            Some(&restored),
+            &ExtensionOptions::for_source(&state),
+            &[],
+            &context(),
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("required automatic u-flow response unavailable"));
+    }
 }
 fn number(s: &str) -> f64 {
     Float::with_val(256, Float::parse(s).unwrap()).to_f64()
@@ -1070,10 +1085,25 @@ fn cluster_attempt_assessment_rejects_unbound_or_invalid_provenance() {
     assessment.reason =
         "CCM sector resolution limit: synthetic index enclosures overlap at 128 working bits"
             .into();
+    assessment.evidence_digest = ContentDigest::sha256_json(&serde_json::json!({
+        "source_eigenpair":assessment.source_eigenpair,"source_matrix":assessment.source_matrix,
+        "source_precision_bits":assessment.source_precision_bits,"requested_eigenpairs_per_sector":assessment.requested_eigenpairs_per_sector,
+        "eigenvalue_route":assessment.eigenvalue_route,"reason":assessment.reason
+    })).unwrap();
     input.cluster_preparation_assessment = Some(assessment.clone());
-    let report = run("spectral_cluster", &s, Some(&matrix), Some(&input));
-    assert_eq!(report.values["sector_attempted"], "1");
-    assert_eq!(report.rows[0].outcome, "unresolved");
+    let error = capture_extended(
+        "spectral_cluster",
+        &s,
+        Some(&matrix),
+        None,
+        Some(&input),
+        &ExtensionOptions::for_source(&s),
+        &[],
+        &context(),
+    )
+    .err()
+    .expect("matching self-digest does not establish an observed sector attempt");
+    assert!(error.to_string().contains("witnessed live sector attempt"));
     for bad in [
         ClusterPreparationAssessment {
             source_eigenpair: ContentDigest::sha256(b"another state"),
@@ -1383,7 +1413,7 @@ fn cluster_assessment_rejects_a_different_finite_cached_source_eigenvalue() {
     cache.ordered_overlays = vec!["tampered".into(), "authentic".into()];
     cache.mode = ArtifactExecutionCacheMode::RequireReuse;
     cache.write_on_miss = false;
-    let error = capture_extended(
+    let selected = capture_extended(
         "spectral_cluster",
         &state,
         Some(&matrix),
@@ -1393,11 +1423,12 @@ fn cluster_assessment_rejects_a_different_finite_cached_source_eigenvalue() {
         &[],
         &cache,
     )
-    .err()
-    .expect("a changed finite source eigenvalue must be rejected");
-    assert!(
-        format!("{error:#}").contains("invalid unresolved cluster assessment"),
-        "the changed finite value must reach domain validation: {error:#}"
+    .unwrap();
+    assert!(selected.reused_manifest.is_some());
+    assert!(!selected.access.rejected_candidates.is_empty());
+    assert_eq!(
+        serde_json::to_value(selected.value).unwrap(),
+        serde_json::to_value(&cold.value).unwrap()
     );
 }
 #[test]
@@ -2678,7 +2709,12 @@ fn ultra_finite_interfaces_execute_every_supplied_problem_and_keep_absence_recor
     )
     .unwrap()
     .value;
-    assert_eq!(missing.measurements.len(), FINITE_DIAGNOSTICS.len());
+    assert_eq!(missing.receipt.outcomes().len(), FINITE_DIAGNOSTICS.len());
+    assert!(!missing.receipt.is_complete());
+    assert!(matches!(
+        missing.receipt.outcomes()["finite_root_budget"],
+        xc_core::DiagnosticOutcome::Missing { .. }
+    ));
     assert_eq!(
         missing.coverage()["constrained_l1_fit"].outcome,
         "awaiting_source"

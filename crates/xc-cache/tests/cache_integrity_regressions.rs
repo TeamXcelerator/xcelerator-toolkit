@@ -90,6 +90,106 @@ impl CacheStore for MetadataStore {
 }
 
 #[test]
+fn key_based_resolver_never_accepts_a_misindexed_candidate() {
+    struct Misindexed(ArtifactManifest);
+    impl CacheStore for Misindexed {
+        fn name(&self) -> &str {
+            "misindexed-fixture"
+        }
+        fn writable(&self) -> bool {
+            false
+        }
+        fn visibility(&self) -> CacheVisibility {
+            CacheVisibility::Public
+        }
+        fn candidates(&self, _: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+            Ok(vec![self.0.clone()])
+        }
+        fn put(&self, _: &ArtifactDraft, _: &[u8]) -> Result<ArtifactManifest, CacheError> {
+            panic!("read-only cache")
+        }
+        fn read_payload_to(
+            &self,
+            _: &ArtifactManifest,
+            _: &mut dyn Write,
+        ) -> Result<(), CacheError> {
+            panic!("wrong key must be rejected before payload I/O")
+        }
+        fn verified_encoded_payload(
+            &self,
+            _: &ArtifactManifest,
+        ) -> Result<Option<VerifiedEncodedPayload>, CacheError> {
+            panic!("wrong key must be rejected before encoded-object lookup")
+        }
+    }
+    let wrong = manifest("wrong-key", CacheQuality::Validated, vec![]);
+    let digest = wrong.content_digest.clone();
+    let requested = key("requested-key");
+    let policy = policy(CacheQuality::Validated);
+    let quality = CacheQuality::Validated;
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(Misindexed(wrong.clone())),
+    }]);
+    assert!(resolver.resolve_manifest(&requested, &policy).is_err());
+    assert!(resolver.resolve(&requested, &policy).is_err());
+    assert!(resolver
+        .resolve_exact_manifest(&requested, &digest, &policy)
+        .is_err());
+    assert!(resolver
+        .read_exact_payload(&requested, &digest, &policy)
+        .is_err());
+    assert!(resolver
+        .resolve_exact(&requested, &digest, quality, &policy)
+        .is_err());
+    assert!(resolver
+        .resolve_exact_encoded(&requested, &digest, quality, &policy)
+        .unwrap()
+        .is_none());
+    assert!(resolver
+        .open_exact_payload(
+            &requested,
+            &digest,
+            quality,
+            &policy,
+            std::path::Path::new("."),
+            64
+        )
+        .is_err());
+    let dependency = DependencyRef {
+        key: requested.clone(),
+        content_digest: digest.clone(),
+        required_quality: quality,
+    };
+    assert!(resolver
+        .prefetch_exact_dependencies(std::slice::from_ref(&dependency), &policy)
+        .is_err());
+
+    let mut right = wrong.clone();
+    right.key = requested.clone();
+    let resolver = CacheResolver::new(vec![
+        CacheLayer {
+            precedence: 0,
+            store: Box::new(Misindexed(wrong)),
+        },
+        CacheLayer {
+            precedence: 1,
+            store: Box::new(MetadataStore(vec![right.clone()])),
+        },
+    ]);
+    assert_eq!(
+        resolver
+            .resolve_exact_manifest(&requested, &digest, &policy)
+            .unwrap()
+            .1,
+        right
+    );
+    resolver
+        .prefetch_exact_dependencies(&[dependency], &policy)
+        .unwrap();
+}
+
+#[test]
 fn dependency_closure_must_reject_a_cycle() {
     let dependency = |name: &str| DependencyRef {
         key: key(name),
@@ -303,4 +403,87 @@ fn supplied_sources_must_satisfy_the_original_acceptance_minimum() {
             .len(),
         1
     );
+}
+
+#[test]
+fn supplied_parent_policy_rejections_are_specific_and_do_not_mask_admissible_sources() {
+    let mut parent = manifest("parent-policy", CacheQuality::Validated, vec![]);
+    parent.key = ArtifactKey::new("ccm_tau_matrix", "parent-policy", b"matrix").unwrap();
+    let root = manifest(
+        "root",
+        CacheQuality::Validated,
+        vec![DependencyRef {
+            key: parent.key.clone(),
+            content_digest: parent.content_digest.clone(),
+            required_quality: CacheQuality::Validated,
+        }],
+    );
+    let policy = policy(CacheQuality::Validated);
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(MetadataStore(vec![parent.clone()])),
+    }]);
+    for case in [
+        "minimum reader",
+        "maximum reader",
+        "visibility",
+        "compatibility floor",
+        "immutable",
+        "quality",
+    ] {
+        let mut bad = parent.clone();
+        match case {
+            "minimum reader" => {
+                bad.minimum_reader_version = ToolkitVersion::parse("999.0.0").unwrap()
+            }
+            "maximum reader" => {
+                bad.maximum_reader_version = Some(ToolkitVersion::parse("0.17.1").unwrap())
+            }
+            "visibility" => bad.visibility = CacheVisibility::Private,
+            "compatibility floor" => {
+                bad.producer_toolkit_version = ToolkitVersion::parse("0.1.0").unwrap()
+            }
+            "immutable" => bad.immutable = false,
+            _ => bad.quality = CacheQuality::Staged,
+        }
+        let mut context = ArtifactCacheContext {
+            resolver: None,
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec![],
+            mode: ArtifactExecutionCacheMode::Disabled,
+            write_on_miss: false,
+            write_visibility: CacheVisibility::Public,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let error = resolve_manifest_sources(&root, std::slice::from_ref(&bad), &context)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(case), "{case}: {error}");
+        assert!(error.contains("ccm_tau_matrix") && error.contains(&parent.content_digest.0));
+        let supplied =
+            resolve_manifest_sources(&root, &[bad.clone(), parent.clone()], &context).unwrap();
+        assert_eq!(supplied, vec![parent.clone()]);
+        context.resolver = Some(&resolver);
+        let from_store =
+            resolve_manifest_sources(&root, std::slice::from_ref(&bad), &context).unwrap();
+        assert_eq!(from_store, vec![parent.clone()]);
+        let ordered = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(MetadataStore(vec![bad, parent.clone()])),
+        }]);
+        context.resolver = Some(&ordered);
+        assert_eq!(
+            resolve_manifest_sources(&root, &[], &context).unwrap(),
+            vec![parent.clone()]
+        );
+    }
+    let mut denied_schema = policy.clone();
+    denied_schema.accepted_schema_versions.clear();
+    assert!(admit_retained_source(&parent, Some(&denied_schema))
+        .unwrap_err()
+        .to_string()
+        .contains("schema version"));
 }

@@ -383,7 +383,7 @@ fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         drop(file);
         // Rust replaces an existing file on Windows as well as Unix. Keep
         // the previous complete report available until the rename succeeds.
-        fs::rename(&temporary, path).map_err(|error| error.to_string())
+        crate::rename_replacement(&temporary, path).map_err(|error| error.to_string())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);

@@ -234,14 +234,15 @@ impl ThickRestartLanczosHp {
             || retained > dimension
             || config.requested_eigenpairs == 0
             || (config.requested_eigenpairs < dimension && config.guard_eigenpairs == 0)
-            || config.maximum_subspace_dimension <= retained
+            || config.maximum_subspace_dimension < retained
+            || (config.maximum_subspace_dimension == retained && retained != dimension)
             || config.maximum_subspace_dimension > dimension
             || config.maximum_restarts == 0
             || config.minimum_restarts > config.maximum_restarts
             || config.maximum_projected_sweeps == 0
         {
             return Err(SolverError::InvalidConfiguration(
-                "HP thick-restart Lanczos requires valid counts, mandatory guards, a retained block smaller than the bounded Krylov subspace, precision in 33..=1000000 bits, and valid restart limits"
+                "HP thick-restart Lanczos requires valid counts, mandatory guards, a retained block with expansion room or full coverage of the Krylov subspace, precision in 33..=1000000 bits, and valid restart limits"
                     .to_owned(),
             ));
         }
@@ -250,10 +251,9 @@ impl ThickRestartLanczosHp {
             config.precision_bits,
             "absolute residual tolerance",
         )?;
-        let backward_tolerance = parse_positive(
+        let backward_tolerance = super::hp_backward_tolerance(
             &config.scaled_backward_error_tolerance,
             config.precision_bits,
-            "scaled backward-error tolerance",
         )?;
         let stability_tolerance = parse_positive(
             &config.ritz_value_stability_tolerance,
@@ -512,10 +512,9 @@ fn build_report(
         config.precision_bits,
         "absolute residual tolerance",
     )?;
-    let backward_tolerance = parse_positive(
+    let backward_tolerance = super::hp_backward_tolerance(
         &config.scaled_backward_error_tolerance,
         config.precision_bits,
-        "scaled backward-error tolerance",
     )?;
     let operator_dimension = states.first().map_or(0, |state| state.vector.len());
     let cluster_tolerance = super::hp_positive_threshold(

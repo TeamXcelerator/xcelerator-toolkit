@@ -858,28 +858,39 @@ fn secular_source_rebinds_validation_identity_with_unchanged_state_bytes() {
         tags,
         provenance_digest: None,
     };
-    let old = store
-        .put(
-            &draft(
-                ArtifactKey::new("ccm_weil_eigenpair", "same-stored-state", b"validation-v2")
-                    .unwrap(),
-                vec![],
-                BTreeMap::new(),
-            ),
-            &payload,
-        )
-        .unwrap();
-    let current = store
-        .put(
-            &draft(
-                ArtifactKey::new("ccm_weil_eigenpair", "same-stored-state", b"validation-v3")
-                    .unwrap(),
-                vec![],
-                BTreeMap::new(),
-            ),
-            &payload,
-        )
-        .unwrap();
+    let write_state = |revision: &str| {
+        let envelope = xc_cache::SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_weil_eigenpair".into(),
+            mathematical_semantics_version: revision.into(),
+            resolved_mathematical_parameters: serde_json::json!({"lambda_squared":"13","n_modes":2,"precision_bits":cfg.precision_bits}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let key = ArtifactKey {
+            kind: envelope.artifact_kind.clone(),
+            logical_key: "same-stored-state".into(),
+            parameters_digest: envelope.digest().unwrap(),
+        };
+        store
+            .put(
+                &draft(
+                    key,
+                    vec![],
+                    BTreeMap::from([(
+                        xc_cache::SEMANTIC_KEY_MANIFEST_TAG.into(),
+                        serde_json::to_string(&envelope).unwrap(),
+                    )]),
+                ),
+                &payload,
+            )
+            .unwrap()
+    };
+    let old = write_state("validation-v2");
+    let current = write_state("validation-v3");
     assert_eq!(old.content_digest, current.content_digest);
     let old_source = resolve_secular_source_via_cache(&params, &cfg, &old, &cache).unwrap();
     let current_source = resolve_secular_source_via_cache(&params, &cfg, &current, &cache).unwrap();

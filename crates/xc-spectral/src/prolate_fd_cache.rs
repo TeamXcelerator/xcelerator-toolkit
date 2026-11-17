@@ -720,12 +720,12 @@ mod tests {
         }
         drop(records);
         let bad = resolver(&poisoned_root);
-        let bad_cache = context(&bad, &policy, &sink);
+        let bad_cache = ArtifactCacheContext { mode: ModePolicy::RequireReuse, write_on_miss: false, ..context(&bad, &policy, &sink) };
         reset();
         assert!(
             compute_k_lambda_finite_dirichlet_via_cache(&lambda, 33, 7, 128, &bad_cache).is_err()
         );
-        assert_eq!(counts(), (0, 0), "poison must not silently recompute");
+        assert_eq!(counts(), (0, 0), "require-reuse must not recompute");
         let required = ArtifactCacheContext {
             mode: ModePolicy::RequireReuse,
             write_on_miss: false,

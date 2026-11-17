@@ -379,7 +379,8 @@ fn target_shift(
             let requested = parse_finite(shift, precision, "target shift")?;
             if requested != factor_shift {
                 return Err(SolverError::InvalidConfiguration(
-                    "target shift must exactly match the retained factorization shift".to_owned(),
+                    "target shift must match the retained factorization shift at working precision"
+                        .to_owned(),
                 ));
             }
             Ok(requested)
@@ -584,14 +585,15 @@ impl ShiftInvertKrylovSolverHp {
             || config.requested_eigenpairs == 0
             || retained > dimension
             || (config.requested_eigenpairs < dimension && config.guard_eigenpairs == 0)
-            || config.maximum_subspace_dimension <= retained
+            || config.maximum_subspace_dimension < retained
+            || (config.maximum_subspace_dimension == retained && retained != dimension)
             || config.maximum_subspace_dimension > dimension
             || config.maximum_restarts == 0
             || config.minimum_restarts > config.maximum_restarts
             || config.maximum_projected_sweeps == 0
         {
             return Err(SolverError::InvalidConfiguration(
-                "shift-invert Krylov requires matching operator/factor dimensions, adequate precision, mandatory guards, and a retained block smaller than the bounded subspace"
+                "shift-invert Krylov requires matching operator/factor dimensions, adequate precision, mandatory guards, and a retained block with expansion room or full coverage of the subspace"
                     .to_owned(),
             ));
         }
@@ -613,10 +615,9 @@ impl ShiftInvertKrylovSolverHp {
             config.precision_bits,
             "absolute residual tolerance",
         )?;
-        let backward_tolerance = parse_positive(
+        let backward_tolerance = super::hp_backward_tolerance(
             &config.scaled_backward_error_tolerance,
             config.precision_bits,
-            "scaled backward-error tolerance",
         )?;
         let stability_tolerance = parse_positive(
             &config.ritz_value_stability_tolerance,
@@ -1007,10 +1008,9 @@ fn build_report(
         config.precision_bits,
         "absolute residual tolerance",
     )?;
-    let backward_tolerance = parse_positive(
+    let backward_tolerance = super::hp_backward_tolerance(
         &config.scaled_backward_error_tolerance,
         config.precision_bits,
-        "scaled backward-error tolerance",
     )?;
     let cluster_tolerance = super::hp_positive_threshold(
         &config.boundary_cluster_tolerance,
@@ -1146,7 +1146,8 @@ fn build_report(
                 .map(|p: &ShiftInvertKrylovEigenpairHp| (&p.eigenvalue, &p.residual_norm)),
             config.precision_bits,
         )?,
-        global_target_ordering_established: boundary_count_evidence.establishes_requested_count(),
+        global_target_ordering_established: status == ResultStatus::Converged
+            && boundary_count_evidence.establishes_requested_count(),
         boundary_count_evidence,
         algorithm: super::HP_KRYLOV_COUNT_SEMANTICS.into(),
         target: config.target.clone(),

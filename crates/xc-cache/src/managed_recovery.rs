@@ -50,6 +50,122 @@ pub fn managed_resource_policy_from_environment() -> Result<ResourcePolicy, Cach
     }
 }
 
+/// A retry consumes only the exact descriptors authorized by the original
+/// operation. Reopening an arbitrary staging root cannot authorize a publish.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PublicationRetryScope {
+    pub(super) target: xc_core::PublicationTarget,
+    pub(super) drafts: std::collections::BTreeMap<String, ContentDigest>,
+}
+
+impl PublicationRetryScope {
+    pub(super) fn select(
+        &self,
+        root: &Path,
+        drafts: Vec<crate::CanonicalProductionDraft>,
+    ) -> Result<Vec<crate::CanonicalProductionDraft>, CacheError> {
+        let root = root.canonicalize()?;
+        let mut selected = Vec::new();
+        for draft in drafts {
+            let path = draft
+                .staged_parts_root
+                .with_file_name("draft.json")
+                .canonicalize()?;
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|_| {
+                    CacheError::InvalidManifest(
+                        "retry descriptor is outside the authorized staging root".into(),
+                    )
+                })?
+                .to_str()
+                .ok_or_else(|| CacheError::InvalidManifest("invalid draft path".into()))?
+                .replace('\\', "/");
+            if let Some(expected) = self.drafts.get(&relative) {
+                let bytes = fs::read(path)?;
+                if &ContentDigest::sha256(&bytes) != expected
+                    || serde_json::from_slice::<crate::CanonicalProductionDraft>(&bytes)? != draft
+                {
+                    return Err(CacheError::InvalidTransition(
+                        "authorized publication descriptor changed".into(),
+                    ));
+                }
+                selected.push(draft);
+            }
+        }
+        if selected.len() != self.drafts.len() || selected.is_empty() {
+            return Err(CacheError::InvalidTransition(
+                "authorized publication descriptors missing".into(),
+            ));
+        }
+        Ok(selected)
+    }
+
+    pub(super) fn record(
+        root: &Path,
+        target: xc_core::PublicationTarget,
+        drafts: &[crate::CanonicalProductionDraft],
+    ) -> Result<(), CacheError> {
+        let root = root.canonicalize()?;
+        let mut scope = Self {
+            target,
+            drafts: Default::default(),
+        };
+        for draft in drafts {
+            let path = draft
+                .staged_parts_root
+                .with_file_name("draft.json")
+                .canonicalize()?;
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|_| CacheError::InvalidManifest("draft outside staging root".into()))?
+                .to_str()
+                .ok_or_else(|| CacheError::InvalidManifest("invalid draft path".into()))?
+                .replace('\\', "/");
+            let bytes = fs::read(path)?;
+            if serde_json::from_slice::<crate::CanonicalProductionDraft>(&bytes)? != *draft {
+                return Err(CacheError::InvalidTransition(
+                    "observed draft changed before publication".into(),
+                ));
+            }
+            scope.drafts.insert(relative, ContentDigest::sha256(&bytes));
+        }
+        let path = root.join("publication-retry-scope.json");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join("publication-retry-scope.lock"))?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        match fs::File::open(&path) {
+            Ok(file) => {
+                let previous: Self = serde_json::from_reader(file)?;
+                if previous.target != target {
+                    return Err(CacheError::InvalidTransition(
+                        "staging root already has a different authorized destination".into(),
+                    ));
+                }
+                for (name, digest) in previous.drafts {
+                    if scope
+                        .drafts
+                        .get(&name)
+                        .is_some_and(|current| current != &digest)
+                    {
+                        return Err(CacheError::InvalidTransition(
+                            "previously authorized descriptor changed".into(),
+                        ));
+                    }
+                    scope.drafts.insert(name, digest);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        crate::atomic_replace_cache_file(&path, &serde_json::to_vec(&scope)?)
+    }
+}
+
 impl ManagedArtifactCacheSession {
     /// Resolved ceilings used for remote reads, staging and publication.
     pub fn resources(&self) -> &ResourcePolicy {
@@ -141,10 +257,6 @@ impl ManagedArtifactCacheSession {
             "publication recovery: staging retained payload and verifying its logical digest"
         );
         record_encoded_dependency(sink, "cache.publication.recover", resolved)?;
-        crate::atomic_replace(
-            &sink.staging_root().join("resource-policy.json"),
-            &serde_json::to_vec_pretty(&self.resources)?,
-        )?;
         Ok(())
     }
 }

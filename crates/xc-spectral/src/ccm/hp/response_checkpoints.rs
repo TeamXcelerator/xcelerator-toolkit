@@ -15,6 +15,22 @@ pub(super) fn allowed(
         && assurance == xc_core::AssuranceLevel::Computed
 }
 
+pub(super) fn backend_policy() -> Result<BTreeMap<String, String>> {
+    let mut result = BTreeMap::new();
+    for (name, default) in [
+        ("XC_PRIME_RESPONSE_BACKEND", "cpu"),
+        ("XC_DENSE_BACKEND", "auto"),
+    ] {
+        let value = match std::env::var(name) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => default.to_owned(),
+            Err(error) => return Err(error.into()),
+        };
+        result.insert(name.to_owned(), value);
+    }
+    Ok(result)
+}
+
 pub(super) fn identity(
     semantic: &SemanticKeyEnvelope,
     cfg: &HighPrecConfig,
@@ -25,24 +41,7 @@ pub(super) fn identity(
     // Bind operational policies as well as the mathematical request. A guard
     // or backend change must not turn a previously resolved event into a bypass
     // of the newly requested execution route.
-    let policy = std::env::vars_os()
-        .filter_map(|(name, value)| {
-            let name = name.to_str()?;
-            (name.starts_with("XC_PRIME_RESPONSE_")
-                || name.starts_with("XC_ROOT_RESPONSE_")
-                || name.starts_with("XC_CUDA_")
-                || name.starts_with("XC_DENSE_")
-                || name == "XC_RESPONSE_EVENT_BATCH")
-                .then(|| {
-                    value
-                        .into_string()
-                        .map(|value| (name.to_owned(), value))
-                        .map_err(|_| {
-                            anyhow::anyhow!("response checkpoint policy {name} is not Unicode")
-                        })
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
+    let policy = backend_policy()?;
     Ok(serde_json::json!({
         "semantics": "ccm-private-completed-prime-response-events-v1",
         "request": semantic,

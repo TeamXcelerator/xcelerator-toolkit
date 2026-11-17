@@ -642,11 +642,11 @@ pub enum CertificateClaim {
     MatrixInertia,
     EigenvalueEnclosure,
     SpectralGap,
-    GeneralizedRayleighLowerBound,
-    RootIsolation,
-    RootCount,
-    SpectralWindowCompleteness,
-    Custom { name: String },
+    /// A named structural claim with required evidence digests. Consumers supply
+    /// its mathematical verifier.
+    Custom {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -776,10 +776,7 @@ impl CertificateBundle {
             CertificateClaim::MatrixInertia => self.inertia.is_none(),
             CertificateClaim::EigenvalueEnclosure => self.eigenvalue_enclosures.is_empty(),
             CertificateClaim::SpectralGap => self.spectral_gap.is_none(),
-            CertificateClaim::RootCount
-            | CertificateClaim::RootIsolation
-            | CertificateClaim::SpectralWindowCompleteness
-            | CertificateClaim::GeneralizedRayleighLowerBound => true,
+            CertificateClaim::Custom { .. } => self.evidence_digests.is_empty(),
             _ => false,
         };
         if missing_record {
@@ -1123,7 +1120,7 @@ pub mod exact {
         match verify_portable_interval_inertia_exact(certificate) {
             Ok(()) => VerificationReport {
                 valid: true,
-                mathematical_claim_verified: true,
+                mathematical_claim_verified: certificate.zero_or_unresolved == 0,
                 checks: vec![
                     "certificate and matrix digests verified".to_owned(),
                     "exact matrix endpoint ordering and symmetry verified".to_owned(),
@@ -1552,7 +1549,7 @@ pub mod exact {
         // valid n*n allocation, every offset is at most n*n - 1.
         if dimension == 0 || dimension.checked_mul(dimension) != Some(matrix.len()) {
             return Err((
-                boundary_name.to_owned(),
+                "configuration".to_owned(),
                 "eigenvalue count requires a nonempty square matrix".to_owned(),
             ));
         }
@@ -1590,6 +1587,11 @@ pub mod exact {
             }),
             Ok(IntervalInertiaResult::Inconclusive { reason, .. }) => {
                 Err((boundary_name.to_owned(), reason))
+            }
+            // An arithmetic error is distinct from an unresolved signed pivot.
+            // Precision-adaptive consumers may retry the latter.
+            Err(error) if precision.is_some() => {
+                Err((format!("{boundary_name} arithmetic"), error.to_string()))
             }
             Err(error) => Err((boundary_name.to_owned(), error.to_string())),
         }
@@ -2526,24 +2528,15 @@ mod tests {
         bundle.refresh_certificate_id().unwrap();
         assert!(bundle.validate_structure().is_ok());
         for claim in [
-            CertificateClaim::RootCount,
-            CertificateClaim::RootIsolation,
-            CertificateClaim::SpectralWindowCompleteness,
-            CertificateClaim::GeneralizedRayleighLowerBound,
+            "root_count",
+            "root_isolation",
+            "spectral_window_completeness",
+            "generalized_rayleigh_lower_bound",
         ] {
-            let mut missing = bundle.clone();
-            missing.claim = claim;
-            missing.inertia = None;
-            missing.refresh_certificate_id().unwrap();
-            let report = verify_bundle(&missing);
             assert!(
-                !report.valid,
-                "unsupported claim cannot verify without a proof record"
+                serde_json::from_value::<CertificateClaim>(serde_json::json!({"claim":claim}))
+                    .is_err()
             );
-            assert!(report
-                .errors
-                .iter()
-                .any(|message| message.contains("required record")));
         }
 
         let uncited_id = bundle.certificate_id.clone();

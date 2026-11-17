@@ -66,12 +66,25 @@ pub struct RetainedState {
     pub(crate) selection_policy: Option<String>,
 }
 impl RetainedState {
+    /// Decode under both the current reader contract and caller restrictions.
+    pub fn from_payload_with_policy(
+        manifest: &ArtifactManifest,
+        bytes: &[u8],
+        approved: &[ContentDigest],
+        policy: &xc_cache::CachePolicy,
+    ) -> Result<Self> {
+        super::source_admission::admit_manifest(manifest, Some(policy))?;
+        Self::from_payload(manifest, bytes, approved)
+    }
+
+    /// Decode with current-reader admission. All storage visibilities are
+    /// allowed here; use `from_payload_with_policy` to restrict the source set.
     pub fn from_payload(
         manifest: &ArtifactManifest,
         bytes: &[u8],
         approved: &[ContentDigest],
     ) -> Result<Self> {
-        manifest.validate()?;
+        super::source_admission::admit_manifest(manifest, None)?;
         if manifest.key.kind != "ccm_weil_eigenpair"
             || !manifest.immutable
             || manifest.quality.admissible_rank() < CacheQuality::Validated.admissible_rank()
@@ -93,6 +106,12 @@ impl RetainedState {
             parity_policy: Option<serde_json::Value>,
         }
         let v: Payload = serde_json::from_slice(bytes)?;
+        super::source_admission::check_payload_shape(
+            manifest,
+            &v.lambda_squared,
+            v.n_modes,
+            v.precision_bits,
+        )?;
         if ![2, 3, 4, 5].contains(&v.schema_version)
             || v.n_modes > 8192
             || !(64..=1_000_000).contains(&v.precision_bits)

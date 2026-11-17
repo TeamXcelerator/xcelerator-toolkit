@@ -87,7 +87,7 @@ fn crosschecked_capture_requests_conditioning() {
     assert!(options.captures_root_conditioning());
 }
 
-fn with_remaining_cache(test: impl FnOnce(&ArtifactCacheContext<'_>)) {
+pub(super) fn with_remaining_cache(test: impl FnOnce(&ArtifactCacheContext<'_>)) {
     use xc_cache::*;
     let root = crate::fresh_test_dir("remaining-ccm-cache");
     let resolver = CacheResolver::new(vec![CacheLayer {

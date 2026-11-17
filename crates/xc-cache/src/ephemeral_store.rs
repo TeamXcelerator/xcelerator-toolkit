@@ -80,6 +80,28 @@ impl EphemeralCacheStore {
         }
         Ok(())
     }
+    fn retained_payload<'a>(
+        state: &'a State,
+        requested: &ArtifactManifest,
+    ) -> Result<&'a Vec<u8>, CacheError> {
+        for (saved, payload) in state.artifacts.iter().rev() {
+            if saved.content_digest != requested.content_digest
+                || !saved.accepts_lookup_key(&requested.key)?
+            {
+                continue;
+            }
+            let mut normalized = requested.clone();
+            normalized
+                .key
+                .logical_key
+                .clone_from(&saved.key.logical_key);
+            if saved == &normalized {
+                return Ok(payload);
+            }
+        }
+        Err(CacheError::NotFound("ephemeral manifest".into()))
+    }
+
     /// Bytes charged to the shared resident-record budget.
     pub fn accounted_bytes(&self) -> Result<u64, CacheError> {
         Ok(self.state()?.accounted_bytes)
@@ -131,7 +153,9 @@ impl CacheStore for EphemeralCacheStore {
                 CacheError::ResourceLimit("ephemeral payload accounting overflow".to_owned())
             })?;
         let mut state = self.state()?;
-        if state.artifacts.iter().any(|(m, _)| m == &manifest) {
+        if let Some(index) = state.artifacts.iter().position(|(m, _)| m == &manifest) {
+            let existing = state.artifacts.remove(index);
+            state.artifacts.push(existing);
             return Ok(manifest);
         }
         let count = state.artifacts.len();
@@ -141,13 +165,22 @@ impl CacheStore for EphemeralCacheStore {
     }
     fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
         key.validate()?;
-        Ok(self
-            .state()?
-            .artifacts
-            .iter()
-            .filter(|(m, _)| &m.key == key)
-            .map(|(m, _)| m.clone())
-            .collect())
+        let state = self.state()?;
+        let mut candidates = Vec::new();
+        for (manifest, _) in state.artifacts.iter().rev() {
+            if manifest.accepts_lookup_key(key)? {
+                let mut candidate = manifest.clone();
+                candidate.key.logical_key.clone_from(&key.logical_key);
+                candidates.push(candidate);
+            }
+        }
+        candidates.sort_by_key(|m| {
+            std::cmp::Reverse((
+                m.producer_toolkit_version.clone(),
+                m.quality.admissible_rank(),
+            ))
+        });
+        Ok(candidates)
     }
     fn matching_keys(
         &self,
@@ -173,11 +206,7 @@ impl CacheStore for EphemeralCacheStore {
         // Never reserve from caller-supplied size metadata before confirming
         // exact membership. Only already bounded retained payloads are copied.
         let state = self.state()?;
-        let (_, payload) = state
-            .artifacts
-            .iter()
-            .find(|(m, _)| m == manifest)
-            .ok_or_else(|| CacheError::NotFound("ephemeral manifest".to_owned()))?;
+        let payload = Self::retained_payload(&state, manifest)?;
         if payload.len() as u64 != manifest.size_bytes
             || ContentDigest::sha256(payload) != manifest.content_digest
         {
@@ -194,11 +223,7 @@ impl CacheStore for EphemeralCacheStore {
     ) -> Result<(), CacheError> {
         manifest.validate()?;
         let state = self.state()?;
-        let (_, payload) = state
-            .artifacts
-            .iter()
-            .find(|(m, _)| m == manifest)
-            .ok_or_else(|| CacheError::NotFound("ephemeral manifest".to_owned()))?;
+        let payload = Self::retained_payload(&state, manifest)?;
         if payload.len() as u64 != manifest.size_bytes
             || ContentDigest::sha256(payload) != manifest.content_digest
         {
@@ -407,6 +432,10 @@ impl ReadOnlyBudgetedStore {
     }
 }
 impl CacheStore for ReadOnlyBudgetedStore {
+    fn allows_payload_fallback(&self, error: &CacheError) -> bool {
+        self.inner.allows_payload_fallback(error)
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -499,6 +528,36 @@ mod tests {
             provenance_digest: None,
         }
     }
+    #[test]
+    fn session_alias_selects_refreshed_content_and_preserves_exact_history() {
+        let store = EphemeralCacheStore::new(16_384).unwrap();
+        let mut d = draft();
+        let semantic = crate::SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: d.key.kind.clone(),
+            mathematical_semantics_version: "test-v1".into(),
+            resolved_mathematical_parameters: serde_json::json!({"order":3}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: Default::default(),
+            algorithm_semantics: None,
+        };
+        d.key.parameters_digest = semantic.digest().unwrap();
+        d.tags.insert(
+            crate::SEMANTIC_KEY_MANIFEST_TAG.into(),
+            serde_json::to_string(&semantic).unwrap(),
+        );
+        store.put(&d, b"original").unwrap();
+        store.put(&d, b"fresh").unwrap();
+        let mut alias = d.key.clone();
+        alias.logical_key = "different-label".into();
+        let candidates = store.candidates(&alias).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(store.read_payload(&candidates[0]).unwrap(), b"fresh");
+        assert_eq!(store.read_payload(&candidates[1]).unwrap(), b"original");
+    }
+
     #[test]
     fn ephemeral_budget_is_transactional_and_payload_is_content_bound() {
         let store = EphemeralCacheStore::new(16_384).unwrap();

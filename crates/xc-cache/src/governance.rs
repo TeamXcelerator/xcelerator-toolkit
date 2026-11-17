@@ -137,7 +137,10 @@ impl PublicSanitizerProfile {
                 {
                     reasons.push(format!("public field {path:?} contains a secret marker"));
                 }
-                if looks_like_local_path(text) {
+                if looks_like_local_path(text)
+                    && !(path == "manifest.provenance.producer_annotations.reference_zero_dataset"
+                        && public_reference_zero_dataset(text))
+                {
                     reasons.push(format!(
                         "public field {path:?} contains a local filesystem path"
                     ));
@@ -472,20 +475,151 @@ fn collect_leaves<'a>(prefix: &str, value: &'a Value, output: &mut Vec<(String, 
     }
 }
 
-fn looks_like_local_path(value: &str) -> bool {
+/// This annotation is serialized JSON inside a string. The bundled resource
+/// has a public logical name containing "/data/". Parse the entire annotation
+/// before allowing that exact identity through the ordinary path check.
+pub(crate) fn public_reference_zero_dataset(raw: &str) -> bool {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Reference {
+        schema_version: u32,
+        resource_id: String,
+        content_sha256: String,
+        record_count: u64,
+        decimal_digits: u64,
+    }
+    let Ok(reference) = serde_json::from_str::<Reference>(raw) else {
+        return false;
+    };
+    if reference.schema_version != 1
+        || reference.record_count == 0
+        || reference.decimal_digits == 0
+        || !ContentDigest(reference.content_sha256.clone()).validate()
+    {
+        return false;
+    }
+    let id = reference.resource_id.as_str();
+    if id == "xc-zeta/data/zeta_zeros_1000x2500.json" {
+        return reference.content_sha256
+            == "115889b81ba4a42bdb858ffb0167a8e1d0689c514a57192a3640784bd3bd26de"
+            && reference.record_count == 1000
+            && reference.decimal_digits == 2500;
+    }
+    !id.is_empty()
+        && id.len() <= 256
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        && !looks_like_local_path(raw)
+}
+
+pub(crate) fn looks_like_local_path(value: &str) -> bool {
     let bytes = value.as_bytes();
-    (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/'))
-        || value.starts_with("/home/")
-        || value.starts_with("/Users/")
-        || value.starts_with("\\\\")
+    let lower = value.to_ascii_lowercase();
+    bytes.windows(3).enumerate().any(|(i, w)| {
+        (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && w[0].is_ascii_alphabetic()
+            && w[1] == b':'
+            && matches!(w[2], b'\\' | b'/')
+    }) || lower
+        .split(|c: char| c.is_whitespace() || matches!(c, '=' | '(' | '\'' | '"'))
+        .any(|token| {
+            token.starts_with('\\')
+                || (token.len() > 2
+                    && token.as_bytes()[0].is_ascii_alphabetic()
+                    && token.as_bytes()[1] == b':'
+                    && token.as_bytes()[2].is_ascii_alphanumeric())
+        })
+        || lower.split_whitespace().any(|token| token == "/etc")
+        || [
+            "%appdata%",
+            "%localappdata%",
+            "%temp%",
+            "$env:",
+            "${home}/",
+            "/usr/local/",
+            "\\users\\",
+            "\\windows\\",
+            "/etc/",
+            "/home/",
+            "/users/",
+            "/mnt/",
+            "/tmp/",
+            "/var/",
+            "/private/",
+            "/root/",
+            "/opt/",
+            "/srv/",
+            "/data/",
+            "/volumes/",
+            "../",
+            "..\\",
+            "file://",
+            "\\\\",
+            "~/",
+            "~\\",
+            "%userprofile%",
+            "$home/",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || bytes.windows(2).enumerate().any(|(i, w)| {
+            w == b"//"
+                && (i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b':'))
+        })
+        || bytes.windows(3).enumerate().any(|(i, w)| {
+            w[0] == b'/'
+                && w[1].is_ascii_alphabetic()
+                && w[2] == b'/'
+                && (i == 0 || bytes[i - 1].is_ascii_whitespace() || b"=('".contains(&bytes[i - 1]))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_zero_attribution_is_allowed_only_in_its_typed_public_field() {
+        let field = "manifest.provenance.producer_annotations.reference_zero_dataset";
+        let bundled = serde_json::json!({
+            "schema_version":1, "resource_id":"xc-zeta/data/zeta_zeros_1000x2500.json",
+            "content_sha256":ContentDigest::sha256(include_bytes!("../../xc-zeta/data/zeta_zeros_1000x2500.json")).0,
+            "record_count":1000, "decimal_digits":2500
+        });
+        let profile = PublicSanitizerProfile {
+            allowed_leaf_fields: [field.to_owned(), "other".to_owned()].into_iter().collect(),
+            allowed_repository_names: ["example/public".to_owned()].into_iter().collect(),
+            ..PublicSanitizerProfile::default()
+        };
+        let inspect = |name: &str, value: &Value| {
+            profile
+                .inspect(
+                    &BTreeMap::from([(name.to_owned(), Value::String(value.to_string()))]),
+                    "example/public",
+                )
+                .accepted
+        };
+        assert!(public_reference_zero_dataset(&bundled.to_string()));
+        assert!(inspect(field, &bundled));
+        assert!(!inspect("other", &bundled));
+        for (key, value) in [
+            ("content_sha256", Value::String("a".repeat(64))),
+            ("record_count", Value::from(999)),
+            (
+                "resource_id",
+                Value::from("private/data/zeta_zeros_1000x2500.json"),
+            ),
+            ("other", Value::from("unreviewed annotation")),
+        ] {
+            let mut changed = bundled.clone();
+            changed[key] = value;
+            assert!(!public_reference_zero_dataset(&changed.to_string()));
+            assert!(!inspect(field, &changed));
+        }
+    }
 
     fn policy() -> CachePublicationPolicy {
         let sanitizer = PublicSanitizerProfile {

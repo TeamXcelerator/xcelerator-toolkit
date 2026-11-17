@@ -11,7 +11,17 @@ use super::*;
 use rug::float::Round;
 use xc_numerics::mpfr_interval::MpfrInterval;
 
-pub const ASSEMBLY_ERROR_SEMANTICS: &str = "ccm-assembly-error-v0.16.0-v2";
+#[derive(Debug)]
+struct RootBoundUnavailable(&'static str);
+
+impl std::fmt::Display for RootBoundUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for RootBoundUnavailable {}
+
+pub const ASSEMBLY_ERROR_SEMANTICS: &str = "ccm-assembly-error-exact-form-v4";
 const ASSEMBLY_ERROR_SCOPE: &str = "rigorous bounds on stored-matrix minus exact finite CCM Weil form at the declared cutoff, and exact-finite-form eigenvalue enclosures by Weyl's inequality; continuum limits are not addressed";
 const BOUND_BITS: u32 = 64;
 
@@ -314,9 +324,82 @@ fn exact_form_bound(
 
 /// Inputs for exact-form eigenvalue enclosures. Every field is optional:
 /// absent sources simply produce fewer bounds.
+#[derive(Clone, Copy)]
 pub(super) struct ExactFormSources<'a> {
     pub primary: Option<&'a HighPrecResult>,
     pub sectors: Option<&'a CcmSectorGapHp>,
+}
+
+impl<'a> ExactFormSources<'a> {
+    fn root_sources(self) -> Result<(&'a HighPrecResult, &'a Float), RootBoundUnavailable> {
+        let primary = self
+            .primary
+            .ok_or(RootBoundUnavailable("retained primary state unavailable"))?;
+        let second = self
+            .sectors
+            .and_then(|gap| gap.even.eigenpairs.get(1))
+            .ok_or(RootBoundUnavailable(
+                "a second even-sector eigenvalue enclosure is required for the state separation",
+            ))?;
+        Ok((primary, &second.eigenvalue_lower))
+    }
+
+    fn check_root_coverage(
+        self,
+        analysis: &CcmAssemblyErrorAnalysis,
+        expected: &[(usize, String)],
+        params: &CcmParams,
+        cfg: &HighPrecConfig,
+        tau: &[Float],
+    ) -> Result<(), CacheError> {
+        let matches = match (
+            &analysis.exact_form_roots,
+            &analysis.exact_form_roots_limitation,
+            self.root_sources(),
+        ) {
+            (Some(roots), None, Ok(_)) => roots
+                .rows
+                .iter()
+                .map(|row| (row.ordinal, &row.computed_value))
+                .eq(expected.iter().map(|(ordinal, value)| (*ordinal, value))),
+            (None, Some(reason), Err(missing)) => reason == missing.0,
+            (None, Some(reason), Ok((primary, second))) => {
+                // A source can legitimately fail separation or normalization. Recheck
+                // that limitation before accepting a payload with every root omitted.
+                parse_bound(&analysis.even_sector.spectral_upper)
+                    .and_then(|allowance| {
+                        exact_form_roots(params, cfg, tau, primary, &allowance, second)
+                    })
+                    .is_err_and(|err| {
+                        err.downcast_ref::<RootBoundUnavailable>()
+                            .is_some_and(|actual| reason == actual.0)
+                    })
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(CacheError::InvalidManifest(
+                "CCM assembly error root coverage does not match its retained inputs".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Failed refinements produce no row. Their position still determines the ordinal
+/// of every subsequent point, including in a projected or signed window.
+fn assembly_root_points(primary: &HighPrecResult) -> Result<impl Iterator<Item = (usize, &Float)>> {
+    let start = primary.first_positive_root_index;
+    if let Some(last_offset) = primary.eigenvalues_pos.len().checked_sub(1) {
+        if start == 0 || start.checked_add(last_offset).is_none() {
+            bail!("invalid root ordinal range for assembly error analysis");
+        }
+    }
+    Ok(primary
+        .eigenvalues_pos
+        .iter()
+        .enumerate()
+        .filter_map(move |(offset, root)| root.value().map(|value| (start + offset, value))))
 }
 
 /// Compute the analysis. `components` supplies the stored pole, archimedean
@@ -485,25 +568,16 @@ pub(super) fn analyze_assembly_error(
             ));
         }
     }
-    let second_lower = sources
-        .sectors
-        .and_then(|sectors| sectors.even.eigenpairs.get(1))
-        .map(|pair| pair.eigenvalue_lower.clone());
-    let (exact_form_roots, exact_form_roots_limitation) = match (sources.primary, second_lower) {
-        (Some(primary), Some(second)) => {
-            match exact_form_roots(params, cfg, tau, primary, &even_allowance, &second) {
-                Ok(roots) => (Some(roots), None),
-                Err(error) => (None, Some(format!("{error:#}"))),
-            }
-        }
-        (None, _) => (None, Some("retained primary state unavailable".to_owned())),
-        (_, None) => (
-            None,
-            Some(
-                "a second even-sector eigenvalue enclosure is required for the state separation"
-                    .to_owned(),
-            ),
-        ),
+    let root_result = sources
+        .root_sources()
+        .map_err(anyhow::Error::from)
+        .and_then(|(primary, second)| {
+            exact_form_roots(params, cfg, tau, primary, &even_allowance, second)
+        });
+    let (exact_form_roots, exact_form_roots_limitation) = match root_result {
+        Ok(roots) => (Some(roots), None),
+        Err(error) if error.is::<RootBoundUnavailable>() => (None, Some(error.to_string())),
+        Err(error) => return Err(error),
     };
     Ok(CcmAssemblyErrorAnalysis {
         schema_version: 1,
@@ -563,11 +637,11 @@ pub(super) fn exact_form_roots(
     let shifted = Float::with_val_round(q, second_lower - even_allowance, Round::Down).0;
     let separation = Float::with_val_round(q, &shifted - mu, Round::Down).0;
     if separation <= 0 || Float::with_val(q, &exact_residual) >= separation {
-        bail!("the retained state is not separated from the rest of the exact even spectrum at assembly scale");
+        return Err(RootBoundUnavailable("the retained state is not separated from the rest of the exact even spectrum at assembly scale").into());
     }
     let sine = Float::with_val_round(BOUND_BITS, &exact_residual / &separation, Round::Up).0;
     if sine >= 1 {
-        bail!("eigenvector angle bound is not informative");
+        return Err(RootBoundUnavailable("eigenvector angle bound is not informative").into());
     }
     // For unit vectors at angle theta <= pi/2, ||x-u|| = 2 sin(theta/2) <= sqrt(2) sin(theta).
     let kappa = mul_up(&sine, &parse_bound("1.4142135623730952")?);
@@ -587,7 +661,10 @@ pub(super) fn exact_form_roots(
     let spread = MpfrInterval::from_u64(d as u64, q).sqrt()?.mul(&radius);
     let denominator = alignment.add(&spread);
     if !denominator.is_strictly_positive() {
-        bail!("the normalization sum is not resolved at the eigenvector uncertainty");
+        return Err(RootBoundUnavailable(
+            "the normalization sum is not resolved at the eigenvector uncertainty",
+        )
+        .into());
     }
     let length = super::super::retained_evidence::finite_math::decimal(
         &lambda_squared_cache_identity(params),
@@ -609,20 +686,8 @@ pub(super) fn exact_form_roots(
         .map(|j| two_pi.mul(&MpfrInterval::from_i64(j, q)).div(&length))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let source = CertifiedSecularFunction::from_interval_data(poles, weights)?;
-    let rows = primary
-        .eigenvalues_pos
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, outcome)| {
-            outcome.value().map(|value| {
-                enclose_root(
-                    &source,
-                    value,
-                    primary.first_positive_root_index + offset,
-                    q,
-                )
-            })
-        })
+    let rows = assembly_root_points(primary)?
+        .map(|(ordinal, value)| enclose_root(&source, value, ordinal, q))
         .collect();
     Ok(CcmExactFormRoots {
         state_residual_upper: decimal_up(&exact_residual),
@@ -714,6 +779,16 @@ pub(super) fn resolve_assembly_error_via_cache(
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<xc_cache::ArtifactExecutionCacheResult<CcmAssemblyErrorAnalysis>> {
     let parity_policy = cfg.effective_parity_policy();
+    let sources = ExactFormSources {
+        primary: primary.map(|(result, _)| result),
+        sectors: sectors.map(|(gap, _)| gap),
+    };
+    let root_points = match sources.root_sources() {
+        Ok((primary, _)) => assembly_root_points(primary)?
+            .map(|(ordinal, value)| (ordinal, lossless_hp_decimal(value)))
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
     let mut resolved_parameters = serde_json::json!({
         "lambda_squared": lambda_squared_cache_identity(params),
         "n_modes": params.n_modes,
@@ -722,6 +797,7 @@ pub(super) fn resolve_assembly_error_via_cache(
         "tau_content_digest": tau_manifest.content_digest.0,
         "eigenpair_content_digest": primary.map(|(_, m)| m.content_digest.0.clone()),
         "sector_gap_content_digest": sectors.map(|(_, m)| m.content_digest.0.clone()),
+        "root_selection_digest": ContentDigest::sha256_json(&root_points)?,
         "analysis_guard_bits": 64,
     });
     add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
@@ -799,7 +875,7 @@ pub(super) fn resolve_assembly_error_via_cache(
                 "CCM assembly error analysis does not match its semantic identity".to_owned(),
             ));
         }
-        Ok(())
+        sources.check_root_coverage(analysis, &root_points, params, cfg, tau)
     };
     Ok(resolve_or_compute_json_artifact_with_dependencies(
         &request,
@@ -821,10 +897,7 @@ pub(super) fn resolve_assembly_error_via_cache(
                 tau,
                 &tau_manifest.content_digest,
                 Some(&components),
-                ExactFormSources {
-                    primary: primary.map(|(result, _)| result),
-                    sectors: sectors.map(|(gap, _)| gap),
-                },
+                sources,
             )
             .map_err(|error| {
                 CacheError::InvalidManifest(format!("CCM assembly error: {error:#}"))
@@ -903,6 +976,154 @@ mod tests {
 mod exact_form_root_tests {
     use super::super::root_certification_report::build_root_certification_report;
     use super::*;
+
+    #[test]
+    fn assembly_error_cache_binds_only_consumed_root_ordinals_and_values() {
+        super::super::ccm_regression_tests::with_remaining_cache(|cache| {
+            xc_numerics::hp_runtime::run_hp(|| -> Result<()> {
+                let params = CcmParams::from_lambda_sq_integer(13, 10);
+                let mut cfg = HighPrecConfig::for_decimal_digits(40);
+                cfg.precision_bits = 192;
+                cfg.quad_points = MIN_QUAD_POINTS;
+                cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+                let (mut primary, source) = run_inner_retaining_source(
+                    &params,
+                    &cfg,
+                    RootAcquisition::Independent {
+                        target: &ZeroTarget::IndexRange { first: 1, last: 2 },
+                        options: IndependentRootDiscoveryOptions::default(),
+                    },
+                    CcmCacheRoute::Fabric(cache),
+                    None,
+                )?;
+                assert_eq!(primary.eigenvalues_pos.len(), 2);
+                let tau = source.tau.clone();
+                let tau_manifest = source.tau_manifest.clone().unwrap();
+                let eigenpair = source.eigenpair_manifest.clone().unwrap();
+                let sectors = analyze_sector_gap_from_retained_source(
+                    &params,
+                    &cfg,
+                    CcmSectorAnalysisOptions::selected(2),
+                    Some(cache),
+                    source,
+                )?;
+                let gap = (&sectors.gap, sectors.gap_manifest.as_ref().unwrap());
+                let resolve = |primary: &HighPrecResult, sectors| {
+                    resolve_assembly_error_via_cache(
+                        &params,
+                        &cfg,
+                        &tau,
+                        &tau_manifest,
+                        Some((primary, &eigenpair)),
+                        sectors,
+                        cache,
+                    )
+                };
+                let second = primary.eigenvalues_pos.pop().unwrap();
+                let narrow = resolve(&primary, Some(gap))?;
+                assert!(narrow.produced_manifest.is_some());
+                assert_eq!(
+                    narrow.value.exact_form_roots.as_ref().unwrap().rows.len(),
+                    1
+                );
+                primary.eigenvalues_pos.push(second);
+                let wide = resolve(&primary, Some(gap))?;
+                assert!(
+                    wide.produced_manifest.is_some(),
+                    "a narrow hit must not satisfy a wider request"
+                );
+                let rows = &wide.value.exact_form_roots.as_ref().unwrap().rows;
+                assert_eq!(rows.len(), 2);
+                let points: Vec<_> = primary
+                    .eigenvalues_pos
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (i + 1, lossless_hp_decimal(r.value().unwrap())))
+                    .collect();
+                let sources = ExactFormSources {
+                    primary: Some(&primary),
+                    sectors: Some(&sectors.gap),
+                };
+                let check = |value: &CcmAssemblyErrorAnalysis| {
+                    sources.check_root_coverage(value, &points, &params, &cfg, &tau)
+                };
+                assert!(check(&wide.value).is_ok());
+                assert!(check(&narrow.value).is_err());
+                assert!(sources
+                    .check_root_coverage(&wide.value, &points[..1], &params, &cfg, &tau)
+                    .is_err());
+                let mut wrong = wide.value.clone();
+                wrong.exact_form_roots.as_mut().unwrap().rows.swap(0, 1);
+                assert!(check(&wrong).is_err());
+                wrong.exact_form_roots = None;
+                wrong.exact_form_roots_limitation = Some(
+                    "the normalization sum is not resolved at the eigenvector uncertainty".into(),
+                );
+                assert!(check(&wrong).is_err());
+
+                let mut retained = outcome_refinement(&primary.eigenvalues_pos[1])
+                    .unwrap()
+                    .clone();
+                retained.diagnostics.iterations += 1;
+                primary.eigenvalues_pos[1] = EigenvalueResult::Approximate(retained.clone());
+                assert_eq!(
+                    resolve(&primary, Some(gap))?.reused_manifest,
+                    wide.produced_manifest
+                );
+                retained.value.next_up();
+                primary.eigenvalues_pos[1] = EigenvalueResult::Stagnated(retained);
+                let changed = resolve(&primary, Some(gap))?;
+                assert!(changed.produced_manifest.is_some());
+                assert_ne!(
+                    changed.value.exact_form_roots.as_ref().unwrap().rows[1].computed_value,
+                    rows[1].computed_value
+                );
+                let changed_sources = ExactFormSources {
+                    primary: Some(&primary),
+                    sectors: Some(&sectors.gap),
+                };
+                assert!(changed_sources
+                    .check_root_coverage(&changed.value, &points, &params, &cfg, &tau)
+                    .is_err());
+
+                primary.eigenvalues_pos.pop();
+                assert_eq!(
+                    resolve(&primary, Some(gap))?.reused_manifest,
+                    narrow.produced_manifest
+                );
+                primary.first_positive_root_index = 2;
+                let shifted = resolve(&primary, Some(gap))?;
+                assert!(shifted.produced_manifest.is_some());
+                assert_eq!(
+                    shifted.value.exact_form_roots.as_ref().unwrap().rows[0].ordinal,
+                    2
+                );
+                primary.first_positive_root_index = 1;
+                primary.eigenvalues_pos.insert(
+                    0,
+                    EigenvalueResult::Failed {
+                        iterations: 1,
+                        reason: "no point".into(),
+                    },
+                );
+                assert_eq!(
+                    resolve(&primary, Some(gap))?.reused_manifest,
+                    shifted.produced_manifest
+                );
+
+                let limited = resolve(&primary, None)?;
+                assert!(limited.value.exact_form_roots.is_none());
+                assert!(limited.value.exact_form_roots_limitation.is_some());
+                primary.eigenvalues_pos.clear();
+                assert_eq!(
+                    resolve(&primary, None)?.reused_manifest,
+                    limited.produced_manifest
+                );
+                Ok(())
+            })
+            .unwrap();
+        });
+    }
 
     #[test]
     fn exact_form_root_enclosures_agree_with_certified_stored_roots() {

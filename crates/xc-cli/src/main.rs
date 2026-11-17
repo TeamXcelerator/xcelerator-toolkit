@@ -1016,7 +1016,9 @@ fn validate_artifact(request: &CacheValidateRequest) -> Result<(), CliError> {
         root_materialization: None,
         materialization: materialization.as_ref(),
     })?;
-    write_success(
+    let passed = resolution.selected.is_some();
+    write_checked(
+        passed,
         "cache.validate",
         &CacheValidateCommandReport {
             mode: request.mode,
@@ -1553,7 +1555,11 @@ fn audit_shard(request: &CacheAuditRequest) -> Result<(), CliError> {
         &request.policy,
         &CancellationToken::for_policy(&request.transport.resources),
     )?;
-    write_success("cache.audit", &report)
+    let passed = !report
+        .issues
+        .iter()
+        .any(|issue| issue.severity == xc_cache::ShardAuditSeverity::Error);
+    write_checked(passed, "cache.audit", &report)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2225,16 +2231,25 @@ struct SuccessEnvelope<'a, T> {
 }
 
 fn write_success<T: Serialize>(command: &str, result: &T) -> Result<(), CliError> {
+    write_checked(true, command, result)
+}
+
+fn write_checked<T: Serialize>(passed: bool, command: &str, result: &T) -> Result<(), CliError> {
     let output = SuccessEnvelope {
         schema_version: 1,
         command,
-        status: "ok",
+        status: if passed { "ok" } else { "failed" },
         result,
     };
     println!(
         "{}",
         serde_json::to_string_pretty(&output).map_err(CliError::from)?
     );
+    if !passed {
+        return Err(CliError::input(format!(
+            "{command} failed; see reported results"
+        )));
+    }
     Ok(())
 }
 
@@ -2311,6 +2326,7 @@ impl Error for CliError {}
 impl From<CacheError> for CliError {
     fn from(error: CacheError) -> Self {
         let category = match &error {
+            CacheError::RefConflict(_) => "ref_conflict",
             CacheError::Authentication(_) => "authentication",
             CacheError::PermissionDenied(_) => "permission_denied",
             CacheError::Cancelled(_) => "cancelled",

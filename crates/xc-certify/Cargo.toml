@@ -11,7 +11,7 @@ rust-version.workspace = true
 
 [features]
 default = []
-hp = ["dep:rug", "xc-numerics/hp"]
+hp = ["dep:rug", "dep:xc-numerics", "xc-numerics/hp"]
 
 [dependencies]
 serde = { workspace = true }
@@ -19,4 +19,4 @@ serde_json = { workspace = true }
 rug = { workspace = true, optional = true }
 xc-core = { workspace = true }
 xc-cache = { workspace = true }
-xc-numerics = { workspace = true }
+xc-numerics = { workspace = true, optional = true }

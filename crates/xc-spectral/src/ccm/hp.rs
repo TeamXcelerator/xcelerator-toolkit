@@ -48,7 +48,7 @@ pub mod finite_window_census;
 /// matrix assembly or the original state-selection proof.
 pub mod retained_root_recovery;
 
-mod complete_discovery;
+pub(super) mod complete_discovery;
 mod eigenstate_accuracy;
 #[cfg(test)]
 mod source_resolution_tests;
@@ -87,14 +87,14 @@ pub use checkpoint_spectra::{
     CcmCheckpointSpectra, CcmCheckpointSpectrumRow, CHECKPOINT_SPECTRA_SEMANTICS,
 };
 mod root_certification_report;
+pub use root_certification_report::{
+    certify_retained_reference_roots, CcmRootCertificationReport, CcmRootCertificationRequest,
+    CcmRootCertificationRow, COMPLETE_POSITIVE_ROOT_CERTIFICATION_REPORT_SEMANTICS,
+    ROOT_CERTIFICATION_REPORT_SEMANTICS, TIGHT_ROOT_CERTIFICATION_REPORT_SEMANTICS,
+};
 use root_certification_report::{
     resolve_complete_positive_root_certification_report_via_cache,
     resolve_root_certification_report_via_cache, resolve_tight_root_certification_report_via_cache,
-};
-pub use root_certification_report::{
-    CcmRootCertificationReport, CcmRootCertificationRequest, CcmRootCertificationRow,
-    COMPLETE_POSITIVE_ROOT_CERTIFICATION_REPORT_SEMANTICS, ROOT_CERTIFICATION_REPORT_SEMANTICS,
-    TIGHT_ROOT_CERTIFICATION_REPORT_SEMANTICS,
 };
 mod root_conditioning_math;
 mod root_response_math;
@@ -4268,7 +4268,7 @@ fn resolve_even_sector_matrix_via_cache(
             }
             let decoded = parse_hp_vector(&artifact.entries, cfg.precision_bits)?;
             if !even_sector_matches_tau(&decoded, tau, params.n_modes, cfg.precision_bits) {
-                return Err(CacheError::InvalidManifest(
+                return Err(CacheError::InvalidTransition(
                     "CCM even-sector matrix is inconsistent with its full tau dependency"
                         .to_owned(),
                 ));
@@ -4388,7 +4388,7 @@ fn resolve_odd_sector_matrix_via_cache(
             let expected = build_odd_sector_matrix(tau, params.n_modes, cfg.precision_bits)
                 .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
             if decoded != expected || !matrix_is_exactly_symmetric(&decoded, dimension) {
-                return Err(CacheError::InvalidManifest(
+                return Err(CacheError::InvalidTransition(
                     "CCM odd-sector matrix is inconsistent with its full tau dependency".to_owned(),
                 ));
             }
@@ -5475,14 +5475,25 @@ fn resolve_sector_eigenvalues_with_policy_via_cache(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let values = compute_sector_eigenvalues_with_policy(
-                tridiagonal,
-                dimension,
-                artifact_request_count,
-                route,
-                cfg.precision_bits,
-                policy,
-            )
+            let compute = || {
+                compute_sector_eigenvalues_with_policy(
+                    tridiagonal,
+                    dimension,
+                    artifact_request_count,
+                    route,
+                    cfg.precision_bits,
+                    policy,
+                )
+            };
+            let values = if matches!(
+                cache.mode,
+                xc_cache::ArtifactExecutionCacheMode::Refresh
+                    | xc_cache::ArtifactExecutionCacheMode::Disabled
+            ) {
+                xc_numerics::eigen::without_qr_checkpoints(compute)
+            } else {
+                compute()
+            }
             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
             Ok((
                 portable_sector_eigenvalues(
@@ -7206,6 +7217,7 @@ mod validation_capacity_repair {
     fn runtime_factors_retire_before_validation_and_release_on_errors() {
         let retained = RuntimeLuFactors::default();
         let factors = Rc::new(xc_numerics::linalg::LuFactors {
+            schur_execution: None,
             lu: vec![Float::with_val(128, 1)],
             perm: vec![0],
         });
@@ -7227,6 +7239,7 @@ mod validation_capacity_repair {
         // A failed solve returns before the explicit retirement boundary.
         // Its scope must still release all per-resolution map ownership.
         let factors = Rc::new(xc_numerics::linalg::LuFactors {
+            schur_execution: None,
             lu: vec![Float::with_val(256, 1)],
             perm: vec![0],
         });
@@ -7631,6 +7644,7 @@ mod validation_capacity_repair {
             assert!(factorization_sanity_error(&matrix, &factors, 2, p).is_none());
         }
         let empty = xc_numerics::linalg::LuFactors {
+            schur_execution: None,
             lu: vec![],
             perm: vec![],
         };
@@ -7665,6 +7679,7 @@ mod validation_capacity_repair {
         assert_eq!(serial, run(4));
         assert!(serial < Float::with_val(p, 1) >> (p - 32));
         let mut wrong = xc_numerics::linalg::LuFactors {
+            schur_execution: None,
             lu: factors.lu.clone(),
             perm: factors.perm.clone(),
         };
@@ -8082,6 +8097,7 @@ fn resolve_factorization_via_cache(
                     ));
                 }
                 let factors = xc_numerics::linalg::LuFactors {
+                    schur_execution: None,
                     lu: parse_hp_vector(&artifact.lu, cfg.precision_bits)?,
                     perm: artifact.permutation.clone(),
                 };
@@ -8619,7 +8635,7 @@ fn weil_eigenpair_cache_identity(
     Ok((semantic_key, logical_key))
 }
 
-fn accepted_identity_exists(
+pub(super) fn accepted_identity_exists(
     semantic_key: &SemanticKeyEnvelope,
     logical_key: &str,
     cache: &ArtifactCacheContext<'_>,
@@ -8779,8 +8795,6 @@ fn weil_eigenpair_via_cache_with_retained_factors(
             "[HP] continuation seed ignored: persistent eigenpair artifacts are computed from the canonical start"
         );
     }
-    let continuation_seed: Option<&[Float]> = None;
-    let continuation_manifest: Option<&ArtifactManifest> = None;
     let parity_policy = cfg.effective_parity_policy();
     if cfg.eigenstate_solver == CcmEigenstateSolver::Auto {
         let mut selected = cfg.clone();
@@ -8903,25 +8917,12 @@ fn weil_eigenpair_via_cache_with_retained_factors(
         bail!("shift-invert Krylov CCM currently requires parity_policy=even-sector");
     }
     let route = cfg.eigenstate_solver.as_str();
-    let seed_identity = continuation_manifest.map_or_else(
-        || "canonical".to_owned(),
-        |manifest| format!("from-eigenpair-{}", manifest.content_digest.0),
-    );
+    let seed_identity = String::from("canonical");
     let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, cfg, tau_manifest)?;
-    let mut tags = BTreeMap::from([
+    let tags = BTreeMap::from([
         ("domain".to_owned(), "ccm".to_owned()),
         ("artifact".to_owned(), "weil_eigenpair".to_owned()),
     ]);
-    if let Some(seed_manifest) = continuation_manifest {
-        tags.insert(
-            xc_cache::OUTPUT_VALIDATION_SEED_TAG.to_owned(),
-            serde_json::to_string(&xc_cache::DependencyRef {
-                key: seed_manifest.key.clone(),
-                content_digest: seed_manifest.content_digest.clone(),
-                required_quality: seed_manifest.quality,
-            })?,
-        );
-    }
     let request = ArtifactExecutionCacheRequest {
         operation: "ccm.weil_eigenpair.resolve_or_compute",
         semantic_key: &semantic_key,
@@ -9125,16 +9126,8 @@ fn weil_eigenpair_via_cache_with_retained_factors(
                             precision_bits: working_precision,
                             id: format!("ccm-even-lu:{}", guarded_factor_manifest.content_digest.0),
                         };
-                        let initial_basis = continuation_seed
-                            .map(|seed| vec![seed.to_vec()])
-                            .unwrap_or_default();
                         let report = xc_solver::ShiftInvertKrylovSolverHp
-                            .solve_with_initial_basis(
-                                &operator,
-                                &shifted,
-                                &solver_config,
-                                &initial_basis,
-                            )
+                            .solve_with_initial_basis(&operator, &shifted, &solver_config, &[])
                             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
                         if report.status != ResultStatus::Converged
                             || report.boundary_cluster.is_some()
@@ -9334,7 +9327,12 @@ fn weil_eigenpair_via_cache_with_retained_factors(
                     shift_invert_krylov: krylov_diagnostics,
                     ground_index,
                 },
-                canonical_dependency_refs(factor_manifests),
+                canonical_dependency_refs(
+                    factor_manifests
+                        .into_iter()
+                        .chain([tau_manifest.clone()])
+                        .collect(),
+                ),
             ))
         },
         |artifact: &PortableWeilEigenpair| {
@@ -9792,7 +9790,15 @@ fn adaptive_root_outcome(
                     adaptive_precision: None,
                 };
             }
-            EigenvalueResult::Approximate(result) => {
+            EigenvalueResult::Approximate(_) => {
+                let outcome =
+                    downround_adaptive_outcome(outcome, xi, poles, target_bits, base_precision);
+                let Some(result) = outcome_refinement(&outcome) else {
+                    return ComputedRootOutcome {
+                        outcome,
+                        adaptive_precision: None,
+                    };
+                };
                 let evidence = PortableAdaptiveRootPrecision {
                     source_accuracy_scope: "exact_stored_point_source".to_owned(),
                     target_precision_bits: target_bits,
@@ -9805,13 +9811,7 @@ fn adaptive_root_outcome(
                     stopping_reason: "iteration_limit".to_owned(),
                 };
                 return ComputedRootOutcome {
-                    outcome: downround_adaptive_outcome(
-                        outcome,
-                        xi,
-                        poles,
-                        target_bits,
-                        base_precision,
-                    ),
+                    outcome,
                     adaptive_precision: Some(evidence),
                 };
             }
@@ -9931,7 +9931,8 @@ fn downround_adaptive_outcome(
 ) -> EigenvalueResult {
     let rebuild = |result: RootRefinement| {
         let value = Float::with_val(base_precision, &result.value);
-        let correction = Float::with_val(base_precision, &result.diagnostics.final_correction);
+        let correction =
+            secular_correction_at(xi, poles, &value, base_precision, RootSolver::Newton)?;
         root_refinement(
             xi,
             poles,
@@ -10638,10 +10639,12 @@ fn decode_root_range(
         }
         previous = Some(value);
     }
-    if artifact_mode == RootArtifactMode::Independent {
-        complete_discovery::validate_assignment(&decoded, seeds)
-            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-    }
+    complete_discovery::validate_assignment(&decoded, seeds).map_err(|error| {
+        match error.downcast::<CacheError>() {
+            Ok(typed) => typed,
+            Err(error) => CacheError::InvalidManifest(error.to_string()),
+        }
+    })?;
     Ok(decoded)
 }
 
@@ -10778,13 +10781,21 @@ fn root_range_semantic_key(
         }
         .to_owned(),
         mathematical_semantics_version: if artifact_mode == RootArtifactMode::Independent
+            && cfg.root_precision_policy == RootPrecisionPolicy::Adaptive
+        {
+            if semantics.is_complete_positive() {
+                "ccm-complete-positive-adaptive-v16"
+            } else {
+                "ccm-root-discovery-adaptive-v3"
+            }
+        } else if artifact_mode == RootArtifactMode::Independent
             && !semantics.is_complete_positive()
         {
             "ccm-root-discovery-v0.15.2-v2"
         } else if semantics.is_complete_positive() {
             "ccm-root-range-v0.15.2-v15"
         } else if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
-            "ccm-root-range-v0.15.2-v12"
+            "ccm-adaptive-root-range-v13"
         } else if semantics.is_advanced() {
             "ccm-root-range-v0.15.2-v11-advanced"
         } else {
@@ -11121,10 +11132,8 @@ fn resolve_root_range_via_cache(
                 semantics.domain,
             )
             .map_err(|error| CacheError::InvalidTransition(error.to_string()))?;
-            if artifact_mode == RootArtifactMode::Independent {
-                complete_discovery::validate_assignment(&runtime_outcomes, seeds)
-                    .map_err(|error| CacheError::InvalidTransition(error.to_string()))?;
-            }
+            complete_discovery::validate_assignment(&runtime_outcomes, seeds)
+                .map_err(|error| CacheError::InvalidTransition(error.to_string()))?;
             let outcomes = computed
                 .iter()
                 .map(|computed| root_execution::portable(computed, resolved_eigenstate_solver))
@@ -12005,11 +12014,19 @@ fn response_spectral_isolation(
     ]
     .iter()
     .any(|x| !x.is_finite())
-        || gap <= 0
     {
-        bail!(
-            "CCM response unresolved_near_crossing: source-matrix eigenvalue intervals are not finitely separated at {p} bits"
-        );
+        bail!("CCM response spectral isolation produced nonfinite bounds");
+    }
+    if gap <= 0 {
+        let bounds = serde_json::json!({
+            "schema":"ccm-response-overlapping-source-intervals-v1",
+            "precision_bits":p,
+            "selected_upper":lossless_hp_decimal(&selected_upper),
+            "neighbor_lower":lossless_hp_decimal(&neighbor_lower),
+        });
+        return Err(anyhow::anyhow!("nonpositive directed source gap")
+            .context(bounds)
+            .context(format!("CCM response unresolved_near_crossing: source-matrix eigenvalue intervals are not finitely separated at {p} bits")));
     }
     let sector_state = restrict_even_sector_vector(unit_state, params.n_modes, p)?;
     let residual = state_residual_bounds::evaluate(
@@ -13708,7 +13725,7 @@ fn resolve_prime_power_response_analysis_via_cache_with_memo(
     Ok(resolved.value)
 }
 
-const U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS: &str = "ccm-u-flow-response-exact-quadrants-v4";
+const U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS: &str = "ccm-u-flow-response-generated-quadrature-v5";
 const U_FLOW_RESPONSE_NORMALIZATION: &str =
     "l2_eigenvector_gauge_with_sum_xi_equals_sqrt_u_and_moving_uniform_secular_poles";
 const U_FLOW_RESPONSE_VELOCITY_PARAMETER: &str = "u=log(lambda_squared)";
@@ -13890,6 +13907,7 @@ fn compute_u_flow_response_analysis(
         velocity_actions,
         spectral_preparation,
         None,
+        None,
     )
 }
 
@@ -13911,6 +13929,7 @@ fn compute_u_flow_response_analysis_with_memo(
     velocity_actions: &UFlowVelocityActions,
     spectral_preparation: &ResponseSpectralPreparation,
     bordered_memo: Option<&BorderedResponseMemo>,
+    checked_isolation: Option<PortableResponseSpectralIsolation>,
 ) -> Result<PortableUFlowResponseAnalysis> {
     let precision_bits = cfg.precision_bits;
     let dimension = params.matrix_size();
@@ -13924,13 +13943,16 @@ fn compute_u_flow_response_analysis_with_memo(
     }
     let ccm_scale = response_normalization_scale(&unit_state, l, precision_bits)?;
     let normalization_target_velocity = response_target_velocity(l, precision_bits)?;
-    let spectral_isolation = response_spectral_isolation(
-        spectral_preparation,
-        params,
-        cfg,
-        state_eigenvalue,
-        &unit_state,
-    )?;
+    let spectral_isolation = match checked_isolation {
+        Some(value) => value,
+        None => response_spectral_isolation(
+            spectral_preparation,
+            params,
+            cfg,
+            state_eigenvalue,
+            &unit_state,
+        )?,
+    };
     let bordered_solver = resolve_bordered_response_solver(
         bordered_memo,
         spectral_preparation,
@@ -14508,6 +14530,14 @@ fn resolve_u_flow_response_analysis_via_cache_with_memo(
         &request,
         || {
             let unit_state = response_unit_state(xi, precision_bits)?;
+            let isolation = response_spectral_isolation(
+                &spectral_preparation.numerical,
+                params,
+                cfg,
+                state_eigenvalue,
+                &unit_state,
+            )
+            .map_err(|e| CacheError::InvalidManifest(format!("{e:#}")))?;
             let velocity_actions = {
                 let _stage = crate::ccm::capture_runtime::Stage::new("u-flow velocity actions");
                 compute_u_flow_velocity_actions_checkpointed(
@@ -14539,6 +14569,7 @@ fn resolve_u_flow_response_analysis_via_cache_with_memo(
                 &velocity_actions,
                 &spectral_preparation.numerical,
                 bordered_memo,
+                Some(isolation),
             )
             .map_err(|error| CacheError::InvalidManifest(format!("{error:#}")))?;
             // Explicit verification modes retain independent numerical replay.
@@ -15145,16 +15176,26 @@ fn run_with_research_capture(
         // computed value and status. Numerical limits never abort the run.
         let root_certification_report = if let Some(certification) = &options.root_certification {
             let certification_started = Instant::now();
-            let (report, _) = resolve_root_certification_report_via_cache(
-                params,
-                cfg,
-                &primary,
-                &primary.xi,
-                retained_source.root_manifest.as_ref(),
-                retained_source.secular_manifest.as_ref(),
-                certification,
-                cache,
-            )?;
+            let report = if cache.is_none()
+                && matches!(acquisition, RootAcquisition::ReferenceSeeded { .. })
+                && !matches!(
+                    certification.target,
+                    super::certified_roots::IndependentCcmRootTarget::PositiveHeightWindow { .. }
+                ) {
+                certify_retained_reference_roots(params, cfg, &primary, certification)?
+            } else {
+                resolve_root_certification_report_via_cache(
+                    params,
+                    cfg,
+                    &primary,
+                    &primary.xi,
+                    retained_source.root_manifest.as_ref(),
+                    retained_source.secular_manifest.as_ref(),
+                    certification,
+                    cache,
+                )?
+                .0
+            };
             xc_core::progress_message!(
                 "[HP] root certification: {} of {} requested roots certified, {} computed but not certified, {} with neither, {} computed values outside their certified interval, {:.3}s",
                 report.certified_rows,
@@ -15991,6 +16032,12 @@ fn run_inner_retaining_source(
         xc_cache::ValidatedValueMemo::new(resources.clone(), resources.maximum_bytes() / 4)
     });
     let _memo_scope = memo.enter();
+    #[cfg(not(feature = "arb"))]
+    if (params.n_modes > 64 || cfg.precision_bits.saturating_add(32) > 16_384)
+        && matches!(acquisition, RootAcquisition::Independent { .. })
+    {
+        bail!("large exact discovery requires the Arb feature");
+    }
     cfg.validate_source_admission(params)?;
     if !matches!(acquisition, RootAcquisition::SourceOnly) {
         cfg.validate_root_precision_policy()?;
@@ -16424,9 +16471,7 @@ fn run_inner_retaining_source(
         ensure_root_window_usable(&roots, artifact_seeds.len(), false, root_semantics.domain)?;
         (roots, None, None, false)
     };
-    if artifact_mode == RootArtifactMode::Independent {
-        complete_discovery::validate_assignment(&canonical_roots, &artifact_seeds)?;
-    }
+    complete_discovery::validate_assignment(&canonical_roots, &artifact_seeds)?;
     let eigenvalues_pos = selected_root_positions
         .iter()
         .map(|position| {
@@ -18957,7 +19002,7 @@ mod tau_cache {
     }
 
     fn cache_dir() -> Option<std::path::PathBuf> {
-        let dir = crate::standalone_cache_root().join("tau_cache");
+        let dir = crate::standalone_cache_root()?.join("tau_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }
@@ -19914,9 +19959,9 @@ mod weil_eigvec_cache {
         let root = TEST_CACHE_ROOT
             .with(|slot| slot.borrow().clone())
             .map(|dir| dir.join("data"))
-            .unwrap_or_else(crate::standalone_cache_root);
+            .or_else(crate::standalone_cache_root)?;
         #[cfg(not(test))]
-        let root = crate::standalone_cache_root();
+        let root = crate::standalone_cache_root()?;
         let dir = root.join("weil_eigvec_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
@@ -20730,6 +20775,53 @@ pub fn assemble_research_matrix_hp(
 #[cfg(test)]
 #[allow(clippy::erasing_op)]
 mod tests {
+    #[test]
+    fn seeded_cluster_cannot_label_one_finite_root_twice() {
+        let params = CcmParams::from_lambda_sq_integer(13, 10);
+        let dataset = xc_zeta::zeros::bundled_dataset_identity().unwrap();
+        for config in [
+            HighPrecConfig::for_decimal_digits(60),
+            HighPrecConfig::for_decimal_digits(60).with_adaptive_root_precision(),
+        ] {
+            let seeds = ["13.9", "14.4"]
+                .map(|s| Float::with_val(config.precision_bits, Float::parse(s).unwrap()));
+            match run_indexed_seeded(&params, &config, 1, &seeds, &dataset) {
+                Ok(result) => {
+                    assert_eq!(result.eigenvalues_pos.len(), 2);
+                    complete_discovery::validate_assignment(&result.eigenvalues_pos, &seeds)
+                        .unwrap();
+                }
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    assert!(
+                        reason.contains("nearest-seed cell")
+                            || reason.contains("strictly increasing")
+                            || reason.contains("duplicate")
+                            || reason
+                                .contains("indistinguishable at the retained numerical accuracy"),
+                        "{reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "arb"))]
+    #[test]
+    fn large_independent_discovery_requires_arb_before_assembly() {
+        let params = CcmParams::from_lambda_sq_integer(13, 65);
+        let config = HighPrecConfig::for_decimal_digits(60);
+        let error = run(&params, &config)
+            .err()
+            .expect("independent discovery requires Arb");
+        assert!(
+            error
+                .to_string()
+                .contains("large exact discovery requires the Arb feature"),
+            "{error}"
+        );
+    }
+
     #[cfg(feature = "arb")]
     #[test]
     fn certified_quadrature_binds_parents_before_lookup_and_reuses_its_own_graph() {
@@ -21052,7 +21144,7 @@ mod tests {
                 size_bytes: 1,
             }],
             created_unix_seconds: 0,
-            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            producer_toolkit_version: xc_cache::current_toolkit_version().unwrap(),
             minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
@@ -22323,7 +22415,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             adaptive_key.mathematical_semantics_version,
-            "ccm-root-discovery-v0.15.2-v2"
+            "ccm-root-discovery-adaptive-v3"
         );
         assert_eq!(
             adaptive_key
@@ -22432,6 +22524,7 @@ mod tests {
         );
 
         let invalid_permutation = xc_numerics::linalg::LuFactors {
+            schur_execution: None,
             lu: factors.lu,
             perm: vec![0, 0],
         };
@@ -23305,7 +23398,7 @@ mod tests {
         assert_ne!(old.digest().unwrap(), new.digest().unwrap());
         assert_eq!(
             new.mathematical_semantics_version,
-            "ccm-root-range-v0.15.2-v15"
+            "ccm-complete-positive-adaptive-v16"
         );
         let zero = vec![Float::with_val(cfg.precision_bits, 0); 5];
         let mut only_central = zero;
@@ -25572,6 +25665,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("unresolved_near_crossing"));
+        let bounds = error
+            .downcast_ref::<serde_json::Value>()
+            .expect("typed finite overlap");
+        assert_eq!(
+            bounds["schema"],
+            "ccm-response-overlapping-source-intervals-v1"
+        );
+        assert_eq!(bounds["precision_bits"], precision_bits);
     }
 
     #[test]
@@ -26120,6 +26221,7 @@ mod tests {
                 &velocity_actions,
                 &spectral_preparation,
                 memo,
+                None,
             )
             .unwrap()
         };
@@ -26604,7 +26706,7 @@ mod tests {
             serde_json::from_str(&manifests[0].tags[xc_cache::SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
         assert_eq!(
             semantic.mathematical_semantics_version,
-            "ccm-u-flow-response-exact-quadrants-v4"
+            "ccm-u-flow-response-generated-quadrature-v5"
         );
         assert_eq!(
             manifests[0].minimum_reader_version,
@@ -26950,7 +27052,7 @@ mod tests {
                 size_bytes: 1,
             }],
             created_unix_seconds: 0,
-            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            producer_toolkit_version: xc_cache::current_toolkit_version().unwrap(),
             minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
@@ -30818,6 +30920,7 @@ mod exhaustive_resumed_lu_factor {
             lu[j] = Float::with_val(p, value);
         }
         let factors = xc_numerics::linalg::LuFactors {
+            schur_execution: None,
             lu,
             perm: vec![0, 1, 2, 3],
         };
@@ -30830,6 +30933,7 @@ mod exhaustive_resumed_lu_factor {
     #[test]
     fn exhaustive_resumed_lu_factor_shape_overflow_returns_failure() {
         let factors = xc_numerics::linalg::LuFactors {
+            schur_execution: None,
             lu: vec![],
             perm: vec![],
         };
@@ -30879,7 +30983,11 @@ mod exhaustive_resumed_lu_directed {
                         };
                     }
                 }
-                let factors = xc_numerics::linalg::LuFactors { lu, perm };
+                let factors = xc_numerics::linalg::LuFactors {
+                    lu,
+                    perm,
+                    schur_execution: None,
+                };
                 assert_eq!(factorization_backward_error(&a, &factors, n, p).unwrap(), 0);
                 a[0] += Float::with_val(p, 1) << exponent;
                 assert!(
@@ -32078,7 +32186,7 @@ mod exhaustive_managed_source_identity {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 0,
-            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            producer_toolkit_version: xc_cache::current_toolkit_version().unwrap(),
             minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
@@ -32128,9 +32236,25 @@ mod exhaustive_managed_source_identity {
         let b = eigen_manifest(2, "other-parent-identity");
         assert_eq!(a.key, b.key, "a store alias is not a numerical input");
         assert_eq!(a.content_digest, b.content_digest);
-        // Both reference the same numerical factorization. Its canonical
-        // manifest, rather than this numerical key, binds the exact Tau producer.
-        assert_eq!(a.dependencies, b.dependencies);
+        let dependency = |manifest: &ArtifactManifest, kind: &str| {
+            let mut edges = manifest
+                .dependencies
+                .iter()
+                .filter(|edge| edge.key.kind == kind);
+            let edge = edges.next().unwrap().clone();
+            assert!(edges.next().is_none());
+            edge
+        };
+        assert_eq!(
+            dependency(&a, "ccm_factorization"),
+            dependency(&b, "ccm_factorization")
+        );
+        for (manifest, label) in [(&a, "a"), (&b, "other-parent-identity")] {
+            let source = fixture(2, label).3;
+            let tau_edge = dependency(manifest, "ccm_tau_matrix");
+            assert_eq!(tau_edge.key, source.key);
+            assert_eq!(tau_edge.content_digest, source.content_digest);
+        }
     }
     #[test]
     fn exhaustive_managed_source_identity_rejects_mismatched_length_and_matrix() {

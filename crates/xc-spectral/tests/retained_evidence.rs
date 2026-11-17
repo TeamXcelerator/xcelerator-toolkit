@@ -5,6 +5,8 @@ use xc_cache::*;
 use xc_spectral::ccm::{retained_evidence::*, state_geometry::RetainedState};
 #[path = "common/published_sources.rs"]
 mod published_sources;
+#[path = "common/retained_cache_regressions.rs"]
+mod retained_cache_regressions;
 fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
     let bytes = serde_json::to_vec(&value).unwrap();
     let digest = ContentDigest::sha256(&bytes);
@@ -313,7 +315,7 @@ fn published_root_sources_validate_exact_canonical_edges_with_empty_local_lists(
         json!({
             "schema_version":5,"lambda_squared":"9","n_modes":1,"precision_bits":128,
             "force_even":true,"first_root_index":1,"discovery_mode":"reference_seeded_audit",
-            "reference_seeds_used":true,"completeness":"complete",
+            "reference_seeds_used":true,"starting_points":["14"],"completeness":"complete",
             "outcomes":[{"status":"converged","details":{"value":"14"}}]
         }),
     );
@@ -392,7 +394,7 @@ fn root_windows_bind_sources_keep_failures_and_adaptive_precision() {
         required_quality: CacheQuality::Validated,
     };
     sec.dependencies.push(dep(&sm));
-    let payload = json!({"schema_version":5,"lambda_squared":"9","n_modes":1,"precision_bits":128,"force_even":true,"first_root_index":7,"discovery_mode":"reference_seeded_audit","reference_seeds_used":true,"completeness":"partial","outcomes":[{"status":"converged","details":{"value":"14","adaptive_precision":{"target_precision_bits":256,"evaluation_precision_bits":320,"verification_precision_bits":384}}},{"status":"failed","details":{"reason":"missing"}},{"status":"approximate","details":{"value":"21"}}]});
+    let payload = json!({"schema_version":5,"lambda_squared":"9","n_modes":1,"precision_bits":128,"force_even":true,"first_root_index":7,"discovery_mode":"reference_seeded_audit","reference_seeds_used":true,"starting_points":["14","18","21"],"completeness":"partial","outcomes":[{"status":"converged","details":{"value":"14","adaptive_precision":{"target_precision_bits":256,"evaluation_precision_bits":320,"verification_precision_bits":384}}},{"status":"failed","details":{"reason":"missing"}},{"status":"approximate","details":{"value":"21"}}]});
     let (mut rm, rb) = source("ccm_root_refinement", payload.clone());
     rm.dependencies.push(dep(&sec));
     let approved = vec![

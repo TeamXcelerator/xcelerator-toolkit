@@ -12,6 +12,28 @@ A request is expanded into an artifact-plan DAG before execution. Every node dec
 
 ## Four identity layers
 
+For an input used by a numerical child, define which fields the calculation
+consumes. Keep the exact producing manifest and raw payload digest as its
+dependency. If equivalent serializations are admitted, apply the same value
+digest to every occurrence of that input in the child's request and ordered
+input list. Sorting JSON object keys recursively preserves array order and
+the exact spelling of high-precision decimal strings.
+
+Schema-2 Fourier reference records use compact UTF-8 JSON with recursively
+sorted object keys. Projection requests compute the canonical reference digest
+after authenticating the supplied bytes. Both the main reference and each
+ordered basis member use this rule. Changing a coefficient or exchanging two
+distinct basis members changes the projection key.
+
+Compact sector-gap consumers use the proof digest described in
+[compact sector certificates](CCM_COMPACT_SECTOR_CERTIFICATES.md). Receipts
+continue to identify the specific records and producing builds used in a run.
+An equivalent numerical input grants no additional publication rights.
+
+Fresh high-precision secular-source, root-discovery and root-refinement
+envelopes identify their default scalar backend as `rug_mpfr`. Staging an
+already authenticated remote record preserves its recorded envelope.
+
 The schema never overloads one hash with multiple meanings:
 
 1. **Semantic identity** hashes the canonical mathematical request, algorithm semantics version, and material configuration.
@@ -92,7 +114,7 @@ A release version alone does not imply support: an older binary bearing the same
 version must reject the unknown format. Existing schema-1 records retain their
 original bytes, hashes and decoding rules. A warm hit preserves the original
 producer. No automatic reindexing, migration or republication occurs. Changed
-semantic keys can miss until a separately authenticated legacy mapping exists;
+semantic keys for superseded mathematics are recomputed;
 there is no broad equality-based fallback that silently changes provenance.
 
 Retained-observation JSON schemas are published separately as `-v1.schema.json`
@@ -245,7 +267,15 @@ family `current_writable_shard` fields can stay on the predecessor so released
 single-shard readers continue to find existing objects, while rollover-aware
 clients publish to and read from the successor.
 
-Owner-direct publication may automatically validate and publish when authority and policy permit. Contributors stage privately and use a review branch or fork plus approval attestations for public publication. Public manifests pass an allowlist sanitizer; credentials, private locations, unpublished inputs, and disallowed metadata are rejected.
+Owner-direct publication may automatically validate and publish when authority and policy permit. Contributors stage privately and use a review branch or fork plus approval attestations for public publication. Public manifests pass a disclosure policy and reviewed-field checks. A public
+`reference` accepts a SHA-256 digest, DOI or arXiv identifier. A string `dataset`
+accepts 1 to 64 lowercase ASCII letters, digits or underscores. A structured
+dataset accepts the producer's numerical evaluation-point schema with fixed
+attribution. Public formulas and semantic target labels use reviewed values.
+For certificate requests, `prefix.count`, `index_range.first` and
+`index_range.last` are unsigned JSON integers. Height-window bounds accept
+finite decimal strings or JSON numbers. Custom producers must supply
+identifiers and numerical values appropriate for public disclosure.
 
 The transaction protocol is:
 
@@ -290,7 +320,7 @@ Artifact plans declare one typed durability class: recomputable, expensive-repro
 
 Local cleanup planning removes the candidate copy from the evidence set before assessing durability. It also evaluates age, pins, dependency reachability, assurance, disposition, recomputation cost, active transactions, and receipt completion for every requested publication target. Cleanup may remove local working copies only after all gates pass. Essential research artifacts retain immutable archive evidence and cannot rely only on a mutable live index. Remote pruning is never implicit.
 
-Trust policy verifies principal, authority scope, signature, attested identity, repository/ref binding, toolkit and schema policy, and revocation state. Clients pin or monotonically advance signed registry and shard state to resist rollback. Revocation is an immutable signed overlay; objects are not rewritten. Emergency repair publishes corrected manifests or indexes plus an audit attestation.
+The topology protocol checks registry generations and pinned digests with its trust policy. The managed bootstrap reader can pin exact registry and shard revisions. Set `XC_CACHE_TRUST_POLICY` to a local JSON `RemoteFabricTrustPolicy` to require approved repository roles, current branch-protection evidence, an exact or attested descendant revision, and an approved publication policy. Revocation is an immutable signed overlay; objects are not rewritten. Emergency repair publishes corrected manifests or indexes plus an audit attestation.
 
 Author refresh and replacement are explicit operations. `XC_CACHE_MODE=refresh` bypasses every local and remote candidate but retains normal validation, local storage, dependency recording, packaging, and publication. When `XC_PUBLISH_REPLACE=true` is combined with author mode and enabled publication, each discoverability commit removes prior entries for the affected semantic identity and installs the fresh entry as its sole current selection. After all artifacts are published, the toolkit audits each exact affected shard revision and issues a separate compare-and-swap cleanup commit removing only unreferenced current-tree manifests, transport encodings, and payload objects. Shared objects and historical receipts remain. Capacity is never decremented because the removed blobs remain in Git history.
 
@@ -301,6 +331,8 @@ Repository-permission evidence is time-bounded. A family batch refreshes its liv
 Live semantic indexes govern ordinary reuse and name only the current admissible selection. Published dependency closure is different: it names an exact semantic, manifest, and payload identity that remains immutable when a later author replacement advances the live index. Identity resolution first uses an exact live-index entry; if that entry has been superseded, it reads the exact retained canonical manifest and requires a matching canonical repository-batch proof from the same authorized shard revision before materialization. Historical entries never participate in key-based selection, and a missing or mismatched manifest, payload, transport, destination, repository, or batch proof fails closed.
 
 Destination publication preflight applies the same historical-identity rule. An exact dependency need not remain the active semantic-index selection, but its retained manifest must reproduce the requested family, semantic, manifest, and payload digests and a bounded scan of canonical batches must prove publication to the exact destination, family, repository, branch, and manifest path. The validated historical inventory is cached per immutable shard revision for the duration of the publication run. This prevents a legitimate superseded parent from being reported missing while keeping unproven orphan manifests ineligible.
+
+A compact certificate can have an active producer and a separately stored exact producer cited by a child. If a repeat needs the exact identity or a higher assurance than the active entry provides, the publisher first replays both compact proofs. A successful historical lookup requires the exact manifest, a matching destination batch at the requested assurance, admissible ancestry, unrevoked publication evidence and the verified transport parts. This lookup spans readable shards and preserves the live index.
 
 Local publication staging namespaces drafts by semantic digest, canonical-payload digest, and source-manifest digest. The raw logical-item digest is insufficient: two canonical manifests can intentionally carry identical `payload.json` bytes while retaining different exact dependency envelopes, and otherwise identical canonical manifests can differ by producer identity. Distinct identities coexist as distinct drafts; retained canonical identity is checked before any local source-key shortcut, while exact manifest/payload identity still deduplicates the identity-based and key-based walks of the same published artifact. Source-key lookup retains all matching drafts and deterministically selects the strongest source quality and then the lexicographically smallest source-manifest digest. A reopened or same-process staging sink uses an already validated draft's canonical manifest to continue walking its parents without resolving and decoding that payload again, but it re-resolves a key-based edge when the retained draft lacks a recorded source quality or does not meet the edge's required quality. Staging presence never suppresses traversal, so an interrupted directory containing a child but missing an ancestor is repaired on the next walk. A successful transitive walk is memoized only for the current process; that memo deliberately does not survive a restart. The workstation cache answers exact published-identity queries from a persistent inventory, `identities/<prefix>/<semantic-digest>.json`, that every write maintains under a process lock and an advisory file lock. The inventory only grows, so its byte length is a change signature: the in-process memo of a query is reused only while the inventory file is unchanged, which makes an artifact written by another process visible without a restart; a signature change during a query is reread before the result is memoized. Each inventory candidate revalidates the retained canonical manifest against the adapter's semantic key, logical payload bytes and provenance; a forged adapter cannot satisfy or pollute an exact identity lookup, and drive-qualified or otherwise non-normal manifest paths are rejected. An identity absent from a writable store's inventory triggers one bounded scan of that semantic digest's manifest directories per process, which also repairs caches written before the inventory existed. A read-only store cannot persist that repair and therefore rescans on every inventory miss. Before closure payloads are consumed, exact sibling dependencies are resolved as metadata and their immutable transports are prepared in bounded repository batches. A dependency whose selected layer retains a provenance-bound verified encoded object is staged as metadata only: the logical payload is never inflated, the encoded object is split and hashed, and the result is bound either by decoding it against the manifest's logical digest (an unpublished artifact) or by the retained canonical manifest's transport digest (a published one). When materialization also verified the original split parts, staging hard-links those immutable content-addressed parts directly, with a verified copy fallback for a different filesystem; an adopted hard link is hash-verified before its descriptor is exposed, parts that the process did not itself verify are hashed before they are linked, and if the part proof is unavailable, its files were pruned, or a regular part file has the wrong size or digest, staging safely splits the verified complete package (a symlink, including a broken symlink, or non-regular file fails closed). Reopening validates that the deserialized parts path is under its canonical semantic/payload/storage-identity draft root and checks that every part is a regular file of the recorded size; the publisher hashes every staged part immediately before it enters Git, so that check is not duplicated at reopen. The unchanged single-entry encoder retains profile V1 and existing transport identities; profile V2 is emitted only by the corrected multi-item writer and verification requires ZIP64 local-header metadata on every V2 entry. Workstation ZIP objects up to 90 MiB are read once into a bounded buffer, hashed from that buffer, and then inflated from memory, within a process-wide 256 MiB in-memory allowance shared by all concurrent reads; a read that does not fit streams through the two-pass path without waiting. `XC_CACHE_SINGLE_PASS_ZIP_BYTES` and `XC_CACHE_IN_MEMORY_ZIP_BYTES` accept 1 byte through 16 GiB; invalid or zero values retain their defaults. Before allocation, the reader requires a regular non-symlink file of exactly the declared size, bounds the compressed read to that size, and rejects trailing data; before inflation it requires the ZIP entry's declared size to equal the manifest and refuses output beyond that bound. Transport records accept only the named V1/V2 profiles and reject duplicate repository paths. When several variants for one semantic identity are absent from a destination, one family batch commits every immutable manifest and transport, orders closure-only and older variants first, and leaves the newest key-addressable dependency-complete variant as the live index selection. If an equal-or-newer discoverable entry is already live, an older closure-only variant is still committed with its immutable manifest, encoding, objects, and repository-batch proof but does not mutate the live semantic index. This exception applies only to exact dependency closure; an ordinary publication cannot downgrade a discoverable producer.
 
@@ -313,6 +345,18 @@ current source-manifest-namespaced layout; paths outside either exact shape
 remain invalid.
 
 ## Domain reuse
+
+Publication-enabled lookup checks dependency metadata before adopting a cache
+candidate. For example, a diagnostic may have the same numerical key after
+its roots are recomputed under a revised contract. Its published manifest
+still identifies the exact earlier roots. If that ancestry is unavailable or
+ineligible, the reader tries the remaining candidates. Prefer-reuse can then
+recompute the diagnostic against the current roots. Require-reuse returns a
+miss. The publisher checks the ancestry of the existing destination record
+before counting it as already present. If another artifact also needs the
+regenerated diagnostic, its new manifest becomes the live entry when the
+same-version predecessor has equivalent values and ineligible ancestry.
+The two manifests can share the same stored numerical payload.
 
 CCM preserves the full assembled tau matrix as the first and fastest ordinary cache hit. On a full-matrix miss it independently resolves compact alpha/beta/gamma archimedean integrals and the expensive prime-component matrix, reconstructs the analytic pole and archimedean matrices, assembles and validates tau, and records the exact component dependencies. The default `even-sector` policy retains every established v0.13 identity and reuses an orthonormal even-sector matrix plus its solver-specific LU factorization. The `natural` policy uses the full matrix without projection. The `adaptive-even` policy also uses the full matrix but applies the historical conditional even projection during inverse iteration. Natural and adaptive work may share the same full-matrix factorization, but their selected eigenpairs and all eigenpair-derived artifacts are semantically disjoint. Explicit sector research additionally derives the historical odd basis `(e_k-e_-k)/sqrt(2)`, computes independently addressable low even and odd spectra, and derives GapLog from those exact spectrum artifacts. Selected natural, adaptive-even, and even-sector ground states, parity spectra, secular sources, configuration evidence, and optional certificates remain independent artifacts.
 
@@ -488,10 +532,23 @@ new sector, prolate and distance semantic keys and warm numerical-validation sco
 ## Managed research records
 
 The `ccm-evidence` family includes private-only `research_capture_receipt` and
-`research_hypothesis_evaluation` kinds. Both have producer/reader floor 0.15.0
-and source-bound, content-addressed record identities. Receipts bind every
-requested outcome and measurement; evaluations embed selected observation
+`research_hypothesis_evaluation` kinds. Capture receipts require a producer
+version of at least 0.17.2 and the `capture-receipt-completion-v2` contract.
+Hypothesis evaluations have a producer floor of 0.16.0. Both use the family's
+0.16.0 reader floor and honor any higher minimum in the manifest. Their
+content-addressed identities bind the source evidence. Receipts record every
+requested outcome and measurement. Evaluations embed selected observation
 bytes and replay their frozen score.
+
+For a source with a validated semantic key, the record uses
+`identity/<semantic digest>` as its portable label. Publication staging
+resolves this reference by artifact kind, semantic digest, exact logical
+content digest and required quality. Copies under different local labels
+can satisfy the same edge when they identify the same canonical manifest.
+If qualified copies identify different canonical manifests, the portable
+reference alone is ambiguous and staging reports an error. The resulting
+edge records the exact manifest and payload digests. A repeated reference
+to that same parent contributes one entry to the manifest's dependency list.
 
 From v0.16.0 a measurement whose value is exactly the payload of retained
 artifacts is recorded by reference: `value_reference` names those artifacts
@@ -506,6 +563,23 @@ computed-but-not-certified outcomes with embedded replayable certificates),
 exact-form eigenvalue enclosures) and `ccm_checkpoint_spectra` (leading-block
 low-spectrum enclosures) to the `ccm-evidence` family, each with floor 0.16.0. Exact source dependencies are
 retained for publication closure. Neither record upgrades source assurance.
+
+The assembly-error key `ccm-assembly-error-exact-form-v4` binds the ordered
+ordinal and full-precision point value of every retained root used for enclosure.
+Failed refinements contribute no row. Their positions determine the ordinals
+of later points. When the primary state or second even-sector enclosure is
+absent, the computation uses no root points. On reuse the reader checks the
+rows against the requested inputs, including their order and values. Earlier
+assembly-error keys omitted this information and are ineligible for reuse.
+
+For reference-seeded index requests, the root certification report uses the
+semantic identity `ccm-reference-label-to-certified-finite-rank-v1`.
+Each row's `ordinal` identifies the reference used to select its point.
+When the converged point lies inside a unique certified enclosure and the
+assignments are in increasing order, `computed_matches_certified_ordinal`
+records the independently counted positive root rank of that enclosure.
+A missing assignment leaves the report partial. The embedded certificates
+can be replayed against the finite secular source.
 
 Both registries carry identical portable shape schemas. Public catalogs exclude
 these two full-record kinds, and public routing, staging and reads reject them.
@@ -599,3 +673,62 @@ Schema-2 retained research payloads keep declared `expected_rows` as evidence
 coverage, while omitting the full request and exact producer wrapper. Coverage
 readers accept the explicit field and the legacy schema-1 request field. Missing
 rows therefore remain visible after content/provenance separation.
+
+### Local refresh and publication admission
+
+Ordinary local lookups use the current hashed key directories. Quality and
+producer policy rank compatible manifests first. Ties use the most recent
+committed index update, including writes in the same second. A malformed
+derived index can be reconstructed from individually validated manifests.
+Historical exact content remains addressable in the current layout.
+
+Automatic publication selects the artifacts observed in its session and their
+exact staged dependencies. Completed claim retries authenticate their retained
+inventory. A distinct primary payload under the same semantic key and producer
+version requires an explicit correction. Live index updates travel with their
+publication evidence in the final commit. Offline shard reads check the matching
+repository batch and the snapshot's revocation partitions.
+
+For a reproducible remote read, set XC_CACHE_READ_PINS to a JSON file mapping
+each registry and shard repository URL to its full Git commit ID. The reader
+uses those immutable revisions for the session and refuses an unlisted
+repository. Without an explicit pin set the reader freezes each repository on
+its first read. Pins describe a snapshot chosen by the operator.
+
+### Workstation lookup and publication retry
+
+For a managed artifact, the workstation index uses the artifact kind and the
+digest of the validated semantic key. A caller can give the same inputs a
+different logical label and still reuse the payload. The index retains write
+order to select the newest equally qualified local result. An exact dependency
+continues to request its original content digest. Untyped local records use
+their supplied key.
+
+A managed family publication serializes local preparation for each family and
+destination, binds retry evidence to the request and authorized repository, and
+records each committed batch and Git revision. Retry checks the current remote
+index, policy and payload evidence before using previous work.
+
+Public publication checks the field names in numerical requests, source roles,
+producer annotations, and dependency-version evidence against the reviewed
+producer schema. Changes that introduce a public field must update this schema
+and its tests. Private target inputs and their descendants retain their
+disclosure restrictions.
+
+Managed publication checks the public drafts' manifest and encoding metadata
+before starting destination writes. The bundled reference-zero table's logical
+resource identifier is accepted in its typed provenance annotation when its
+digest, record count and precision match the bundled table. A custom public
+table can supply a plain resource identifier. Local paths are refused.
+
+For a compact sector-gap certificate, the content digest identifies its exact
+serialized producer and the proof digest identifies its replayed mathematics.
+When a same-version publication encounters different certificate bytes, the
+publisher authenticates both archives, checks each proof against its semantic
+key and replays analytic assembly and inertia. This requires the linked
+`xc-spectral/arb` verifier. Equal proofs preserve the active certificate.
+Exact references in capture receipts continue to resolve to their producer.
+The ordinary conflict check applies to other numerical payloads. The historical
+`ccm_secular_source` backend labels `canonical_json` and `rug_mpfr` describe
+the same value only when the logical items and all other numerical envelope
+fields agree.

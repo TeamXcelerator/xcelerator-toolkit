@@ -752,6 +752,7 @@ mod ladder_tests {
             rows.push(rr);
         }
         let report = ExtendedAnalysis {
+            execution_budget_limited: false,
             diagnostic: "band_reconstruction".into(),
             outcome: "partial_unresolved".into(),
             reason: Some("required positivity failed".into()),

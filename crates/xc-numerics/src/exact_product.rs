@@ -411,10 +411,22 @@ impl PreparedProduct {
         backend: crate::modular_product::ProductBackend,
         limits: crate::modular_product::ProductLimits,
     ) -> Result<Vec<Float>> {
+        self.modular_product_with_observer(round, backend, limits, &mut |_| {})
+    }
+
+    #[cfg(feature = "modular-product")]
+    pub(crate) fn modular_product_with_observer(
+        &self,
+        round: Round,
+        backend: crate::modular_product::ProductBackend,
+        limits: crate::modular_product::ProductLimits,
+        observe: &mut impl FnMut(crate::modular_product::ProductBackend),
+    ) -> Result<Vec<Float>> {
         self.check_rounding_context(round)?;
         let remaining = self.modular_remaining_limits(limits)?;
         let ProductShape { rows, inner, cols } = self.plan.shape;
         if rows == 0 || inner == 0 || cols == 0 {
+            observe(crate::modular_product::ProductBackend::Cpu);
             return self.cpu_product(round);
         }
         ensure!(
@@ -441,11 +453,12 @@ impl PreparedProduct {
                     result.rows == rows && result.columns == cols,
                     "exact product modular backend output shape mismatch"
                 );
+                observe(result.backend_used);
                 result.entries
             }
             Err(error) if error.is::<crate::modular_product::ReconstructionCapacity>() => {
                 crate::modular_product::multiply_wide_entries(
-                    &left, &right, rows, inner, cols, backend, remaining,
+                    &left, &right, rows, inner, cols, backend, remaining, observe,
                 )?
             }
             Err(error) => return Err(error),

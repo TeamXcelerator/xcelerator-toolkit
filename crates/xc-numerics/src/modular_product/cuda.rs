@@ -40,18 +40,80 @@ unsafe extern "system" {
     fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn GetProcAddress(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn FreeLibrary(handle: *mut c_void) -> c_int;
+    fn GetModuleFileNameW(handle: *mut c_void, path: *mut u16, size: u32) -> u32;
 }
 
-struct Library(*mut c_void);
+#[cfg(windows)]
+#[link(name = "version")]
+unsafe extern "system" {
+    fn GetFileVersionInfoSizeW(path: *const u16, ignored: *mut u32) -> u32;
+    fn GetFileVersionInfoW(path: *const u16, ignored: u32, size: u32, data: *mut c_void) -> i32;
+    fn VerQueryValueW(
+        data: *const c_void,
+        key: *const u16,
+        value: *mut *mut c_void,
+        length: *mut u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn windows_library_identity(handle: *mut c_void) -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut path = vec![0u16; 32768];
+    // The module handle remains owned by Library for every call below.
+    let count =
+        unsafe { GetModuleFileNameW(handle, path.as_mut_ptr(), path.len() as u32) } as usize;
+    if count == 0 || count >= path.len() {
+        return None;
+    }
+    let module = PathBuf::from(std::ffi::OsString::from_wide(&path[..count]));
+    let name = module.file_name()?.to_string_lossy().into_owned();
+    let size = unsafe { GetFileVersionInfoSizeW(path.as_ptr(), ptr::null_mut()) };
+    if size == 0 || size > 4 * 1024 * 1024 {
+        return Some(name);
+    }
+    let mut data = vec![0u32; size.div_ceil(4) as usize];
+    let mut value: *mut c_void = ptr::null_mut();
+    let mut bytes = 0;
+    // The root version block begins with the signature, structure version,
+    // and two DWORDs encoding all four file-version components.
+    let ok = unsafe {
+        GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr().cast()) != 0
+            && VerQueryValueW(
+                data.as_ptr().cast(),
+                [92u16, 0].as_ptr(),
+                &mut value,
+                &mut bytes,
+            ) != 0
+    };
+    if !ok || value.is_null() || bytes < 16 {
+        return Some(name);
+    }
+    let [signature, _, ms, ls] = unsafe { value.cast::<[u32; 4]>().read_unaligned() };
+    if signature != 0xfeef04bd {
+        return Some(name);
+    }
+    Some(format!(
+        "{name} {}.{}.{}.{}",
+        ms >> 16,
+        ms & 65535,
+        ls >> 16,
+        ls & 65535
+    ))
+}
+
+struct Library(*mut c_void, Option<String>);
 // Loaded libraries are immutable, held for the process lifetime by API, and
 // their documented CUDA entry points support concurrent host threads.
 unsafe impl Send for Library {}
 unsafe impl Sync for Library {}
 impl Library {
-    fn open(names: &[&str]) -> Result<Self> {
+    fn open(names: &[&str], required: &[&str]) -> Result<Self> {
         let mut roots = Vec::new();
         if let Some(path) = std::env::var_os("XC_CUDA_LIB_DIR") {
-            roots.extend(std::env::split_paths(&path));
+            for root in std::env::split_paths(&path).filter(|path| !path.as_os_str().is_empty()) {
+                roots.push(std::path::absolute(root)?);
+            }
         }
         if let Some(path) = std::env::var_os("CUDA_PATH") {
             let root = PathBuf::from(path);
@@ -59,6 +121,10 @@ impl Library {
                 roots.push(root.join("bin/x64"));
             }
             roots.push(root.join(if cfg!(windows) { "bin" } else { "lib64" }));
+        }
+        #[cfg(windows)]
+        if let Some(path) = std::env::var_os("PATH") {
+            roots.extend(std::env::split_paths(&path).filter(|path| path.is_absolute()));
         }
         // Standard loader search is last. On Windows LOAD_LIBRARY_SEARCH flags
         // exclude the working directory and search the DLL's own dependencies.
@@ -84,7 +150,17 @@ impl Library {
             #[cfg(not(any(unix, windows)))]
             let handle: *mut c_void = ptr::null_mut();
             if !handle.is_null() {
-                return Ok(Self(handle));
+                #[cfg(windows)]
+                let identity = windows_library_identity(handle);
+                #[cfg(not(windows))]
+                let identity = path.file_name().map(|v| v.to_string_lossy().into_owned());
+                let library = Self(handle, identity);
+                if required
+                    .iter()
+                    .all(|name| unsafe { library.symbol::<unsafe extern "C" fn()>(name).is_ok() })
+                {
+                    return Ok(library);
+                }
             }
         }
         bail!(
@@ -235,7 +311,7 @@ impl ExecutionMode {
         if text.is_none() && moduli >= DEFAULT_PIPELINE_MODULI_PER_DEVICE {
             Ok((Self::Pipelined, true))
         } else {
-            Ok((explicit, false))
+            Ok((explicit, explicit == Self::Pipelined))
         }
     }
     pub(super) fn for_product(moduli: usize) -> Result<(Self, bool)> {
@@ -326,16 +402,41 @@ struct Api {
 }
 impl Api {
     fn load() -> Result<Self> {
-        let runtime = Library::open(if cfg!(windows) {
-            &["cudart64_13.dll", "cudart64_12.dll"]
-        } else {
-            &["libcudart.so.13", "libcudart.so.12", "libcudart.so"]
-        })?;
-        let blas = Library::open(if cfg!(windows) {
-            &["cublas64_13.dll", "cublas64_12.dll"]
-        } else {
-            &["libcublas.so.13", "libcublas.so.12", "libcublas.so"]
-        })?;
+        let runtime = Library::open(
+            if cfg!(windows) {
+                &["cudart64_13.dll", "cudart64_12.dll"]
+            } else {
+                &["libcudart.so.13", "libcudart.so.12", "libcudart.so"]
+            },
+            &[
+                "cudaDeviceGetAttribute",
+                "cudaDeviceGetPCIBusId",
+                "cudaDriverGetVersion",
+                "cudaFree",
+                "cudaGetDevice",
+                "cudaGetDeviceCount",
+                "cudaMalloc",
+                "cudaMemGetInfo",
+                "cudaMemcpy",
+                "cudaRuntimeGetVersion",
+                "cudaSetDevice",
+            ],
+        )?;
+        let blas = Library::open(
+            if cfg!(windows) {
+                &["cublas64_13.dll", "cublas64_12.dll"]
+            } else {
+                &["libcublas.so.13", "libcublas.so.12", "libcublas.so"]
+            },
+            &[
+                "cublasCreate_v2",
+                "cublasDestroy_v2",
+                "cublasGemmEx",
+                "cublasGetProperty",
+                "cublasGetVersion_v2",
+                "cublasSetWorkspace_v2",
+            ],
+        )?;
         // Each symbol is assigned the documented C ABI signature. The library
         // owners remain in Api until every borrowed function pointer is dead.
         unsafe {
@@ -515,7 +616,11 @@ pub(super) fn status() -> Result<CudaStatus> {
         Ok(api) => api,
         Err(e) => return Ok(CudaStatus::unavailable(e.to_string())),
     };
-    let mut result = CudaStatus::default();
+    let mut result = CudaStatus {
+        runtime_library: api._runtime_library.1.clone(),
+        cublas_library: api._blas_library.1.clone(),
+        ..CudaStatus::default()
+    };
     let (mut driver, mut runtime, mut count) = (0, 0, 0);
     unsafe {
         if let Err(e) = checked((api.driver)(&mut driver), "query driver version")
@@ -538,9 +643,9 @@ pub(super) fn status() -> Result<CudaStatus> {
     }
     let blas_version = blas_parts[0] * 10_000 + blas_parts[1] * 100 + blas_parts[2];
     result.cublas_version = Some(blas_version);
-    if !(12_000..14_000).contains(&runtime) {
+    if runtime < 12_000 {
         result.unavailable_reason = Some(format!(
-            "CUDA runtime {runtime} is outside supported major versions 12 and 13"
+            "CUDA runtime {runtime} is below the supported runtime minimum"
         ));
         return Ok(result);
     }
@@ -658,7 +763,7 @@ fn padded(value: usize) -> Result<usize> {
     Ok(value)
 }
 
-fn padded_reduction(value: usize) -> Result<usize> {
+pub(super) fn padded_reduction(value: usize) -> Result<usize> {
     // Some CUDA integer kernels reject non-tiled reduction sizes even when
     // the documented four-byte leading-dimension requirements are satisfied.
     // Ampere also rejects some rectangular products with 16-element reduction
@@ -1752,7 +1857,7 @@ mod tests {
             );
             assert_eq!(
                 ExecutionMode::product_request(Some("1"), moduli).unwrap(),
-                (ExecutionMode::Pipelined, false)
+                (ExecutionMode::Pipelined, true)
             );
             assert_eq!(
                 ExecutionMode::product_request(None, moduli).unwrap(),

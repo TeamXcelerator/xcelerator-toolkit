@@ -167,6 +167,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<DecodedMatrix> {
         bytes.len() as u64,
         &ContentDigest::sha256(bytes),
         &super::retained_matrix_resources()?,
+        |_, _, _| Ok(()),
     )
 }
 
@@ -175,6 +176,7 @@ pub(super) fn decode_reader<R: Read + Seek>(
     length: u64,
     digest: &ContentDigest,
     resources: &RunResources,
+    validate_shape: impl FnOnce(&str, usize, u32) -> Result<()>,
 ) -> Result<DecodedMatrix> {
     // The live parser holds at most one token scratch, metadata, conversion
     // temporaries, and this read buffer. The token high-water estimate depends
@@ -198,6 +200,11 @@ pub(super) fn decode_reader<R: Read + Seek>(
     if metadata.schema_version != 2 {
         bail!("invalid retained matrix shape");
     }
+    validate_shape(
+        &metadata.lambda_squared,
+        metadata.n_modes,
+        metadata.precision_bits,
+    )?;
     let _conversion = resources
         .try_reserve_working(u64::from(metadata.precision_bits).div_ceil(8) * 32 + 65_536)?;
     let reservation = resources.try_reserve_retained(

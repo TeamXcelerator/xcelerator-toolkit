@@ -163,23 +163,99 @@ fn compact_sector_certificate_capture_is_optional_reference_bound_and_request_fi
     .expect("compact payload must not pair with legacy full manifest");
     assert!(mismatch.to_string().contains("does not match its manifest"));
     drop(state);
+    let mut child_digests = Vec::new();
     for id in [
         "capture_preflight",
         "transform_enclosure",
         "finite_root_budget",
     ] {
         let record = run.capture_diagnostic(id, &options, &cache).unwrap();
-        // from_cached references the diagnostic artifact itself. Its manifest
-        // carries the exact certificate source edge; receipts do not repeat
-        // every ancestor as a top-level source.
-        assert!(
-            record
+        if id == "capture_preflight" {
+            // Preflight reports certificate availability, not its numerical
+            // contents. Its complete consumed values are bound by the request;
+            // replay must not require the certificate's producer payloads.
+            assert!(!record.sources.is_empty());
+            assert!(record.sources.iter().all(|m| m.dependencies.is_empty()));
+        } else {
+            // Numerical diagnostics retain the exact certificate source edge.
+            assert!(
+                record
+                    .sources
+                    .iter()
+                    .any(|m| xc_cache::manifest_depends_on(m, &manifest).unwrap()),
+                "{id} artifact must depend on the actual compact certificate manifest"
+            );
+            let child = record
                 .sources
                 .iter()
-                .any(|m| xc_cache::manifest_depends_on(m, &manifest).unwrap()),
-            "{id} artifact must depend on the actual compact certificate manifest"
-        );
+                .find(|m| xc_cache::manifest_depends_on(m, &manifest).unwrap())
+                .unwrap();
+            child_digests.push((
+                id,
+                child.key.parameters_digest.clone(),
+                child.content_digest.clone(),
+            ));
+        }
         assert!(run.sector_certificate.is_none());
+    }
+    // Independently produce a second proof with a different producer in an
+    // empty store. Its numerical children must hit the first store and must
+    // also reproduce the first store's bytes when computed from scratch.
+    let other_dir = xc_core::test_support::TestDir::new("compact-other-producer");
+    let other_resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(ZipJsonFilesystemCacheStore::new(
+            "local",
+            other_dir.to_path_buf(),
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let other_cache = ArtifactCacheContext {
+        resolver: Some(&other_resolver),
+        ordered_overlays: cache.ordered_overlays.clone(),
+        ..cache
+    };
+    let warm = ArtifactCacheContext {
+        mode: ArtifactExecutionCacheMode::RequireReuse,
+        write_on_miss: false,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        ..cache
+    };
+    let mut other =
+        RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &other_cache).unwrap();
+    let mut other_options = options.clone();
+    other_options.sector_gap_certificate_format = CcmSectorGapCertificateFormat::Compact(
+        ReconstructionSourceIdentity::current("independent-producer"),
+    );
+    other
+        .capture_diagnostic("sector_gap_certificate", &other_options, &other_cache)
+        .unwrap();
+    let other_cert = other
+        .compact_sector_certificate
+        .as_ref()
+        .unwrap()
+        .produced_manifest
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert_ne!(other_cert.content_digest, manifest.content_digest);
+    assert_eq!(other_cert.key, manifest.key);
+    other.set_extended_research_inputs(input).unwrap();
+    for (id, key, payload) in child_digests {
+        for (store, parent) in [(&warm, &manifest), (&other_cache, &other_cert)] {
+            let result = other.capture_diagnostic(id, &other_options, store).unwrap();
+            let child = result
+                .sources
+                .iter()
+                .find(|m| m.key.parameters_digest == key)
+                .unwrap();
+            assert_eq!(child.content_digest, payload, "{id}");
+            assert!(
+                xc_cache::manifest_depends_on(child, parent).unwrap(),
+                "{id}"
+            );
+        }
     }
     let mut full_request = options.clone();
     full_request.sector_gap_certificate_format = CcmSectorGapCertificateFormat::Full;

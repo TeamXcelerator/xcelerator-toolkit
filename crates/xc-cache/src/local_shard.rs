@@ -243,6 +243,71 @@ pub fn read_local_shard_json(
         .first()
         .ok_or_else(|| invalid("missing transport identity"))?
         .clone();
+    let destination = if descriptor.visibility == CacheVisibility::Public {
+        PublicationDestination::Public
+    } else {
+        PublicationDestination::Private
+    };
+    let visibility = if destination == PublicationDestination::Public {
+        "public"
+    } else {
+        "private"
+    };
+    let batch_path = format!(
+        "transactions/batches/{}/{visibility}.json",
+        entry.publication_transaction_id
+    );
+    let (batch, raw): (RepositoryPublicationBatch, _) =
+        metadata_with_digest(&confined_file(&root, &batch_path)?)?;
+    batch.validate()?;
+    if batch.digest()? != raw
+        || batch.batch_id.0 != entry.publication_transaction_id
+        || batch.branch != "main"
+        || batch.destination != destination
+        || batch.family != canonical.artifact_family
+        || !batch.artifacts.iter().any(|a| {
+            a.semantic_digest == entry.semantic_digest
+                && a.manifest_digest == manifest_digest
+                && a.manifest_path == expected
+                && a.canonical_payload_digest == canonical.payload_digest
+                && a.transport_digest == transport_digest
+                && a.achieved_assurance == entry.achieved_assurance
+                && a.producer_toolkit_version == entry.producer_toolkit_version
+        })
+    {
+        return Err(invalid("local index lacks a matching publication batch"));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| invalid(e.to_string()))?
+        .as_secs();
+    for (scope, identity) in [
+        (RevocationScope::Manifest, &manifest_digest),
+        (RevocationScope::Semantic, &canonical.semantic_digest),
+        (RevocationScope::Payload, &canonical.payload_digest),
+        (RevocationScope::Transport, &transport_digest),
+        (
+            RevocationScope::Repository,
+            &repository_identity_digest(&batch.authorized_repository),
+        ),
+    ]
+    .into_iter()
+    .chain(batch.revocable_evidence(&manifest_digest))
+    {
+        let prefix = &identity.0[..2];
+        let relative = format!("revocations/indexes/{prefix}.json");
+        if root.join(&relative).try_exists()? {
+            let partition: RevocationIndexPartition = metadata(&confined_file(&root, &relative)?)?;
+            partition.validate()?;
+            if partition.identity_prefix != prefix
+                || partition.active(scope, identity, now).is_some()
+            {
+                return Err(invalid(
+                    "local artifact is revoked or has an invalid revocation partition",
+                ));
+            }
+        }
+    }
     let (encoding, raw_transport_digest): (TransportEncodingRecord, ContentDigest) =
         metadata_with_digest(&confined_file(
             &root,
@@ -468,6 +533,37 @@ mod tests {
             claim_scope: "synthetic finite fixture".into(),
             assumptions: Vec::new(),
         };
+        let destination = if visibility == CacheVisibility::Public {
+            PublicationDestination::Public
+        } else {
+            PublicationDestination::Private
+        };
+        let batch = RepositoryPublicationBatch::new(
+            destination,
+            "ccm-matrices",
+            "producer",
+            "example/matrices",
+            "main",
+            ContentDigest::sha256(b"policy"),
+            (destination == PublicationDestination::Private).then_some(1),
+            vec![crate::RepositoryBatchArtifact {
+                semantic_digest: canonical.semantic_digest.clone(),
+                canonical_payload_digest: canonical.payload_digest.clone(),
+                manifest_digest: canonical.digest().unwrap(),
+                transport_digest: encoding.digest().unwrap(),
+                manifest_path: format!(
+                    "manifests/{}/{}.json",
+                    &canonical.semantic_digest.0[..2],
+                    canonical.digest().unwrap().0
+                ),
+                achieved_assurance: assurance,
+                producer_toolkit_version: version.clone(),
+                provenance_evidence_digests: vec![],
+            }],
+            1,
+        )
+        .unwrap();
+        write_json(&root.join(batch.repository_path()), &batch);
         let entry = ShardIndexEntry {
             semantic_digest: canonical.semantic_digest.clone(),
             canonical_payload_digest: canonical.payload_digest.clone(),
@@ -477,7 +573,7 @@ mod tests {
             producer_toolkit_version: version,
             minimum_reader_version: canonical.minimum_reader_version.clone(),
             transport_digests: canonical.transport_digests.clone(),
-            publication_transaction_id: "a".repeat(64),
+            publication_transaction_id: batch.batch_id.0,
         };
         let index = ShardIndexPartition::rebuild(
             "ccm-matrices",
@@ -521,6 +617,52 @@ mod tests {
                 maximum_package_bytes: 1024 * 1024,
             },
         }
+    }
+
+    #[test]
+    fn read_requires_the_original_batch_and_honors_revocation() {
+        let f = fixture(CacheVisibility::Private, ArtifactAssuranceState::Computed);
+        let index: ShardIndexPartition = metadata(&f.index_path).unwrap();
+        let batch_path = f
+            .base
+            .join("shard/transactions/batches")
+            .join(&index.entries[0].publication_transaction_id)
+            .join("private.json");
+        fs::remove_file(batch_path).unwrap();
+        assert!(read_local_shard_json(&f.manifest_path, &f.options).is_err());
+        let f = fixture(CacheVisibility::Private, ArtifactAssuranceState::Computed);
+        let index: ShardIndexPartition = metadata(&f.index_path).unwrap();
+        let digest = &index.entries[0].manifest_digest;
+        let revision =
+            serde_json::json!({"schema_version":1,"identity_prefix":&digest.0[..2],"records":[]});
+        let rev_path = f
+            .base
+            .join(format!("shard/revocations/indexes/{}.json", &digest.0[..2]));
+        // An advertised but malformed partition must never be treated as no revocations.
+        let mut malformed = revision;
+        malformed["identity_prefix"] = serde_json::json!("malformed");
+        write_json(&rev_path, &malformed);
+        assert!(read_local_shard_json(&f.manifest_path, &f.options).is_err());
+        let partition = RevocationIndexPartition {
+            schema_version: 1,
+            identity_prefix: digest.0[..2].to_owned(),
+            records: vec![RevocationRecord {
+                schema_version: 1,
+                scope: RevocationScope::Manifest,
+                identity_digest: digest.clone(),
+                reason: "withdrawn".to_owned(),
+                effective_unix_seconds: 0,
+                replacement_digest: None,
+                incident_reference: None,
+                authorizing_evidence_digest: ContentDigest::sha256(b"review"),
+            }],
+        };
+        partition.validate().unwrap();
+        write_json(&rev_path, &partition);
+        let error = read_local_shard_json(&f.manifest_path, &f.options)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("revoked"), "{error}");
     }
 
     #[test]

@@ -12,6 +12,20 @@ pub(crate) mod retained;
 
 const COMPACT_SCHEMA: u32 = 1;
 pub const COMPACT_SEMANTICS: &str = "ccm-analytic-sector-gap-reassembly-counts-v1";
+pub(crate) const ROOT_BUDGET_SEMANTICS: &str = "ccm-analytic-local-root-budget-compact-v2";
+
+pub(crate) fn root_budget_request_digest(
+    state: &ContentDigest,
+    proof: &ContentDigest,
+    windows: &impl Serialize,
+) -> Result<ContentDigest> {
+    Ok(xc_cache::canonical_digest(&(
+        ROOT_BUDGET_SEMANTICS,
+        state,
+        proof,
+        windows,
+    ))?)
+}
 
 /// Producer provenance. Matrix reconstruction hashes, rather than this caller
 /// supplied provenance, bind the mathematical source checked by the verifier.
@@ -169,6 +183,18 @@ pub struct CompactCcmSectorGapCertificate {
 }
 
 impl CompactCcmSectorGapCertificate {
+    /// Canonical identity for consumers of the proof. Include every assertion,
+    /// reconstruction setting and guide, even fields added in a later schema.
+    /// The raw payload digest also covers the recorded producer metadata.
+    pub fn proof_digest(&self) -> Result<ContentDigest> {
+        let proof = xc_core::finite_json::to_value_omitting(
+            self,
+            &["source_identity", "producer_toolkit_version"],
+            "compact sector-gap proof",
+        )?;
+        Ok(xc_cache::canonical_digest(&proof)?)
+    }
+
     /// Lossless projection of mathematical assertions, not legacy payload bytes.
     /// This checks the legacy structure/outcomes but does not replay its proof.
     /// Public compact verification always reconstructs and proves afresh.
@@ -463,6 +489,52 @@ pub fn verify_compact_ccm_sector_gap_certificate(
         Err(error) => invalid_report(error.to_string()),
     }
 }
+
+#[cfg(feature = "arb")]
+fn publication_key(proof: &CompactCcmSectorGapCertificate) -> SemanticKeyEnvelope {
+    let config = crate::ccm::cutoff_free::CutoffFreeConfig {
+        integer_cutoff_c: proof.integer_cutoff_c,
+        modes: proof.n_modes,
+        precision_bits: proof.precision_bits,
+        geometric_terms: proof.geometric_terms,
+    };
+    cache::semantic_key(
+        &config,
+        &proof.scalar_backend,
+        [
+            &proof.guide_even_spectrum_content_digest,
+            &proof.guide_odd_spectrum_content_digest,
+            &proof.guide_sector_gap_content_digest,
+        ],
+        CcmSectorGapCertificationOptions {
+            relative_enclosure_bits: proof.relative_enclosure_bits,
+            maximum_bracket_expansions: proof.maximum_bracket_expansions,
+        },
+    )
+}
+
+/// Reconstruct each distinct serialized producer before returning its proof identity.
+#[cfg(feature = "arb")]
+fn publication_proof(
+    key: &SemanticKeyEnvelope,
+    bytes: &[u8],
+) -> Result<ContentDigest, xc_cache::CacheError> {
+    fn verify(key: &SemanticKeyEnvelope, bytes: &[u8]) -> Result<ContentDigest> {
+        let proof: CompactCcmSectorGapCertificate = serde_json::from_slice(bytes)?;
+        anyhow::ensure!(
+            *key == publication_key(&proof),
+            "compact certificate does not bind the publication request"
+        );
+        reconstruct_verified_compact_sector_gap(&proof)?;
+        proof.proof_digest()
+    }
+    verify(key, bytes).map_err(|e| {
+        xc_cache::CacheError::InvalidManifest(format!("compact publication proof: {e}"))
+    })
+}
+
+#[cfg(feature = "arb")]
+inventory::submit! { xc_cache::CompactPublicationVerifier(publication_proof) }
 
 #[cfg(all(test, feature = "arb"))]
 #[path = "compact_tests.rs"]

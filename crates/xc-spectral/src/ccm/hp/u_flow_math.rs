@@ -338,7 +338,7 @@ fn action_checkpoint_identity(
     semantic: &SemanticKeyEnvelope,
 ) -> serde_json::Value {
     serde_json::json!({
-        "semantics": "ccm-private-u-flow-actions-v2",
+        "semantics": "ccm-private-u-flow-actions-v3",
         "request": semantic,
         "lambda_squared": lambda_squared_cache_identity(params),
         "modes": params.n_modes,
@@ -494,7 +494,7 @@ fn load_action_checkpoint(
     };
     match store
         .limited_bytes(cap)
-        .load::<ActionCheckpoint>("u-flow-velocity-actions")
+        .load_completion::<ActionCheckpoint>("u-flow-velocity-actions")
     {
         Ok(Some(saved)) => match saved.decode(count, p) {
             Ok(mut actions) => {
@@ -542,7 +542,7 @@ fn save_action_checkpoint(
         },
         None => None,
     };
-    if let Err(error) = store.limited_bytes(cap).save(
+    if let Err(error) = store.limited_bytes(cap).save_completion(
         "u-flow-velocity-actions",
         &ActionCheckpoint::encode(actions, p),
     ) {
@@ -719,11 +719,13 @@ fn evaluate_on_pool(
             &unique,
             plan,
             |points, schedule| {
-                xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
+                // A standalone table has no verified content binding to this response.
+                xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled_with_generator(
                     points,
                     p,
-                    cfg.cache_mode,
+                    xc_numerics::quadrature::CacheMode::Off,
                     schedule,
+                    cfg.archimedean_gl_generator,
                 )
                 .map(|table| (points, table))
             },
@@ -1030,7 +1032,14 @@ mod tests {
                 evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).unwrap();
             assert_eq!(channel_bits(&warm), expected);
             drop(warm);
-            // The existing checkpoint reader authenticates the sealed payload.
+            let new_handle =
+                crate::ccm::capture_runtime::Checkpoints::local(&identity, directory.to_path_buf())
+                    .unwrap();
+            assert!(
+                load_action_checkpoint(&new_handle, vector.len(), cfg.precision_bits, 1 << 30)
+                    .is_none()
+            );
+            // A fresh handle cannot treat the on-disk seal as independent evidence.
             let key_dir = std::fs::read_dir(&directory)
                 .unwrap()
                 .next()

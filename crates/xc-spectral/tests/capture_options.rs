@@ -105,9 +105,17 @@ fn changing_sector_capture_request_must_not_silently_reuse_the_old_request() {
     )
     .unwrap();
     assert!(result.produced_manifest.is_some());
-    assert_eq!(result.value.measurements.len(), ids.len());
+    assert_eq!(result.value.measurements.len() + 1, ids.len());
     for id in ids {
         assert!(plan.receipt().unwrap().outcomes().contains_key(*id));
+        if *id == "finite_root_budget" {
+            assert!(matches!(
+                result.value.receipt.outcomes()[*id],
+                xc_core::DiagnosticOutcome::Missing { .. }
+                    | xc_core::DiagnosticOutcome::Blocked { .. }
+            ));
+            continue;
+        }
         let measurement = &result.value.measurements[*id];
         assert!(measurement.value_reference.is_some(), "{id}");
         let value = measurement_value(measurement, &resolver, &policy).unwrap();
@@ -167,4 +175,69 @@ fn changing_sector_capture_request_must_not_silently_reuse_the_old_request() {
         eprintln!("old and new payload equal={}; requested three cross-checked eigenpairs; observed={observed:?}",initial.value==changed.value);
         assert!(spectra.iter().all(|v|v["requested_eigenpairs"]==3 && v["eigenvalue_route"]=="cross_checked"),"changed sector count/route was silently ignored");
     }
+}
+
+#[cfg(feature = "arb")]
+#[test]
+fn refused_assembly_root_enclosure_is_absent_on_ample_retry() {
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(EphemeralCacheStore::new(1 << 30).unwrap()),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: current_toolkit_version().unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let cache = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        reference_resolver: None,
+        acceptance: Some(&policy),
+        ordered_overlays: vec!["ephemeral".into()],
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        write_visibility: CacheVisibility::Local,
+        requested_assurance: xc_core::AssuranceLevel::Computed,
+        certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+        production_sink: None,
+    };
+    let params = CcmParams::from_lambda_sq_integer(13, 16);
+    let mut cfg = HighPrecConfig::for_decimal_digits(40).with_adaptive_root_precision();
+    cfg.n_eigenvalues = 2;
+    cfg.quad_points = 32;
+    let options = xc_spectral::ccm::capture::CcmCapturePlan::ultra(2, 17)
+        .unwrap()
+        .primary_options()
+        .unwrap();
+    let dataset = xc_zeta::zeros::bundled_dataset_identity().unwrap();
+    let seeds = xc_zeta::zeros::bundled_first_n_strings(2)
+        .unwrap()
+        .iter()
+        .map(|s| Float::with_val(cfg.precision_bits, Float::parse(s).unwrap()))
+        .collect::<Vec<_>>();
+    let open = || {
+        let mut run = RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &cache).unwrap();
+        run.set_capture_lookahead(false);
+        run
+    };
+    let resources = xc_core::RunResources::new(1 << 30).unwrap();
+    {
+        let _scope = resources.enter();
+        let mut run = open();
+        let usage = resources.usage();
+        let free = resources.maximum_bytes() - usage.retained_bytes - usage.working_bytes;
+        let _hold = resources.try_reserve_retained(free - (256 << 10)).unwrap();
+        assert!(matches!(
+            run.capture_diagnostic_outcome("assembly_error", &options, &cache),
+            Err(CaptureFailure::Blocked { .. })
+        ));
+    }
+    let outcome = open()
+        .capture_diagnostic_outcome("assembly_error", &options, &cache)
+        .unwrap();
+    assert!(outcome.value["exact_form_roots_limitation"].is_null());
+    assert!(!outcome.value["exact_form_roots"].is_null());
 }

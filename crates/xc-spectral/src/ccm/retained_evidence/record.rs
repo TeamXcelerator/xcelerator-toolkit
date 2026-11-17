@@ -54,19 +54,30 @@ impl<T: Serialize> Serialize for ResearchRecord<T> {
                 data: &self.data,
             }
             .serialize(serializer),
-            2 => NumericalRecord {
-                schema_version: 2,
-                semantics: self.semantics.clone(),
-                kind: self.kind.clone(),
-                scope: self.scope.clone(),
-                expected_rows: self
-                    .request
-                    .get("expected_rows")
-                    .and_then(Value::as_u64)
-                    .and_then(|n| usize::try_from(n).ok()),
-                data: &self.data,
+            2 => {
+                let wire = NumericalRecord {
+                    schema_version: 2,
+                    semantics: self.semantics.clone(),
+                    kind: self.kind.clone(),
+                    scope: self.scope.clone(),
+                    expected_rows: self
+                        .request
+                        .get("expected_rows")
+                        .and_then(Value::as_u64)
+                        .and_then(|n| usize::try_from(n).ok()),
+                    data: &self.data,
+                };
+                if self.kind == "ccm_reference_source" {
+                    // A reference is also a numerical input to projections. Keep its
+                    // cross-language wire order stable even if Rust fields move.
+                    let mut value =
+                        xc_core::finite_json::to_value(&wire).map_err(serde::ser::Error::custom)?;
+                    value.sort_all_objects();
+                    value.serialize(serializer)
+                } else {
+                    wire.serialize(serializer)
+                }
             }
-            .serialize(serializer),
             _ => Err(serde::ser::Error::custom(
                 "unsupported retained research payload schema",
             )),
