@@ -179,3 +179,35 @@ fn current_ultra_requests_retained_research_without_changing_primary_algorithm()
     assert!(receipt.outcomes().contains_key("assembly_error"));
     assert!(receipt.outcomes().contains_key("checkpoint_spectra"));
 }
+
+#[cfg(feature = "hp")]
+#[test]
+fn external_consumer_can_select_optional_exact_cpu_execution() {
+    use xc_numerics::modular_product::{
+        multiply_with_execution, CpuExecutionOptions, CpuProductKernel, ProductBackend,
+        ProductLimits, ResidueLayout,
+    };
+    let a = [(-7).into(), 3.into(), 5.into(), (-2).into()];
+    let b = [4.into(), (-1).into(), 6.into(), 8.into()];
+    let result = multiply_with_execution(
+        &a,
+        &b,
+        2,
+        2,
+        2,
+        ProductBackend::Cpu,
+        ProductLimits {
+            max_workspace_bytes: 32 << 20,
+            max_input_bits: 128,
+            max_modular_scalar_products: 1_000_000,
+            workers: 1,
+        },
+        CpuExecutionOptions {
+            kernel: CpuProductKernel::Auto,
+            residue_layout: ResidueLayout::Flat,
+        },
+    )
+    .unwrap();
+    let decimal: Vec<_> = result.entries.iter().map(ToString::to_string).collect();
+    assert_eq!(decimal, ["-10", "31", "8", "-21"]);
+}

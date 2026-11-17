@@ -8,6 +8,13 @@ Results bind the exact input state and declared policy. Point measurements,
 conditional expressions and qualified absence are distinct from certificates.
 These products do not assume RH or assert infinite-limit convergence.
 
+Consumed-input views whose entire value is bound by the request, and preflight
+inventories derived entirely from the request, do not require the historical
+producer's matrix or factorization payloads. Their producer records remain in
+manifest provenance. Other diagnostics continue to retain and validate the
+exact numerical parents they use. This distinction applies on cache hits as
+well as fresh production; it does not broaden public disclosure eligibility.
+
 | Diagnostic | Artifact kind | Inputs |
 |---|---|---|
 | compactness | ccm_compactness_analysis | Eigenpair |

@@ -5,6 +5,8 @@ use xc_cache::*;
 use xc_spectral::ccm::{retained_evidence::*, state_geometry::RetainedState};
 #[path = "common/published_sources.rs"]
 mod published_sources;
+#[path = "common/retained_cache_regressions.rs"]
+mod retained_cache_regressions;
 fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
     let bytes = serde_json::to_vec(&value).unwrap();
     let digest = ContentDigest::sha256(&bytes);

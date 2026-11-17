@@ -70,7 +70,7 @@ struct BootstrapShardCapacityPolicy {
     rollover_repository_pattern: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct BootstrapShard {
     pub(crate) authorized_repository: String,
     pub(crate) repository_url: String,
@@ -79,7 +79,7 @@ pub(crate) struct BootstrapShard {
     pub(crate) writable: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct BootstrapFamilyTopology {
     pub(crate) family: String,
     pub(crate) visibility: CacheVisibility,

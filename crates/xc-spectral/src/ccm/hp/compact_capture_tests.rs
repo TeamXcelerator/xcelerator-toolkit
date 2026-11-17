@@ -169,16 +169,22 @@ fn compact_sector_certificate_capture_is_optional_reference_bound_and_request_fi
         "finite_root_budget",
     ] {
         let record = run.capture_diagnostic(id, &options, &cache).unwrap();
-        // from_cached references the diagnostic artifact itself. Its manifest
-        // carries the exact certificate source edge; receipts do not repeat
-        // every ancestor as a top-level source.
-        assert!(
-            record
-                .sources
-                .iter()
-                .any(|m| xc_cache::manifest_depends_on(m, &manifest).unwrap()),
-            "{id} artifact must depend on the actual compact certificate manifest"
-        );
+        if id == "capture_preflight" {
+            // Preflight reports certificate availability, not its numerical
+            // contents. Its complete consumed values are bound by the request;
+            // replay must not require the certificate's producer payloads.
+            assert!(!record.sources.is_empty());
+            assert!(record.sources.iter().all(|m| m.dependencies.is_empty()));
+        } else {
+            // Numerical diagnostics retain the exact certificate source edge.
+            assert!(
+                record
+                    .sources
+                    .iter()
+                    .any(|m| xc_cache::manifest_depends_on(m, &manifest).unwrap()),
+                "{id} artifact must depend on the actual compact certificate manifest"
+            );
+        }
         assert!(run.sector_certificate.is_none());
     }
     let mut full_request = options.clone();

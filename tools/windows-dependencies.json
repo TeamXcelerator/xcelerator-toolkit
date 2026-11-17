@@ -1,8 +1,8 @@
 {
     "schema_version":  1,
-    "toolkit_version":  "0.17.1",
+    "toolkit_version":  "0.17.2",
     "target":  "x86_64-pc-windows-gnu",
-    "rust_version":  "1.99.1",
+    "rust_version":  "1.100.0",
     "package_base_url":  "https://repo.msys2.org/mingw/ucrt64/",
     "bootstrap":  {
                       "file":  "msys2-base-x86_64-20260927.tar.zst",
@@ -236,10 +236,10 @@
                      },
                      {
                          "name":  "mingw-w64-ucrt-x86_64-rust",
-                         "version":  "1.99.1-1",
-                         "file":  "mingw-w64-ucrt-x86_64-rust-1.99.1-1-any.pkg.tar.zst",
-                         "sha256":  "f30b909b7e0a03d87864d54e96e5b1d5ee668848297cb943d9988538142fe9cb",
-                         "signature_sha256":  "ed9506643ff92a9289c1e93e8177b13ad3f857de38af66694b350bb26f7d8c86"
+                         "version":  "1.100.0-1",
+                         "file":  "mingw-w64-ucrt-x86_64-rust-1.100.0-1-any.pkg.tar.zst",
+                         "sha256":  "ca6cddfaaf8a8560fa1565131b1afdbf1b0bd21f5b14e3ea58c42bc9f87ff772",
+                         "signature_sha256":  "017612ccf4bf6190712337b78b0e2c009775549287158a30bd2318e750db8526"
                      },
                      {
                          "name":  "mingw-w64-ucrt-x86_64-sqlite",
@@ -301,7 +301,7 @@
     "native_files":  [
                          {
                              "path":  "bin/cargo.exe",
-                             "sha256":  "82fe4c3afdd89168d1da1a99a90ba83c53f7a22b16a682c42a201311fa0152a7"
+                             "sha256":  "f38122a60ad678d53fef069f3d39c48e6294d584038f43c3d0e35ccabfdf6049"
                          },
                          {
                              "path":  "bin/gcc.exe",
@@ -409,15 +409,15 @@
                          },
                          {
                              "path":  "bin/rustc.exe",
-                             "sha256":  "bdab53d55eb2c34bee8b35ab5ef1090bf3b1f713201833647d8b4a9d1153fee4"
+                             "sha256":  "bcc94001f79890c346faed9788eae936b5f6e2b2d5534e61754b9966d45d1cfa"
                          },
                          {
-                             "path":  "bin/rustc_driver-1744323744c1171a.dll",
-                             "sha256":  "bc76800062a30b4cf0e8bd56c09bb83055fb9a37eec0881b438845023d86f5c9"
+                             "path":  "bin/rustc_driver-adaf72a74e31e25b.dll",
+                             "sha256":  "b4609c8908a046371c6e1b7120c084b256e94635ae8a7e79bb6693a3ee7291a7"
                          },
                          {
-                             "path":  "bin/std-a4b788336475b2b8.dll",
-                             "sha256":  "7ddf08d03974b8796e9baf54e215202f2ad8b42ade35834628ae1071dac4d6cd"
+                             "path":  "lib/rustlib/x86_64-pc-windows-gnu/lib/std-ca4bc919f81c85f6.dll",
+                             "sha256":  "20e6e85e1d3b9e89f792d84acd5cf6235729ca511710d9d9bf12f06d63ba98bd"
                          },
                          {
                              "path":  "bin/zlib1.dll",
@@ -450,6 +450,26 @@
                          {
                              "path":  "x86_64-w64-mingw32/bin/ld.exe",
                              "sha256":  "a279cc83f198a606f255a597b3a067b51f11a9bbf8fe46de2a0dc8bb71b47f4f"
+                         },
+                         {
+                             "path":  "bin/cargo-clippy.exe",
+                             "sha256":  "620cd2f6a150dd328dce0f8f6d2e397e56de2cbe404e45cc9b8cd7582dc8a2fd"
+                         },
+                         {
+                             "path":  "bin/clippy-driver.exe",
+                             "sha256":  "65649fb5855dd6d763bc8b33eb07d8591f9292456d6c24db3908b4a178eba3b6"
+                         },
+                         {
+                             "path":  "bin/cargo-fmt.exe",
+                             "sha256":  "3dc7c4e507cc5579bcfb0ea2330537f3d20fa397263f0e601c40ac9337bd761c"
+                         },
+                         {
+                             "path":  "bin/rustfmt.exe",
+                             "sha256":  "c01bc36dd17484d146a8c043852a7a9fd4023155494f7da7027819bd752c1604"
+                         },
+                         {
+                             "path":  "bin/rustdoc.exe",
+                             "sha256":  "75bac81bea73ddbd1812b392369b47ed93e1f202c03b5302dacb841aac160c48"
                          }
                      ]
 }

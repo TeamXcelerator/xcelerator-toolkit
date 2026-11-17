@@ -1,7 +1,7 @@
 # Native Windows high-precision builds
 
-The v0.17.1 Windows build lane uses a native x64 UCRT toolchain with Rust
-1.99.1, GMP, MPFR, and FLINT. It does not require WSL, a Linux container, or a
+The v0.17.2 Windows build lane uses a native x64 UCRT toolchain with Rust
+1.100.0, GMP, MPFR, and FLINT. It does not require WSL, a Linux container, or a
 virtual machine. MPFR still performs arbitrary-precision arithmetic with the
 declared rounding and precision; CUDA products retain their exact integer
 reconstruction and acceptance checks.
@@ -67,6 +67,11 @@ The alternate prefix must match the pinned compiler and native-file hashes.
 The environment script checks those bytes before selecting its tools or DLLs,
 including the compiler implementation libraries and transitive arithmetic DLLs.
 Qualify a changed dependency set separately before updating the lock.
+
+When a checkout updates the compiler pin, an older native installation will
+fail this verification. Bootstrap a fresh root and select its prefix explicitly,
+or install the exact signed package versions in the updated lock. Updating
+Rust through `rustup` alone does not update the separate UCRT compiler.
 
 The scripts explicitly select `x86_64-pc-windows-gnu`; binaries are written
 under `$env:CARGO_TARGET_DIR\x86_64-pc-windows-gnu\release` for release builds.

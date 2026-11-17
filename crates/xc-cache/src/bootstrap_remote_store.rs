@@ -335,17 +335,14 @@ impl GitHubBootstrapCacheStore {
             .ok_or_else(|| {
                 CacheError::ResourceLimit("reader session disk size exceeds u64".to_owned())
             })?;
-        if [
-            self.resources.maximum_temporary_disk_bytes,
-            self.resources.maximum_permanent_disk_bytes,
-        ]
-        .into_iter()
-        .flatten()
-        .any(|limit| total > limit)
-        {
-            return Err(CacheError::ResourceLimit(format!(
-                "reader session requires {total} retained bytes above its configured disk limit"
-            )));
+        // This directory is ephemeral and removed when the reader closes.
+        // Persistent publication/cache stores enforce their own permanent cap.
+        if let Some(limit) = self.resources.maximum_temporary_disk_bytes {
+            if total > limit {
+                return Err(CacheError::ResourceLimit(format!(
+                    "reader session requires {total} temporary bytes (existing plus {additional} additional), exceeding the configured temporary-disk limit of {limit} bytes; this is a resource-policy ceiling, not a free-space measurement"
+                )));
+            }
         }
         Ok(())
     }
@@ -1306,6 +1303,10 @@ impl CacheStore for GitHubBootstrapCacheStore {
         if manifests.is_empty() {
             return Ok(());
         }
+        let _materialization = self
+            .materialization_gate
+            .lock()
+            .map_err(|_| CacheError::Io("reader materialization lock poisoned".to_owned()))?;
         let resolved = self
             .resolved
             .lock()
@@ -1340,6 +1341,9 @@ impl CacheStore for GitHubBootstrapCacheStore {
             .values()
             .flat_map(BTreeMap::values)
             .fold(0u64, |total, bytes| total.saturating_add(*bytes));
+        // Refuse an inadmissible batch before Git downloads its objects.
+        // Packages and extracted parts are budgeted separately at materialization.
+        self.check_session_disk_budget(prepared_bytes)?;
         let batches = batches
             .into_iter()
             .map(|((repository, revision), paths)| {
@@ -2772,6 +2776,37 @@ mod tests {
             }
         });
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reader_budget_is_temporary_and_refuses_prefetch_before_network() {
+        let scratch = crate::test_support::TestDir::new("reader-prefetch-budget");
+        let mut store =
+            GitHubBootstrapCacheStore::public("fixture-owner", scratch.join("store")).unwrap();
+        let artifact = resolved_fixture(&scratch.join("artifact"), "a", Vec::new());
+        let key = ArtifactKey {
+            kind: artifact.manifest.semantic_key.artifact_kind.clone(),
+            logical_key: "fixture".into(),
+            parameters_digest: artifact.semantic_digest.clone(),
+        };
+        let adapter = store.adapter_manifest_for(key, &artifact).unwrap();
+        store.remember_resolved(&adapter, artifact.clone()).unwrap();
+        store.resources.maximum_permanent_disk_bytes = Some(0);
+        store.resources.maximum_temporary_disk_bytes = Some(u64::MAX);
+        store.check_session_disk_budget(1).unwrap();
+        let existing = crate::git_transport::directory_size_bytes(&store.root).unwrap();
+        store.resources.maximum_temporary_disk_bytes = Some(existing);
+        // The synthetic remote is unreachable; a network call would give a
+        // different failure. Capacity must refuse the transfer first.
+        let error = store.prefetch_manifests(&[adapter]).unwrap_err();
+        assert!(matches!(error, CacheError::ResourceLimit(_)), "{error}");
+        assert!(error
+            .to_string()
+            .contains("configured temporary-disk limit"));
+        assert_eq!(
+            crate::git_transport::directory_size_bytes(&store.root).unwrap(),
+            existing
+        );
     }
 
     #[test]

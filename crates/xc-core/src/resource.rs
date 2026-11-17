@@ -76,7 +76,7 @@ impl ResourcePolicy {
                 profile,
                 maximum_memory_bytes: Some(16 * GIB),
                 maximum_temporary_disk_bytes: Some(100 * GIB),
-                maximum_permanent_disk_bytes: Some(20 * GIB),
+                maximum_permanent_disk_bytes: Some(100 * GIB),
                 maximum_transfer_bytes: Some(20 * GIB),
                 maximum_cpu_seconds: Some(4 * 24 * 60 * 60),
                 maximum_wall_seconds: Some(24 * 60 * 60),
@@ -470,6 +470,8 @@ mod tests {
     #[test]
     fn named_profiles_change_limits_not_mathematics() {
         let normal = ResourcePolicy::for_profile(ResourceProfile::NormalWorkstation);
+        assert_eq!(normal.maximum_temporary_disk_bytes, Some(100 * GIB));
+        assert_eq!(normal.maximum_permanent_disk_bytes, Some(100 * GIB));
         let high_memory = ResourcePolicy::for_profile(ResourceProfile::HighMemoryWorkstation);
         let external = ResourcePolicy::for_profile(ResourceProfile::ExternalCompute);
         assert!(high_memory.maximum_memory_bytes > normal.maximum_memory_bytes);

@@ -2818,6 +2818,127 @@ where
     )
 }
 
+/// Resolve a schema-2 value whose complete numerical inputs are in its request
+/// or payload. Historical producer ancestry is retained as provenance, not as
+/// a dependency requiring payload downloads. The validator must check all
+/// consumed values; this must not be used for artifacts requiring parent data.
+/// Disclosure is never broadened by replacing producer ancestry.
+pub fn resolve_or_compute_self_contained_json_artifact<T, Compute, Validate>(
+    request: &ArtifactExecutionCacheRequest<'_>,
+    compute: Compute,
+    validate: Validate,
+) -> Result<ArtifactExecutionCacheResult<T>, CacheError>
+where
+    T: Serialize + DeserializeOwned,
+    Compute: FnOnce() -> Result<T, CacheError>,
+    Validate: Fn(&T) -> Result<(), CacheError>,
+{
+    let result = resolve_or_compute_json_artifact_core(
+        request,
+        None,
+        true,
+        || compute().map(|value| (value, Vec::new(), ArtifactProductionAssessment::default())),
+        validate,
+    )?;
+    let ValidatedExecutionValue::Decoded(value, ()) = result.value else {
+        return Err(CacheError::InvalidTransition(
+            "unmemoized execution retained a value".into(),
+        ));
+    };
+    Ok(ArtifactExecutionCacheResult {
+        value,
+        access: result.access,
+        reused_manifest: result.reused_manifest,
+        produced_manifest: result.produced_manifest,
+    })
+}
+
+fn bind_self_contained_provenance(
+    manifest: &mut ArtifactManifest,
+    request: &ArtifactExecutionCacheRequest<'_>,
+) -> Result<(), CacheError> {
+    let encoded = request
+        .tags
+        .get(crate::MANIFEST_PROVENANCE_V2_TAG)
+        .ok_or_else(|| {
+            CacheError::InvalidManifest("self-contained reuse requires schema-2 provenance".into())
+        })?;
+    let mut provenance: crate::ManifestProvenanceV2 = serde_json::from_str(encoded)?;
+    provenance.validate()?;
+    if !manifest.dependencies.is_empty() {
+        provenance
+            .producer_receipts
+            .push(manifest_digest(manifest)?);
+    }
+    let retained = crate::retained_canonical_manifest(manifest)?;
+    if let Some(canonical) = &retained {
+        if canonical.schema_version != 2 {
+            return Err(CacheError::InvalidManifest(
+                "self-contained reuse requires schema-2 content".into(),
+            ));
+        }
+        let family = crate::production_staging::family_for_artifact_kind(&manifest.key.kind)
+            .ok_or_else(|| CacheError::InvalidManifest("unknown artifact family".into()))?;
+        validate_retained_canonical_binding(
+            canonical,
+            request.semantic_key,
+            family,
+            &manifest.content_digest,
+            manifest.size_bytes,
+            manifest.provenance_digest.as_ref(),
+        )?;
+        provenance.producer_receipts.push(canonical.digest()?);
+    } else if crate::local_manifest_provenance_v2(manifest)?.is_none() {
+        return Err(CacheError::InvalidManifest(
+            "self-contained reuse requires schema-2 content".into(),
+        ));
+    }
+    match crate::local_artifact_disclosure(manifest)? {
+        crate::ArtifactDisclosure::PrivateOnly => {
+            provenance.disclosure = crate::ArtifactDisclosure::PrivateOnly
+        }
+        crate::ArtifactDisclosure::Unclassified
+            if provenance.disclosure != crate::ArtifactDisclosure::PrivateOnly =>
+        {
+            provenance.disclosure = crate::ArtifactDisclosure::Unclassified;
+        }
+        _ => {}
+    }
+    if let Some(previous) = crate::local_manifest_provenance_v2(manifest)? {
+        provenance
+            .producer_receipts
+            .extend(previous.producer_receipts);
+        for (name, value) in previous.producer_annotations {
+            provenance.producer_annotations.entry(name).or_insert(value);
+        }
+    }
+    provenance.producer_receipts.sort();
+    provenance.producer_receipts.dedup();
+    provenance.validate()?;
+    manifest.dependencies.clear();
+    if let Some(mut canonical) = retained {
+        // Preserve every logical-envelope and transport field. Schema 2 keeps
+        // producer ancestry outside the payload digest, so dropping that
+        // ancestry must not re-infer a different scalar representation or ZIP.
+        canonical.canonical_payload.dependencies.clear();
+        canonical.provenance = Some(provenance.clone());
+        canonical.validate()?;
+        manifest.provenance_digest = Some(canonical.digest()?);
+        manifest.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.into(),
+            serde_json::to_string(&canonical)?,
+        );
+    } else {
+        manifest.provenance_digest = None;
+    }
+    manifest.tags.insert(
+        crate::MANIFEST_PROVENANCE_V2_TAG.into(),
+        serde_json::to_string(&provenance)?,
+    );
+    manifest.validate()?;
+    Ok(())
+}
+
 /// Identity of every input other than the payload bytes that a domain
 /// validator reads, for [`resolve_or_compute_json_artifact_shared`].
 ///
@@ -2913,6 +3034,7 @@ where
     let result = resolve_or_compute_json_artifact_core(
         request,
         None,
+        false,
         || {
             compute().map(|(value, dependencies)| {
                 (value, dependencies, ArtifactProductionAssessment::default())
@@ -2946,7 +3068,7 @@ where
             -> Result<(T, Vec<crate::DependencyRef>, ArtifactProductionAssessment), CacheError>,
     Validate: Fn(&T) -> Result<(), CacheError>,
 {
-    let result = resolve_or_compute_json_artifact_core(request, None, compute, validate)?;
+    let result = resolve_or_compute_json_artifact_core(request, None, false, compute, validate)?;
     let ValidatedExecutionValue::Decoded(value, ()) = result.value else {
         return Err(CacheError::InvalidTransition(
             "unmemoized execution returned a retained value".to_owned(),
@@ -2963,6 +3085,7 @@ where
 fn resolve_or_compute_json_artifact_core<T, R, Compute, Validate>(
     request: &ArtifactExecutionCacheRequest<'_>,
     memo: Option<&ValidatedValueMemoBinding<'_>>,
+    self_contained: bool,
     compute: Compute,
     validate: Validate,
 ) -> Result<ArtifactExecutionCacheResult<ValidatedExecutionValue<T, R>>, CacheError>
@@ -3038,6 +3161,9 @@ where
                         None,
                     )?;
                     report_managed_cache_decision(request, &resolved.layer_name, "reused");
+                    if self_contained {
+                        bind_self_contained_provenance(&mut resolved.manifest, request)?;
+                    }
                     // A validated remote hit is promoted into the ordinary local
                     // working cache immediately. Subsequent runs are therefore
                     // offline and do not repeatedly download a large artifact.
@@ -3120,8 +3246,14 @@ where
                             &resolved.manifest,
                             &mut BTreeSet::new(),
                         )?;
-                        let transport = resolver
-                            .verified_transport_parts(&resolved.layer_name, &resolved.manifest)?;
+                        let transport = if self_contained {
+                            None
+                        } else {
+                            resolver.verified_transport_parts(
+                                &resolved.layer_name,
+                                &resolved.manifest,
+                            )?
+                        };
                         // The payload has served its purpose (typed decode
                         // and local adoption); hand it to staging instead of
                         // copying it.
@@ -4840,6 +4972,184 @@ mod tests {
                 logical_size_bytes,
                 encoded,
             )
+        }
+    }
+
+    #[test]
+    fn self_contained_reuse_does_not_fetch_historical_parents_or_broaden_disclosure() {
+        use crate::CacheStore;
+        for canonical_parent in [false, true] {
+            let scratch = crate::test_support::TestDir::new("self-contained-provenance");
+            let semantic = semantic_key();
+            let store = crate::FilesystemCacheStore::new(
+                "workstation",
+                scratch.join("cache"),
+                true,
+                CacheVisibility::Local,
+            );
+            let provenance = crate::ManifestProvenanceV2 {
+                disclosure: crate::ArtifactDisclosure::PrivateOnly,
+                producer_annotations: BTreeMap::from([(
+                    "source_note".into(),
+                    "historical producer".into(),
+                )]),
+                producer_receipts: vec![],
+            };
+            let payload = br#"["embedded values"]"#;
+            let mut draft = ArtifactDraft {
+                schema_version: 1,
+                key: ArtifactKey {
+                    kind: semantic.artifact_kind.clone(),
+                    logical_key: "gauss-legendre/4/128".into(),
+                    parameters_digest: semantic.digest().unwrap(),
+                },
+                producer_toolkit_version: ToolkitVersion::parse("0.17.2").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.17.1").unwrap(),
+                maximum_reader_version: None,
+                quality: CacheQuality::Validated,
+                visibility: CacheVisibility::Local,
+                immutable: true,
+                dependencies: vec![DependencyRef {
+                    key: ArtifactKey::new(
+                        "ccm_tau_matrix",
+                        "unrelated-unavailable-parent",
+                        b"old producer",
+                    )
+                    .unwrap(),
+                    content_digest: ContentDigest::sha256(b"unavailable historical payload"),
+                    required_quality: CacheQuality::Validated,
+                }],
+                tags: BTreeMap::from([
+                    (
+                        crate::MANIFEST_PROVENANCE_V2_TAG.into(),
+                        serde_json::to_string(&provenance).unwrap(),
+                    ),
+                    (
+                        SEMANTIC_KEY_MANIFEST_TAG.into(),
+                        serde_json::to_string(&semantic).unwrap(),
+                    ),
+                ]),
+                provenance_digest: None,
+            };
+            if canonical_parent {
+                let mut source = draft.clone();
+                source.dependencies.clear();
+                let seed_store = crate::FilesystemCacheStore::new(
+                    "seed",
+                    scratch.join("seed"),
+                    true,
+                    CacheVisibility::Local,
+                );
+                let seed = seed_store.put(&source, payload).unwrap();
+                let canonical = crate::stage_produced_artifact(
+                    &ProducedArtifactRecord {
+                        operation: "fixture".into(),
+                        semantic_key: semantic.clone(),
+                        logical_key: seed.key.logical_key.clone(),
+                        manifest: seed,
+                        achieved_assurance: crate::ArtifactAssuranceState::Computed,
+                        assurance_evidence_digests: vec![],
+                        payload: payload.to_vec(),
+                    },
+                    &scratch.join("seed-staging"),
+                    &crate::TransportPolicy::default(),
+                    &xc_core::ResourcePolicy::default(),
+                    &xc_core::CancellationToken::new(),
+                )
+                .unwrap();
+                let mut canonical = canonical.manifest;
+                canonical
+                    .canonical_payload
+                    .dependencies
+                    .push(crate::PayloadDependencyIdentity {
+                        artifact_family: "ccm-matrices".into(),
+                        semantic_digest: ContentDigest::sha256(b"unavailable semantic"),
+                        manifest_digest: ContentDigest::sha256(b"unavailable manifest"),
+                        payload_digest: ContentDigest::sha256(b"unavailable payload"),
+                    });
+                canonical.validate().unwrap();
+                draft.dependencies.clear();
+                draft.provenance_digest = Some(canonical.digest().unwrap());
+                draft.tags.insert(
+                    REMOTE_CANONICAL_MANIFEST_TAG.into(),
+                    serde_json::to_string(&canonical).unwrap(),
+                );
+            }
+            let old = store.put(&draft, payload).unwrap();
+            let resolver = CacheResolver::new(vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(store),
+            }]);
+            let mut policy = policy();
+            policy.current_toolkit_version = ToolkitVersion::parse("0.17.2").unwrap();
+            let mut req = request(
+                &semantic,
+                &resolver,
+                &policy,
+                ArtifactExecutionCacheMode::RequireReuse,
+            );
+            let sink = RecordingSink::default();
+            req.production_sink = Some(&sink);
+            let mut requested_provenance = provenance.clone();
+            requested_provenance.disclosure = crate::ArtifactDisclosure::PublicInputs;
+            requested_provenance.producer_annotations.clear();
+            req.tags.insert(
+                crate::MANIFEST_PROVENANCE_V2_TAG.into(),
+                serde_json::to_string(&requested_provenance).unwrap(),
+            );
+            // The ordinary route must still fail: it cannot omit real dependencies.
+            assert!(resolve_or_compute_json_artifact::<Vec<String>, _, _>(
+                &req,
+                || panic!("must reuse"),
+                |_| Ok(())
+            )
+            .is_err());
+            let reused = resolve_or_compute_self_contained_json_artifact::<Vec<String>, _, _>(
+                &req,
+                || panic!("must reuse"),
+                |v| {
+                    if v == &["embedded values"] {
+                        Ok(())
+                    } else {
+                        Err(CacheError::InvalidManifest("changed values".into()))
+                    }
+                },
+            )
+            .unwrap();
+            let manifest = reused.reused_manifest.unwrap();
+            assert_eq!(manifest.content_digest, old.content_digest);
+            assert!(manifest.dependencies.is_empty());
+            if canonical_parent {
+                let before = crate::retained_canonical_manifest(&old).unwrap().unwrap();
+                let after = crate::retained_canonical_manifest(&manifest)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(before.payload_digest, after.payload_digest);
+                assert_eq!(before.transport_digests, after.transport_digests);
+                assert!(after.canonical_payload.dependencies.is_empty());
+                assert!(after
+                    .provenance
+                    .unwrap()
+                    .producer_receipts
+                    .contains(&before.digest().unwrap()));
+            }
+            assert_eq!(
+                crate::local_artifact_disclosure(&manifest).unwrap(),
+                crate::ArtifactDisclosure::PrivateOnly
+            );
+            let records = sink.0.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].payload, payload);
+            assert!(records[0].manifest.dependencies.is_empty());
+            drop(records);
+            assert!(
+                resolve_or_compute_self_contained_json_artifact::<Vec<String>, _, _>(
+                    &req,
+                    || panic!("must reuse"),
+                    |_| Err(CacheError::InvalidManifest("wrong current values".into()))
+                )
+                .is_err()
+            );
         }
     }
 

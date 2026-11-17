@@ -484,6 +484,7 @@ fn completed_remote_publication(
 struct DestinationDraftSelection<'a> {
     pending: Vec<&'a CanonicalProductionDraft>,
     already_present: usize,
+    reused: BTreeMap<ExactDependencyIdentity, crate::PayloadDependencyIdentity>,
 }
 
 fn publication_dependency_identities<'a>(
@@ -565,6 +566,7 @@ fn family_draft_advances_live_index(
 
 #[path = "managed_publication/producer_admission.rs"]
 mod producer_admission;
+mod read_snapshot;
 
 fn destination_manifest_dominates(
     existing: &crate::CanonicalArtifactManifest,
@@ -576,7 +578,8 @@ fn destination_manifest_dominates(
         || existing.resolved_mathematical_configuration_digest
             != staged.resolved_mathematical_configuration_digest
         || existing.claim_scope != staged.claim_scope
-        || existing.assumptions != staged.assumptions
+        || publication_independent_assumptions(existing)
+            != publication_independent_assumptions(staged)
         || !manifest_admissible_for_current_reader(existing)
     {
         return false;
@@ -590,6 +593,20 @@ fn destination_manifest_dominates(
             || staged_dependencies
                 .iter()
                 .all(|dependency| existing_dependencies.contains(dependency)))
+}
+
+// Visibility is enforced independently by destination admission and the
+// disclosure contract. Historical placement annotations are not mathematical
+// assumptions and cannot make an otherwise identical artifact new.
+fn publication_independent_assumptions(
+    manifest: &crate::CanonicalArtifactManifest,
+) -> BTreeSet<&str> {
+    manifest
+        .assumptions
+        .iter()
+        .map(String::as_str)
+        .filter(|assumption| !assumption.starts_with("publication_visibility="))
+        .collect()
 }
 
 fn manifest_admissible_for_current_reader(manifest: &crate::CanonicalArtifactManifest) -> bool {
@@ -738,6 +755,7 @@ fn select_missing_destination_drafts_with_admission<'a>(
 
     let mut pending = Vec::with_capacity(drafts.len());
     let mut already_present = 0usize;
+    let mut reused = BTreeMap::new();
     let mut batches = BTreeMap::<String, Option<crate::RepositoryPublicationBatch>>::new();
     for draft in drafts {
         let manifest = target_manifest(draft, destination)?;
@@ -800,13 +818,13 @@ fn select_missing_destination_drafts_with_admission<'a>(
                         }
                     };
                     if admitted {
-                        existing_candidates.push(entry);
+                        existing_candidates.push((entry, document.value));
                     }
                 }
             }
         }
         let mut proven = false;
-        for entry in existing_candidates {
+        for (entry, selected_manifest) in existing_candidates {
             let transaction_id = entry.publication_transaction_id.clone();
             if !batches.contains_key(&transaction_id) {
                 let path = format!(
@@ -852,6 +870,20 @@ fn select_missing_destination_drafts_with_admission<'a>(
                         })
                 });
             if proven {
+                reused.insert(
+                    (
+                        family.to_owned(),
+                        manifest.semantic_digest.clone(),
+                        manifest_digest.clone(),
+                        manifest.payload_digest.clone(),
+                    ),
+                    crate::PayloadDependencyIdentity {
+                        artifact_family: family.to_owned(),
+                        semantic_digest: selected_manifest.semantic_digest,
+                        manifest_digest: entry.manifest_digest.clone(),
+                        payload_digest: selected_manifest.payload_digest,
+                    },
+                );
                 break;
             }
         }
@@ -871,6 +903,7 @@ fn select_missing_destination_drafts_with_admission<'a>(
     Ok(DestinationDraftSelection {
         pending,
         already_present,
+        reused,
     })
 }
 
@@ -903,6 +936,7 @@ fn select_missing_destination_drafts<'a>(
 // immutable artifacts. Require the same canonical manifest and committed batch
 // evidence on every readable shard; a semantic-key hit alone is insufficient.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn select_missing_topology_drafts<'a>(
     remote: &dyn crate::RemoteGitStore,
     topology: &crate::bootstrap_topology::BootstrapFamilyTopology,
@@ -912,15 +946,45 @@ fn select_missing_topology_drafts<'a>(
     required_dependencies: &BTreeSet<ExactDependencyIdentity>,
     cancellation: &xc_core::CancellationToken,
 ) -> Result<DestinationDraftSelection<'a>, CacheError> {
-    let mut producer_admission = producer_admission::DestinationProducerAdmission::new(
+    select_missing_topology_drafts_with_cache(
         remote,
+        topology,
+        writable_revision,
+        destination,
+        drafts,
+        required_dependencies,
+        cancellation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_missing_topology_drafts_with_cache<'a>(
+    remote: &dyn RemoteGitStore,
+    topology: &crate::bootstrap_topology::BootstrapFamilyTopology,
+    writable_revision: &str,
+    destination: PublicationDestination,
+    drafts: &[&'a CanonicalProductionDraft],
+    required_dependencies: &BTreeSet<ExactDependencyIdentity>,
+    cancellation: &xc_core::CancellationToken,
+    proofs: Option<&producer_admission::ProducerProofCache>,
+) -> Result<DestinationDraftSelection<'a>, CacheError> {
+    let snapshot = read_snapshot::ReadSnapshot::with_head(
+        remote,
+        &topology.current_writable.repository_url,
+        writable_revision,
+    );
+    let mut producer_admission = producer_admission::DestinationProducerAdmission::new(
+        &snapshot,
         destination,
         topology,
         writable_revision,
         cancellation,
-    );
+    )
+    .with_proof_cache(proofs);
     let mut pending = drafts.to_vec();
     let mut already_present = 0;
+    let mut reused = BTreeMap::new();
     for shard in &topology.readable_shards {
         if pending.is_empty() {
             break;
@@ -928,10 +992,10 @@ fn select_missing_topology_drafts<'a>(
         let revision = if shard == &topology.current_writable {
             writable_revision.to_owned()
         } else {
-            remote.read_ref(&shard.repository_url, "main")?
+            snapshot.read_ref(&shard.repository_url, "main")?
         };
         let selection = select_missing_destination_drafts_with_admission(
-            remote,
+            &snapshot,
             &shard.repository_url,
             &revision,
             &topology.family,
@@ -942,11 +1006,13 @@ fn select_missing_topology_drafts<'a>(
             Some(&mut producer_admission),
         )?;
         already_present += selection.already_present;
+        reused.extend(selection.reused);
         pending = selection.pending;
     }
     Ok(DestinationDraftSelection {
         pending,
         already_present,
+        reused,
     })
 }
 
@@ -1195,9 +1261,11 @@ struct PublicationRunTransports {
     stores: BTreeMap<(PublicationDestination, String), crate::GitCliRemoteStore>,
     principal: String,
     finished: bool,
+    proofs: std::sync::Arc<producer_admission::ProducerProofCache>,
 }
 
 impl PublicationRunTransports {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         groups: &[PublicationGroup],
         topologies: &BTreeMap<
@@ -1206,14 +1274,18 @@ impl PublicationRunTransports {
         >,
         principal: &str,
         journal_root: &Path,
+        transport_root: &Path,
         resources: &xc_core::ResourcePolicy,
+        metadata_cache: &crate::git_transport::PublicationMetadataCache,
+        proofs: std::sync::Arc<producer_admission::ProducerProofCache>,
     ) -> Result<Self, CacheError> {
         let mut result = Self {
             stores: BTreeMap::new(),
             principal: principal.to_owned(),
             finished: false,
+            proofs,
         };
-        let temporary_root = journal_root.join("git-transport").join("family-batch");
+        let temporary_root = transport_root.join("family-batch");
         for (target, drafts, _) in groups {
             let first = drafts.first().ok_or_else(|| {
                 CacheError::InvalidTransition("empty publication family group".to_owned())
@@ -1261,7 +1333,8 @@ impl PublicationRunTransports {
                         .cloned()
                         .map(|part| (draft.staged_parts_root.clone(), part))
                 }))?
-                .with_resource_policy(resources.clone());
+                .with_resource_policy(resources.clone())
+                .with_publication_metadata_cache(metadata_cache);
                 remote = remote
                     .with_publication_disk_budget(&temporary_root, result.stores.values().next())?;
                 result.stores.insert(key, remote);
@@ -1374,6 +1447,7 @@ fn execute_family_batch_publication(
     required_dependencies: &BTreeSet<ExactDependencyIdentity>,
     admission_manifests: &[crate::CanonicalArtifactManifest],
     remote: &crate::GitCliRemoteStore,
+    proofs: &producer_admission::ProducerProofCache,
 ) -> Result<Vec<ManagedPublicationExecutionReport>, CacheError> {
     let first = drafts.first().ok_or_else(|| {
         CacheError::InvalidTransition("family batch publication received no drafts".to_owned())
@@ -1398,6 +1472,7 @@ fn execute_family_batch_publication(
         required_dependencies,
         admission_manifests,
         remote,
+        proofs,
     );
     // Covers early preflight/preparation/lease failures and an all-present
     // no-op as well as committed work. Closing a handle is never an outcome.
@@ -1425,6 +1500,7 @@ fn execute_family_batch_publication_inner(
     required_dependencies: &BTreeSet<ExactDependencyIdentity>,
     admission_manifests: &[crate::CanonicalArtifactManifest],
     remote: &crate::GitCliRemoteStore,
+    proofs: &producer_admission::ProducerProofCache,
 ) -> Result<Vec<ManagedPublicationExecutionReport>, CacheError> {
     for draft in drafts {
         crate::publication_admission::require_artifact_destination(&draft.manifest, destination)?;
@@ -1455,15 +1531,16 @@ fn execute_family_batch_publication_inner(
     // repository access instead of rejecting the original five-minute probe.
     let mut active_session = session.clone();
     refresh_github_write_session(&mut active_session, principal, &authorized)?;
+    let read_snapshot = read_snapshot::ReadSnapshot::new(remote);
     let topology = verify_bootstrap_registry_route(
-        remote,
+        &read_snapshot,
         owner,
         &first.family,
         destination,
         target,
         &cancellation,
     )?;
-    let observed_head = remote.read_ref(&repository_url, "main")?;
+    let observed_head = read_snapshot.read_ref(&repository_url, "main")?;
     let mut pending_drafts = drafts.to_vec();
     // A destination can be missing both an historical closure member and its
     // active replacement. Publish every immutable identity in one family
@@ -1471,14 +1548,15 @@ fn execute_family_batch_publication_inner(
     // index entry is the key-addressable, newest, dependency-complete draft.
     order_family_publication_drafts(&mut pending_drafts);
     if !replace_existing_semantic {
-        let selection = select_missing_topology_drafts(
-            remote,
+        let selection = select_missing_topology_drafts_with_cache(
+            &read_snapshot,
             &topology,
             &observed_head,
             destination,
             &pending_drafts,
             required_dependencies,
             &cancellation,
+            Some(proofs),
         )?;
         remote.publication_event(
             "candidate_selection",
@@ -1651,7 +1729,7 @@ fn execute_family_batch_publication_inner(
             &private_lease_policy,
         )?;
         if !replace_existing_semantic && head != observed_head {
-            let selection = select_missing_topology_drafts(
+            let selection = select_missing_topology_drafts_with_cache(
                 remote,
                 &topology,
                 &head,
@@ -1659,6 +1737,7 @@ fn execute_family_batch_publication_inner(
                 &pending_drafts,
                 required_dependencies,
                 &cancellation,
+                Some(proofs),
             )?;
             if selection.already_present > 0 {
                 xc_core::progress_message!(
@@ -2484,6 +2563,15 @@ pub(crate) fn destination_neutral_manifest(
 fn remap_destination_drafts_with_existing(
     drafts: &[CanonicalProductionDraft],
     destination: PublicationDestination,
+    existing_dependency: impl FnMut(&crate::PayloadDependencyIdentity) -> Result<bool, CacheError>,
+) -> Result<Vec<CanonicalProductionDraft>, CacheError> {
+    remap_destination_drafts_with_reused(drafts, destination, &BTreeMap::new(), existing_dependency)
+}
+
+fn remap_destination_drafts_with_reused(
+    drafts: &[CanonicalProductionDraft],
+    destination: PublicationDestination,
+    reused: &BTreeMap<ExactDependencyIdentity, crate::PayloadDependencyIdentity>,
     mut existing_dependency: impl FnMut(&crate::PayloadDependencyIdentity) -> Result<bool, CacheError>,
 ) -> Result<Vec<CanonicalProductionDraft>, CacheError> {
     type Identity = (String, ContentDigest, ContentDigest, ContentDigest);
@@ -2559,7 +2647,25 @@ fn remap_destination_drafts_with_existing(
                     dependency.manifest_digest.clone(),
                     dependency.payload_digest.clone(),
                 );
-                if let Some(dependency_index) = source_identities.get(&identity) {
+                let selected = reused
+                    .get(&identity)
+                    .filter(|_| draft.manifest.canonical_payload.schema_version == 2);
+                if let Some(selected) = selected {
+                    if selected.artifact_family != dependency.artifact_family
+                        || selected.semantic_digest != dependency.semantic_digest
+                        || selected.payload_digest != dependency.payload_digest
+                        || !existing_dependency(selected)?
+                    {
+                        return Err(CacheError::InvalidManifest("selected existing producer does not preserve the exact numerical dependency".into()));
+                    }
+                    external_identities.insert((
+                        selected.artifact_family.clone(),
+                        selected.semantic_digest.clone(),
+                        selected.manifest_digest.clone(),
+                        selected.payload_digest.clone(),
+                    ));
+                    dependencies.push(selected.clone());
+                } else if let Some(dependency_index) = source_identities.get(&identity) {
                     let Some(destination_dependency) = remapped[*dependency_index].as_ref() else {
                         ready = false;
                         break;
@@ -2606,6 +2712,14 @@ fn remap_destination_drafts_with_existing(
             destination_draft.manifest.canonical_payload.dependencies = dependencies;
             destination_draft.manifest.payload_digest =
                 destination_draft.manifest.canonical_payload.digest()?;
+            if !reused.is_empty()
+                && draft.manifest.canonical_payload.schema_version == 2
+                && destination_draft.manifest.payload_digest != draft.manifest.payload_digest
+            {
+                return Err(CacheError::InvalidManifest(
+                    "existing-producer remapping changed a V2 numerical payload identity".into(),
+                ));
+            }
             destination_draft.encoding.canonical_payload_digest =
                 destination_draft.manifest.payload_digest.clone();
             destination_draft.manifest.transport_digests =
@@ -3584,14 +3698,14 @@ fn publication_group_members_present(
     members: &[usize],
     owner: &str,
     journal_root: &Path,
+    transport_root: &Path,
     resources: &xc_core::ResourcePolicy,
 ) -> Result<Vec<usize>, CacheError> {
     let (target, drafts, _) = group;
     let mut present = members.to_vec();
     for destination in destinations(*target)? {
         let remote = crate::GitCliRemoteStore::new(
-            journal_root
-                .join("git-transport")
+            transport_root
                 .join("dependency-recheck")
                 .join(visibility_name(destination)),
             journal_root
@@ -4024,6 +4138,7 @@ fn execute_managed_family_drafts_on_github(
             required_dependencies,
             admission_manifests,
             remote,
+            &transports.proofs,
         )?);
     }
     return Ok(ManagedRunPublicationReport {
@@ -4276,8 +4391,78 @@ fn execute_managed_family_drafts_on_github(
 
 struct ManagedTransportWorkspace {
     root: PathBuf,
+    owner: Option<Vec<u8>>,
     lock: File,
     finished: bool,
+}
+
+fn verify_transport_owner(root: &Path, expected: &[u8]) -> Result<(), CacheError> {
+    let marker = root.join("owner");
+    for path in [root, marker.as_path()] {
+        let metadata = fs::symlink_metadata(path)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(CacheError::InvalidTransition(
+                    "Git workspace ownership path is linked".into(),
+                ));
+            }
+        }
+        if metadata.file_type().is_symlink() {
+            return Err(CacheError::InvalidTransition(
+                "Git workspace ownership path is linked".into(),
+            ));
+        }
+    }
+    if fs::read(marker)? != expected {
+        return Err(CacheError::InvalidTransition(
+            "Git workspace belongs to a different journal".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn allocate_transport_workspace(
+    journal_root: &Path,
+    root: PathBuf,
+) -> Result<(PathBuf, Option<Vec<u8>>), CacheError> {
+    #[cfg(windows)]
+    if root.as_os_str().len() > 100 {
+        use std::os::windows::ffi::OsStrExt;
+        // Git's Windows repository discovery reads files before core.longpaths
+        // takes effect. Keep only its disposable object databases short; all
+        // authenticated artifacts, journals and locks stay at their given paths.
+        let journal = fs::canonicalize(journal_root)?;
+        let bytes: Vec<u8> = journal
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let identity = ContentDigest::sha256(&bytes);
+        let root = std::env::temp_dir().join(format!("xcgit-{}", &identity.0[..32]));
+        if root.as_os_str().len() > 100 {
+            return Err(CacheError::ResourceLimit("Windows Git transport needs a shorter TEMP directory; persistent journals can remain at their existing paths".into()));
+        }
+        let owner = format!("xc-git-transport-v1\n{}\n", identity.0).into_bytes();
+        match fs::create_dir(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                verify_transport_owner(&root, &owner)?;
+                let bytes = transport_tree_size_bytes(&root)?;
+                fs::remove_dir_all(&root)?;
+                fs::create_dir(&root)?;
+                xc_core::progress_message!(
+                    "publication transport recovery: removed {bytes} stale temporary bytes"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        fs::write(root.join("owner"), &owner)?;
+        return Ok((root, Some(owner)));
+    }
+    let _ = journal_root;
+    Ok((root, None))
 }
 
 impl ManagedTransportWorkspace {
@@ -4304,14 +4489,19 @@ impl ManagedTransportWorkspace {
                 "publication transport recovery: removed {stale_bytes} stale temporary bytes"
             );
         }
+        let (root, owner) = allocate_transport_workspace(journal_root, root)?;
         Ok(Self {
             root,
+            owner,
             lock,
             finished: false,
         })
     }
 
     fn finish(&mut self) -> Result<(), CacheError> {
+        if let Some(owner) = &self.owner {
+            verify_transport_owner(&self.root, owner)?;
+        }
         let bytes = transport_tree_size_bytes(&self.root)?;
         if self.root.exists() {
             fs::remove_dir_all(&self.root)?;
@@ -4330,6 +4520,17 @@ impl ManagedTransportWorkspace {
 impl Drop for ManagedTransportWorkspace {
     fn drop(&mut self) {
         if !self.finished {
+            if self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| verify_transport_owner(&self.root, owner).is_err())
+            {
+                xc_core::progress_message!(
+                    "publication transport cleanup refused changed ownership"
+                );
+                let _ = FileExt::unlock(&self.lock);
+                return;
+            }
             if let Err(error) = fs::remove_dir_all(&self.root) {
                 if self.root.exists() {
                     xc_core::progress_message!(
@@ -4391,6 +4592,7 @@ pub fn execute_managed_drafts_on_github(
         target,
         owner,
         journal_root,
+        &workspace.root,
         resources,
         replace_existing_semantic,
         family_workers,
@@ -4435,6 +4637,7 @@ struct DestinationDependencyCheck<'a> {
     historical: HistoricalDependencyInventories,
     results: BTreeMap<ExactDependencyIdentity, bool>,
     resources: &'a xc_core::ResourcePolicy,
+    proofs: Option<&'a producer_admission::ProducerProofCache>,
 }
 
 impl DestinationDependencyCheck<'_> {
@@ -4539,9 +4742,185 @@ impl DestinationDependencyCheck<'_> {
     }
 }
 
+/// Bind new V2 descendants to the already admitted producer selected for an
+/// equal numerical parent. A fresh provenance wrapper must not force duplicate
+/// publication of that parent's payload or the rest of its dependency graph.
+fn remap_to_selected_producers(
+    drafts: &[CanonicalProductionDraft],
+    check: &mut DestinationDependencyCheck<'_>,
+    cancellation: &xc_core::CancellationToken,
+) -> Result<Vec<CanonicalProductionDraft>, CacheError> {
+    let mut families = BTreeMap::<&str, Vec<&CanonicalProductionDraft>>::new();
+    for draft in drafts {
+        families.entry(&draft.family).or_default().push(draft);
+    }
+    let mut reused = BTreeMap::new();
+    for (family, members) in families {
+        let key = check.topology_key(family)?;
+        let topology = check.topologies[&key].clone();
+        let repository = &topology.current_writable.repository_url;
+        let head = if let Some(head) = check.revisions.get(repository) {
+            head.clone()
+        } else {
+            let head = check.remote.read_ref(repository, "main")?;
+            check.revisions.insert(repository.clone(), head.clone());
+            head
+        };
+        let selection = select_missing_topology_drafts_with_cache(
+            check.remote,
+            &topology,
+            &head,
+            check.destination,
+            &members,
+            &BTreeSet::new(),
+            cancellation,
+            check.proofs,
+        )?;
+        reused.extend(selection.reused);
+    }
+    remap_destination_drafts_with_reused(drafts, check.destination, &reused, |dependency| {
+        check.exists(dependency)
+    })
+}
+
+/// Public disclosure authenticates exact external producer ancestry as well as
+/// the staged graph. Numerical equality never substitutes for these checks.
+fn collect_public_admission_manifests(
+    drafts: &[CanonicalProductionDraft],
+    check: &mut DestinationDependencyCheck<'_>,
+    cancellation: &xc_core::CancellationToken,
+) -> Result<Vec<crate::CanonicalArtifactManifest>, CacheError> {
+    if check.destination != PublicationDestination::Public {
+        return Err(CacheError::PermissionDenied(
+            "public admission requires a public destination".into(),
+        ));
+    }
+    let mut manifests = BTreeMap::new();
+    let mut pending = Vec::new();
+    for draft in drafts {
+        let manifest = target_manifest(draft, check.destination)?;
+        let digest = manifest.digest()?;
+        pending.push(digest.clone());
+        manifests.insert(digest, manifest);
+    }
+    let remote = check.remote;
+    let reader = crate::RemoteShardReader::new(remote, 16 * 1024 * 1024)?;
+    let mut admissions = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    let mut external_bytes = 0u64;
+    while let Some(digest) = pending.pop() {
+        cancellation
+            .check()
+            .map_err(|e| CacheError::Cancelled(e.to_string()))?;
+        if !visited.insert(digest.clone()) {
+            continue;
+        }
+        let dependencies = manifests[&digest].canonical_payload.dependencies.clone();
+        for dependency in dependencies {
+            if !manifests.contains_key(&dependency.manifest_digest) {
+                if !check.exists(&dependency)? {
+                    return Err(CacheError::InvalidManifest(
+                        "public admission is missing an exact published producer".into(),
+                    ));
+                }
+                let key = check.topology_key(&dependency.artifact_family)?;
+                let topology = check.topologies[&key].clone();
+                let writable = &topology.current_writable.repository_url;
+                let head = if let Some(head) = check.revisions.get(writable) {
+                    head.clone()
+                } else {
+                    let head = remote.read_ref(writable, "main")?;
+                    check.revisions.insert(writable.clone(), head.clone());
+                    head
+                };
+                let admission = admissions
+                    .entry(dependency.artifact_family.clone())
+                    .or_insert_with(|| {
+                        producer_admission::DestinationProducerAdmission::new(
+                            remote,
+                            check.destination,
+                            &topology,
+                            &head,
+                            cancellation,
+                        )
+                        .with_proof_cache(check.proofs)
+                    });
+                let mut found = None;
+                for shard in &topology.readable_shards {
+                    let revision =
+                        if let Some(revision) = check.revisions.get(&shard.repository_url) {
+                            revision.clone()
+                        } else {
+                            let revision = remote.read_ref(&shard.repository_url, "main")?;
+                            check
+                                .revisions
+                                .insert(shard.repository_url.clone(), revision.clone());
+                            revision
+                        };
+                    let path = format!(
+                        "manifests/{}/{}.json",
+                        &dependency.semantic_digest.0[..2],
+                        dependency.manifest_digest
+                    );
+                    let document = match reader.read_json::<crate::CanonicalArtifactManifest>(
+                        &shard.repository_url,
+                        &revision,
+                        &path,
+                        cancellation,
+                    ) {
+                        Ok(document) => document,
+                        Err(CacheError::NotFound(_)) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if document.source.content_digest != dependency.manifest_digest
+                        || document.value.digest()? != dependency.manifest_digest
+                        || document.value.artifact_family != dependency.artifact_family
+                        || document.value.semantic_digest != dependency.semantic_digest
+                        || document.value.payload_digest != dependency.payload_digest
+                    {
+                        return Err(CacheError::InvalidManifest(
+                            "public external producer binding mismatch".into(),
+                        ));
+                    }
+                    if !admission.admits(&document.value, &shard.repository_url)? {
+                        continue;
+                    }
+                    external_bytes = external_bytes.saturating_add(document.source.size_bytes);
+                    if external_bytes
+                        > check
+                            .resources
+                            .maximum_memory_bytes
+                            .unwrap_or(256 * 1024 * 1024)
+                        || manifests.len() >= 100_000
+                    {
+                        return Err(CacheError::ResourceLimit(
+                            "public external admission metadata exceeds its resource budget".into(),
+                        ));
+                    }
+                    found = Some(document.value);
+                    break;
+                }
+                let manifest = found.ok_or_else(|| {
+                    CacheError::PermissionDenied(
+                        "public exact producer ancestry is not admissible".into(),
+                    )
+                })?;
+                manifests.insert(dependency.manifest_digest.clone(), manifest);
+            }
+            pending.push(dependency.manifest_digest);
+        }
+    }
+    let manifests = manifests.into_values().collect::<Vec<_>>();
+    for manifest in &manifests {
+        crate::public_admission_closure(manifest, &manifests)?;
+    }
+    Ok(manifests)
+}
+
 /// Require exact newly staged parents only for artifacts still needing a write.
 /// A reused leaf's selected older closure has already been validated; its new
 /// producer wrappers do not create a reason to republish otherwise equal parents.
+#[cfg(test)]
 fn pending_publication_dependencies(
     remote: &dyn crate::RemoteGitStore,
     destination: PublicationDestination,
@@ -4552,6 +4931,29 @@ fn pending_publication_dependencies(
     >,
     cancellation: &xc_core::CancellationToken,
 ) -> Result<BTreeSet<ExactDependencyIdentity>, CacheError> {
+    pending_publication_dependencies_with_cache(
+        remote,
+        destination,
+        drafts,
+        topologies,
+        cancellation,
+        None,
+    )
+}
+
+fn pending_publication_dependencies_with_cache(
+    remote: &dyn crate::RemoteGitStore,
+    destination: PublicationDestination,
+    drafts: &[CanonicalProductionDraft],
+    topologies: &BTreeMap<
+        (PublicationDestination, String),
+        crate::bootstrap_topology::BootstrapFamilyTopology,
+    >,
+    cancellation: &xc_core::CancellationToken,
+    proofs: Option<&producer_admission::ProducerProofCache>,
+) -> Result<BTreeSet<ExactDependencyIdentity>, CacheError> {
+    let snapshot = read_snapshot::ReadSnapshot::new(remote);
+    let remote: &dyn crate::RemoteGitStore = &snapshot;
     let mut families = BTreeMap::<&str, Vec<&CanonicalProductionDraft>>::new();
     for draft in drafts {
         families.entry(&draft.family).or_default().push(draft);
@@ -4573,11 +4975,19 @@ fn pending_publication_dependencies(
     let maximum_passes = publication_dependency_identities(drafts)
         .len()
         .saturating_add(1);
-    for _ in 0..maximum_passes {
+    for pass in 0..maximum_passes {
         let mut next = required.clone();
         for (family, members) in &families {
+            let started = std::time::Instant::now();
+            xc_core::progress_message!(
+                "publication dependency preflight: destination={} pass={} family={} candidates={}",
+                visibility_name(destination),
+                pass + 1,
+                family,
+                members.len()
+            );
             let topology = &topologies[&(destination, (*family).into())];
-            let selection = select_missing_topology_drafts(
+            let selection = select_missing_topology_drafts_with_cache(
                 remote,
                 topology,
                 &heads[family],
@@ -4585,8 +4995,13 @@ fn pending_publication_dependencies(
                 members,
                 &required,
                 cancellation,
+                proofs,
             )?;
             next.extend(publication_dependency_identities(selection.pending));
+            xc_core::progress_message!(
+                "publication dependency preflight complete: destination={} pass={} family={} already_present={} seconds={:.3}",
+                visibility_name(destination), pass + 1, family, selection.already_present, started.elapsed().as_secs_f64()
+            );
         }
         if next == required {
             return Ok(required);
@@ -4648,16 +5063,20 @@ fn in_run_queried_dependencies(
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_managed_drafts_on_github_inner(
     drafts: &[CanonicalProductionDraft],
     target: PublicationTarget,
     owner: &str,
     journal_root: &Path,
+    transport_root: &Path,
     resources: &xc_core::ResourcePolicy,
     replace_existing_semantic: bool,
     family_workers: std::num::NonZeroUsize,
 ) -> Result<ManagedRunPublicationReport, CacheError> {
     let requested_destinations = destinations(target)?;
+    let metadata_cache = crate::git_transport::PublicationMetadataCache::default();
+    let proofs = std::sync::Arc::new(producer_admission::ProducerProofCache::new(resources));
     let mut groups = Vec::new();
     let mut available_parents =
         BTreeMap::<PublicationDestination, BTreeSet<ExactDependencyIdentity>>::new();
@@ -4667,6 +5086,7 @@ fn execute_managed_drafts_on_github_inner(
     >::new();
     let probe = crate::GitHubCredentialApiProbe::default();
     let mut principals = BTreeSet::new();
+    let mut admission_by_destination = BTreeMap::new();
     for destination in requested_destinations.iter().copied() {
         // Mirror the inventory's routing: private-only kinds ride the private
         // leg and are withheld from the public one, so a mixed draft set
@@ -4687,8 +5107,7 @@ fn execute_managed_drafts_on_github_inner(
             PublicationDestination::Public => PublicationTarget::Public,
         };
         let dependency_remote = crate::GitCliRemoteStore::new(
-            journal_root
-                .join("git-transport")
+            transport_root
                 .join("dependency-preflight")
                 .join(visibility_name(destination)),
             journal_root
@@ -4699,14 +5118,16 @@ fn execute_managed_drafts_on_github_inner(
             "Xcelerator dependency preflight",
             "preflight@invalid",
         )?
-        .with_resource_policy(resources.clone());
+        .with_resource_policy(resources.clone())
+        .with_publication_metadata_cache(&metadata_cache);
+        let dependency_reads = read_snapshot::ReadSnapshot::new(&dependency_remote);
         for family in destination_drafts
             .iter()
             .map(|draft| draft.family.as_str())
             .collect::<BTreeSet<_>>()
         {
             let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
-                &dependency_remote,
+                &dependency_reads,
                 owner,
                 visibility(destination),
                 family,
@@ -4724,7 +5145,7 @@ fn execute_managed_drafts_on_github_inner(
             family_topologies.insert((destination, family.to_owned()), topology);
         }
         let mut check = DestinationDependencyCheck {
-            remote: &dependency_remote,
+            remote: &dependency_reads,
             owner,
             destination,
             topologies: &mut family_topologies,
@@ -4732,6 +5153,7 @@ fn execute_managed_drafts_on_github_inner(
             historical: BTreeMap::new(),
             results: BTreeMap::new(),
             resources,
+            proofs: Some(proofs.as_ref()),
         };
         // A parent that this run publishes, but whose exact identity is already
         // present at the destination, cannot be lost by a failed transaction,
@@ -4742,24 +5164,46 @@ fn execute_managed_drafts_on_github_inner(
                 check.exists(dependency)
             })
             .and_then(|remapped| {
+                let remapped = if replace_existing_semantic {
+                    remapped
+                } else {
+                    remap_to_selected_producers(
+                        &remapped,
+                        &mut check,
+                        &xc_core::CancellationToken::for_policy(resources),
+                    )?
+                };
                 check.prefetch(&in_run_queried_dependencies(&remapped)?);
                 let present =
                     in_run_parents_present(&remapped, |dependency| check.exists(dependency))?;
                 let required = if replace_existing_semantic {
                     publication_dependency_identities(&remapped)
                 } else {
-                    pending_publication_dependencies(
-                        &dependency_remote,
+                    pending_publication_dependencies_with_cache(
+                        &dependency_reads,
                         destination,
                         &remapped,
                         check.topologies,
                         &xc_core::CancellationToken::for_policy(resources),
+                        Some(proofs.as_ref()),
                     )?
                 };
-                Ok((remapped, present, required))
+                let admission = if destination == PublicationDestination::Public {
+                    collect_public_admission_manifests(
+                        &remapped,
+                        &mut check,
+                        &xc_core::CancellationToken::for_policy(resources),
+                    )?
+                } else {
+                    remapped
+                        .iter()
+                        .map(|draft| target_manifest(draft, destination))
+                        .collect::<Result<Vec<_>, CacheError>>()?
+                };
+                Ok((remapped, present, required, admission))
             });
         let cleanup_result = dependency_remote.cleanup_all_sessions();
-        let (remapped, present_parents, required_dependencies) = match (
+        let (remapped, present_parents, required_dependencies, admission) = match (
             remapped_result,
             cleanup_result,
         ) {
@@ -4774,6 +5218,7 @@ fn execute_managed_drafts_on_github_inner(
             }
         };
         available_parents.insert(destination, present_parents);
+        admission_by_destination.insert(destination, admission);
         // Preserve exact edges of pending writes across family groups. Reused
         // leaves keep their already admitted producer closure at the destination.
         let mut by_family = BTreeMap::<String, Vec<CanonicalProductionDraft>>::new();
@@ -4804,20 +5249,11 @@ fn execute_managed_drafts_on_github_inner(
         &family_topologies,
         principals.iter().next().expect("one principal was checked"),
         journal_root,
+        transport_root,
         resources,
+        &metadata_cache,
+        std::sync::Arc::clone(&proofs),
     )?;
-    let mut admission_by_destination =
-        BTreeMap::<PublicationDestination, Vec<crate::CanonicalArtifactManifest>>::new();
-    for (group_target, family_drafts, _) in &groups {
-        for destination in destinations(*group_target)? {
-            for draft in family_drafts {
-                admission_by_destination
-                    .entry(destination)
-                    .or_default()
-                    .push(target_manifest(draft, destination)?);
-            }
-        }
-    }
     // Authenticate the complete public graph before any family starts writing.
     if let Some(manifests) = admission_by_destination.get(&PublicationDestination::Public) {
         for manifest in manifests {
@@ -4956,6 +5392,7 @@ fn execute_managed_drafts_on_github_inner(
                 &recheck,
                 owner,
                 journal_root,
+                transport_root,
                 resources,
             ) {
                 Ok(present) => {
@@ -5741,6 +6178,7 @@ mod tests {
             !transport_root.exists(),
             "stale transport tree survived workspace acquisition"
         );
+        let transport_root = workspace.root.clone();
         fs::create_dir_all(&transport_root).unwrap();
         fs::write(transport_root.join("active.pack"), b"active transport").unwrap();
         workspace.finish().unwrap();
@@ -5750,6 +6188,49 @@ mod tests {
             "completed transport tree survived workspace cleanup"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn long_publication_journals_use_owned_short_git_workspace() {
+        let scratch = crate::test_support::temporary_root("long-publication-journal");
+        let journal = scratch.join("journal-component".repeat(8));
+        fs::create_dir_all(&journal).unwrap();
+        fs::write(journal.join("preserved.json"), b"retained journal").unwrap();
+        let mut workspace = ManagedTransportWorkspace::acquire(&journal).unwrap();
+        assert!(workspace.owner.is_some());
+        assert!(workspace.root.as_os_str().len() <= 100);
+        let remote = crate::GitCliRemoteStore::new(
+            workspace.root.join("dependency-preflight/private"),
+            journal.join("staging"),
+            "Fixture",
+            "fixture@example.invalid",
+        )
+        .unwrap();
+        // Preparing one real staged blob exercises init, origin setup, streamed
+        // hashing, and the shared temporary resource accounting without a remote.
+        let bytes = b"retained artifact";
+        fs::write(journal.join("staging/payload"), bytes).unwrap();
+        remote
+            .prepare_staged_parts(
+                "https://example.invalid/fixture.git",
+                &[TransportPart {
+                    sequence: 0,
+                    repository_path: "payload".into(),
+                    size_bytes: bytes.len() as u64,
+                    content_digest: ContentDigest::sha256(bytes),
+                }],
+            )
+            .unwrap();
+        let temporary = workspace.root.clone();
+        drop(remote);
+        workspace.finish().unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(
+            fs::read(journal.join("preserved.json")).unwrap(),
+            b"retained journal"
+        );
+        assert_eq!(fs::read(journal.join("staging/payload")).unwrap(), bytes);
     }
 
     #[test]
@@ -5912,7 +6393,12 @@ mod tests {
             &topologies,
             "test-owner",
             &journal,
+            &journal.join("git-transport"),
             &ResourcePolicy::default(),
+            &crate::git_transport::PublicationMetadataCache::default(),
+            std::sync::Arc::new(producer_admission::ProducerProofCache::new(
+                &ResourcePolicy::default(),
+            )),
         )
         .unwrap();
         let first = transports
@@ -5991,7 +6477,12 @@ mod tests {
             &topologies,
             "test-owner",
             &root.join("journal"),
+            &root.join("journal/git-transport"),
             &ResourcePolicy::default(),
+            &crate::git_transport::PublicationMetadataCache::default(),
+            std::sync::Arc::new(producer_admission::ProducerProofCache::new(
+                &ResourcePolicy::default(),
+            )),
         )
         .unwrap();
         assert_eq!(transports.stores.len(), 2);
@@ -6017,6 +6508,7 @@ mod tests {
     struct FilesystemMemoryRemote {
         staging_root: PathBuf,
         repositories: Mutex<BTreeMap<String, RepositoryState>>,
+        reads: Mutex<BTreeMap<String, usize>>,
     }
 
     impl FilesystemMemoryRemote {
@@ -6024,6 +6516,7 @@ mod tests {
             Self {
                 staging_root,
                 repositories: Mutex::new(BTreeMap::new()),
+                reads: Mutex::new(BTreeMap::new()),
             }
         }
 
@@ -6088,6 +6581,12 @@ mod tests {
             cancellation: &CancellationToken,
             writer: &mut dyn Write,
         ) -> Result<RemoteReadReport, CacheError> {
+            *self
+                .reads
+                .lock()
+                .unwrap()
+                .entry(path.to_owned())
+                .or_default() += 1;
             cancellation
                 .check()
                 .map_err(|error| CacheError::Cancelled(error.to_string()))?;
@@ -7083,6 +7582,7 @@ mod tests {
             historical: BTreeMap::new(),
             results: BTreeMap::new(),
             resources: &resources,
+            proofs: None,
         };
         check.prefetch(&BTreeSet::from([identity(&present), identity(&missing)]));
 
@@ -7291,10 +7791,30 @@ mod tests {
         drafts: &[&CanonicalProductionDraft],
         destination: PublicationDestination,
     ) -> BTreeMap<String, Vec<u8>> {
+        published_destination_tree_with_legacy_placement(drafts, destination, false)
+    }
+
+    fn published_destination_tree_with_legacy_placement(
+        drafts: &[&CanonicalProductionDraft],
+        destination: PublicationDestination,
+        legacy_placement: bool,
+    ) -> BTreeMap<String, Vec<u8>> {
+        let manifest_for = |draft: &CanonicalProductionDraft| {
+            let mut manifest = target_manifest(draft, destination).unwrap();
+            if legacy_placement && manifest.schema_version == 2 {
+                manifest.assumptions.push(format!(
+                    "publication_visibility={}",
+                    visibility_name(destination)
+                ));
+                manifest.assumptions.sort();
+                manifest.assumptions.dedup();
+            }
+            manifest
+        };
         let artifacts = drafts
             .iter()
             .map(|draft| {
-                let manifest = target_manifest(draft, destination).unwrap();
+                let manifest = manifest_for(draft);
                 crate::RepositoryBatchArtifact {
                     semantic_digest: manifest.semantic_digest.clone(),
                     canonical_payload_digest: manifest.payload_digest.clone(),
@@ -7326,7 +7846,9 @@ mod tests {
         let transaction_id = batch.batch_id.0.clone();
         let mut partitions = BTreeMap::<String, Vec<crate::ShardIndexEntry>>::new();
         for draft in drafts {
-            let entry = active_index_entry(draft, destination, transaction_id.clone());
+            let mut entry = active_index_entry(draft, destination, transaction_id.clone());
+            let manifest = manifest_for(draft);
+            entry.manifest_digest = manifest.digest().unwrap();
             partitions
                 .entry(entry.semantic_digest.0[..2].to_owned())
                 .or_default()
@@ -7344,7 +7866,7 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         for draft in drafts {
-            let manifest = target_manifest(draft, destination).unwrap();
+            let manifest = manifest_for(draft);
             let manifest_digest = manifest.digest().unwrap();
             tree.insert(
                 format!(
@@ -7506,6 +8028,330 @@ mod tests {
     }
 
     #[test]
+    fn new_v2_child_uses_selected_existing_producer_without_republishing_equal_parent() {
+        for destination in [
+            PublicationDestination::Private,
+            PublicationDestination::Public,
+        ] {
+            let root = crate::test_support::temporary_root("reused-parent-new-child");
+            let fixture = |n| {
+                let mut draft = fixture_draft_with_n(&root, n);
+                draft.manifest.schema_version = 2;
+                draft.manifest.canonical_payload.schema_version = 2;
+                draft.manifest.provenance = Some(crate::ManifestProvenanceV2 {
+                    disclosure: crate::ArtifactDisclosure::PublicInputs,
+                    producer_annotations: BTreeMap::new(),
+                    producer_receipts: Vec::new(),
+                });
+                draft.manifest.minimum_reader_version = ToolkitVersion::parse("0.17.1").unwrap();
+                draft.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.1").unwrap();
+                draft.manifest.payload_digest = draft.manifest.canonical_payload.digest().unwrap();
+                draft.encoding.canonical_payload_digest = draft.manifest.payload_digest.clone();
+                draft.manifest.transport_digests = vec![draft.encoding.digest().unwrap()];
+                draft
+            };
+            let old = fixture(1);
+            let mut parent = old.clone();
+            parent.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.2").unwrap();
+            let child = fixture_draft_with_dependency(fixture(2), &parent);
+            let shard = crate::bootstrap_topology::BootstrapShard {
+                authorized_repository: "example-org/xcelerator-cache-private-ccm-matrices-0001"
+                    .into(),
+                repository_url:
+                    "https://github.com/example-org/xcelerator-cache-private-ccm-matrices-0001.git"
+                        .into(),
+                shard_id: "ccm-matrices-0001".into(),
+                sequence: 1,
+                writable: true,
+            };
+            let topology = crate::bootstrap_topology::BootstrapFamilyTopology {
+                family: "ccm-matrices".into(),
+                visibility: visibility(destination),
+                current_writable: shard.clone(),
+                readable_shards: vec![shard.clone()],
+            };
+            let remote = FilesystemMemoryRemote::new(root.to_path_buf());
+            remote.insert_repository(
+                shard.repository_url.clone(),
+                "head".into(),
+                published_destination_tree(&[&old], destination),
+            );
+            let mut topologies =
+                BTreeMap::from([((destination, "ccm-matrices".into()), topology.clone())]);
+            let resources = xc_core::ResourcePolicy::default();
+            let cancellation = CancellationToken::new();
+            let mut check = DestinationDependencyCheck {
+                remote: &remote,
+                owner: "example-org",
+                destination,
+                topologies: &mut topologies,
+                revisions: BTreeMap::new(),
+                historical: BTreeMap::new(),
+                results: BTreeMap::new(),
+                resources: &resources,
+                proofs: None,
+            };
+            let input = remap_destination_drafts(&[parent, child.clone()], destination).unwrap();
+            let remapped = remap_to_selected_producers(&input, &mut check, &cancellation).unwrap();
+            let rewritten_child = remapped
+                .iter()
+                .find(|d| d.manifest.semantic_digest == child.manifest.semantic_digest)
+                .unwrap();
+            assert_eq!(
+                rewritten_child.manifest.payload_digest,
+                child.manifest.payload_digest
+            );
+            assert_eq!(
+                rewritten_child.manifest.semantic_digest,
+                child.manifest.semantic_digest
+            );
+            assert_eq!(
+                rewritten_child.manifest.canonical_payload.dependencies[0].manifest_digest,
+                old.manifest.digest().unwrap()
+            );
+            let required = pending_publication_dependencies(
+                &remote,
+                destination,
+                &remapped,
+                check.topologies,
+                &cancellation,
+            )
+            .unwrap();
+            let members = remapped.iter().collect::<Vec<_>>();
+            let selection = select_missing_topology_drafts(
+                &remote,
+                &topology,
+                "head",
+                destination,
+                &members,
+                &required,
+                &cancellation,
+            )
+            .unwrap();
+            assert_eq!(selection.already_present, 1);
+            assert_eq!(selection.pending.len(), 1);
+            assert_eq!(
+                selection.pending[0].manifest.semantic_digest,
+                child.manifest.semantic_digest
+            );
+            if destination == PublicationDestination::Public {
+                let closure =
+                    collect_public_admission_manifests(&remapped, &mut check, &cancellation)
+                        .unwrap();
+                assert!(closure
+                    .iter()
+                    .any(|m| m.digest().unwrap() == old.manifest.digest().unwrap()));
+                crate::public_admission_closure(&rewritten_child.manifest, &closure).unwrap();
+                let mut missing = published_destination_tree(&[&old], destination);
+                missing.remove(&format!(
+                    "manifests/{}/{}.json",
+                    &old.manifest.semantic_digest.0[..2],
+                    old.manifest.digest().unwrap()
+                ));
+                remote.insert_repository(shard.repository_url.clone(), "head".into(), missing);
+                assert!(collect_public_admission_manifests(&remapped, &mut check, &cancellation).is_err(), "cached publication existence cannot substitute for missing exact public ancestry");
+            }
+        }
+    }
+
+    #[test]
+    fn producer_ancestry_prefetch_batches_metadata_and_preserves_cancellation() {
+        let root = crate::test_support::temporary_root("ancestry-prefetch");
+        let shard = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "example-org/matrices".into(),
+            repository_url: "https://github.com/example-org/matrices.git".into(),
+            shard_id: "matrices-0001".into(),
+            sequence: 1,
+            writable: true,
+        };
+        let topology = crate::bootstrap_topology::BootstrapFamilyTopology {
+            family: "ccm-matrices".into(),
+            visibility: visibility(PublicationDestination::Private),
+            current_writable: shard.clone(),
+            readable_shards: vec![shard.clone()],
+        };
+        let dependencies = (0..600)
+            .map(|n| crate::PayloadDependencyIdentity {
+                artifact_family: topology.family.clone(),
+                semantic_digest: ContentDigest::sha256(format!("semantic-{n}").as_bytes()),
+                manifest_digest: ContentDigest::sha256(format!("manifest-{n}").as_bytes()),
+                payload_digest: ContentDigest::sha256(format!("payload-{n}").as_bytes()),
+            })
+            .collect::<Vec<_>>();
+        for cancel in [None, Some(false), Some(true)] {
+            let remote = PrefetchRecorder {
+                inner: FilesystemMemoryRemote::new(root.to_path_buf()),
+                prefetches: Mutex::new(Vec::new()),
+                prefetch_cancellation: cancel,
+                digest_checks: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let cancellation = CancellationToken::new();
+            let mut admission = producer_admission::DestinationProducerAdmission::new(
+                &remote,
+                PublicationDestination::Private,
+                &topology,
+                "pinned",
+                &cancellation,
+            );
+            let result = admission.prefetch_parents(&dependencies);
+            let batches = remote.prefetches.lock().unwrap();
+            assert!(batches
+                .iter()
+                .all(
+                    |(repository, revision, paths)| repository == &shard.repository_url
+                        && revision == "pinned"
+                        && paths.len() <= 256
+                ));
+            if cancel.is_some() {
+                assert!(matches!(result, Err(CacheError::Cancelled(_))));
+                assert_eq!(batches.len(), 1);
+            } else {
+                result.unwrap();
+                assert!((3..=5).contains(&batches.len()));
+                let paths = batches
+                    .iter()
+                    .flat_map(|(_, _, paths)| paths.iter())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(
+                    paths.iter().filter(|p| p.starts_with("manifests/")).count(),
+                    600
+                );
+                assert!(paths.iter().all(|p| p.starts_with("manifests/")
+                    || p.starts_with("indexes/")
+                    || p.starts_with("revocations/indexes/")));
+                assert!(
+                    remote.inner.reads.lock().unwrap().is_empty(),
+                    "prefetch does not count as document validation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn producer_admission_reuses_shared_parent_proofs_without_hiding_missing_ancestry() {
+        let root = crate::test_support::temporary_root("producer-shared-proof");
+        let destination = PublicationDestination::Private;
+        let fixture = |n| {
+            let mut draft = fixture_draft_with_n(&root, n);
+            draft.manifest.schema_version = 2;
+            draft.manifest.canonical_payload.schema_version = 2;
+            draft.manifest.provenance = Some(crate::ManifestProvenanceV2 {
+                disclosure: crate::ArtifactDisclosure::PublicInputs,
+                producer_annotations: BTreeMap::new(),
+                producer_receipts: Vec::new(),
+            });
+            draft.manifest.minimum_reader_version = ToolkitVersion::parse("0.17.1").unwrap();
+            draft.manifest.payload_digest = draft.manifest.canonical_payload.digest().unwrap();
+            draft.encoding.canonical_payload_digest = draft.manifest.payload_digest.clone();
+            draft.manifest.transport_digests = vec![draft.encoding.digest().unwrap()];
+            draft
+        };
+        let leaf = fixture(1);
+        let parent = fixture_draft_with_dependency(fixture(2), &leaf);
+        let children = (3..13)
+            .map(|n| fixture_draft_with_dependency(fixture(n), &parent))
+            .collect::<Vec<_>>();
+        let shard = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "example-org/xcelerator-cache-private-ccm-matrices-0001".into(),
+            repository_url:
+                "https://github.com/example-org/xcelerator-cache-private-ccm-matrices-0001.git"
+                    .into(),
+            shard_id: "ccm-matrices-0001".into(),
+            sequence: 1,
+            writable: true,
+        };
+        let topology = crate::bootstrap_topology::BootstrapFamilyTopology {
+            family: "ccm-matrices".into(),
+            visibility: visibility(destination),
+            current_writable: shard.clone(),
+            readable_shards: vec![shard.clone()],
+        };
+        let remote = FilesystemMemoryRemote::new(root.to_path_buf());
+        let mut drafts = vec![&leaf, &parent];
+        drafts.extend(children.iter());
+        let tree = published_destination_tree(&drafts, destination);
+        remote.insert_repository(shard.repository_url.clone(), "first".into(), tree.clone());
+        let cancellation = CancellationToken::new();
+        let proofs = producer_admission::ProducerProofCache::new(&ResourcePolicy::default());
+        let mut admission = producer_admission::DestinationProducerAdmission::new(
+            &remote,
+            destination,
+            &topology,
+            "first",
+            &cancellation,
+        )
+        .with_proof_cache(Some(&proofs));
+        assert!(admission
+            .admits(&children[0].manifest, &shard.repository_url)
+            .unwrap());
+        let parent_paths = [&leaf, &parent].map(|draft| {
+            format!(
+                "manifests/{}/{}.json",
+                &draft.manifest.semantic_digest.0[..2],
+                draft.manifest.digest().unwrap()
+            )
+        });
+        let counts = parent_paths
+            .each_ref()
+            .map(|path| remote.reads.lock().unwrap()[path]);
+        let before = remote.reads.lock().unwrap().clone();
+        let mut next_phase = producer_admission::DestinationProducerAdmission::new(
+            &remote,
+            destination,
+            &topology,
+            "first",
+            &cancellation,
+        )
+        .with_proof_cache(Some(&proofs));
+        assert!(next_phase
+            .admits(&children[0].manifest, &shard.repository_url)
+            .unwrap());
+        assert_eq!(
+            *remote.reads.lock().unwrap(),
+            before,
+            "an unchanged exact closure must survive phase boundaries without metadata reads"
+        );
+        for child in &children[1..] {
+            assert!(admission
+                .admits(&child.manifest, &shard.repository_url)
+                .unwrap());
+        }
+        assert_eq!(
+            counts,
+            parent_paths
+                .each_ref()
+                .map(|path| remote.reads.lock().unwrap()[path]),
+            "shared exact ancestors must not be read again for every child"
+        );
+        // A different dependency is not satisfied by cached admission of the
+        // shared parent, and a new revision gets a fresh admission snapshot.
+        let missing = fixture(100);
+        let bad_child = fixture_draft_with_dependency(children[0].clone(), &missing);
+        assert!(!admission
+            .admits(&bad_child.manifest, &shard.repository_url)
+            .unwrap());
+        let mut changed = tree;
+        changed.remove(&parent_paths[0]);
+        remote.insert_repository(shard.repository_url.clone(), "second".into(), changed);
+        let mut fresh = producer_admission::DestinationProducerAdmission::new(
+            &remote,
+            destination,
+            &topology,
+            "second",
+            &cancellation,
+        )
+        .with_proof_cache(Some(&proofs));
+        assert!(!fresh
+            .admits(&children[0].manifest, &shard.repository_url)
+            .unwrap());
+        cancellation.cancel(xc_core::CancellationReason::UserRequested);
+        assert!(matches!(
+            admission.admits(&children[0].manifest, &shard.repository_url),
+            Err(CacheError::Cancelled(_))
+        ));
+    }
+
+    #[test]
     fn schema_two_reuses_exact_older_producer_closure_across_shards_and_obeys_revocation() {
         for destination in [
             PublicationDestination::Private,
@@ -7526,11 +8372,25 @@ mod tests {
                 draft.manifest.transport_digests = vec![draft.encoding.digest().unwrap()];
                 draft
             };
-            let old_parent = convert(fixture_draft_with_n(&root, 1));
+            let mut old_parent = convert(fixture_draft_with_n(&root, 1));
+            old_parent.manifest.assumptions.push(format!(
+                "publication_visibility={}",
+                visibility_name(destination)
+            ));
+            old_parent.manifest.assumptions.sort();
             let mut new_parent = old_parent.clone();
+            new_parent
+                .manifest
+                .assumptions
+                .retain(|a| !a.starts_with("publication_visibility="));
             new_parent.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.1").unwrap();
-            let old_child =
+            let mut old_child =
                 fixture_draft_with_dependency(convert(fixture_draft_with_n(&root, 2)), &old_parent);
+            old_child.manifest.assumptions.push(format!(
+                "publication_visibility={}",
+                visibility_name(destination)
+            ));
+            old_child.manifest.assumptions.sort();
             let mut new_child =
                 fixture_draft_with_dependency(convert(fixture_draft_with_n(&root, 2)), &new_parent);
             new_child.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.1").unwrap();
@@ -7558,7 +8418,11 @@ mod tests {
                 readable_shards: vec![first.clone(), second.clone()],
             };
             let remote = FilesystemMemoryRemote::new(root.to_path_buf());
-            let history = published_destination_tree(&[&old_parent, &old_child], destination);
+            let history = published_destination_tree_with_legacy_placement(
+                &[&old_parent, &old_child],
+                destination,
+                true,
+            );
             remote.insert_repository(
                 first.repository_url.clone(),
                 "history".into(),
@@ -7569,15 +8433,18 @@ mod tests {
                 "current".into(),
                 BTreeMap::new(),
             );
+            let proofs = producer_admission::ProducerProofCache::new(&ResourcePolicy::default());
             let select = || {
-                select_missing_topology_drafts(
+                let head = remote.read_ref(&second.repository_url, "main").unwrap();
+                select_missing_topology_drafts_with_cache(
                     &remote,
                     &topology,
-                    "current",
+                    &head,
                     destination,
                     &[&new_child],
                     &BTreeSet::new(),
                     &CancellationToken::new(),
+                    Some(&proofs),
                 )
                 .unwrap()
                 .already_present
@@ -7622,7 +8489,7 @@ mod tests {
                 };
                 remote.insert_repository(
                     second.repository_url.clone(),
-                    "current".into(),
+                    format!("repository-revoked-{expected}"),
                     BTreeMap::from([(
                         format!("revocations/indexes/{}.json", &identity.0[..2]),
                         canonical_json_bytes(&partition).unwrap(),
@@ -7649,7 +8516,7 @@ mod tests {
             };
             remote.insert_repository(
                 second.repository_url.clone(),
-                "current".into(),
+                "manifest-revoked".into(),
                 BTreeMap::from([(
                     format!("revocations/indexes/{}.json", &identity.0[..2]),
                     canonical_json_bytes(&revocations).unwrap(),
@@ -7658,7 +8525,7 @@ mod tests {
             assert_eq!(select(), 0, "matching values cannot substitute a different producer for a revoked exact ancestor");
             remote.insert_repository(
                 second.repository_url.clone(),
-                "current".into(),
+                "current-restored".into(),
                 BTreeMap::new(),
             );
             let mut missing_parent = history;
@@ -7669,7 +8536,7 @@ mod tests {
             ));
             remote.insert_repository(
                 first.repository_url.clone(),
-                "history".into(),
+                "history-missing".into(),
                 missing_parent,
             );
             assert_eq!(select(), 0, "missing exact ancestry cannot prove reuse");

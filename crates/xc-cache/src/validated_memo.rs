@@ -434,6 +434,7 @@ where
     let result = resolve_or_compute_json_artifact_core(
         request,
         binding.as_ref(),
+        false,
         || compute().map(|(value, deps)| (value, deps, ArtifactProductionAssessment::default())),
         |payload| build(payload, resources.as_ref(), scope.as_ref()),
     )?;

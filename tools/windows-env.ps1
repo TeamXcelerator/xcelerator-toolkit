@@ -40,8 +40,8 @@ $env:PKG_CONFIG_LIBDIR = $env:PKG_CONFIG_PATH
 $env:LIBRARY_PATH = Join-Path $Prefix 'lib'
 $env:CARGO_TARGET_DIR = Join-Path (Split-Path -Parent $Prefix) 'build'
 $version = & $env:RUSTC --version
-if ($LASTEXITCODE -ne 0 -or $version -notmatch '^rustc 1\.99\.1 ') {
-    throw "Expected Rust 1.99.1 in the selected UCRT prefix; found $version"
+if ($LASTEXITCODE -ne 0 -or $version -notmatch '^rustc 1\.100\.0 ') {
+    throw "Expected Rust 1.100.0 in the selected UCRT prefix; found $version"
 }
 $hostInfo = @(& $env:RUSTC -vV)
 if ($LASTEXITCODE -ne 0 -or $hostInfo -notcontains 'host: x86_64-pc-windows-gnu') {

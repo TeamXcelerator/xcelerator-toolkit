@@ -4,16 +4,35 @@ A validated artifact can be saved in the workstation cache even if its subsequen
 publication staging fails. Preserve the cache, original capture receipt and run
 journal. A packaging limit is not evidence of a numerical error.
 
+On Windows, publication may place disposable Git object databases in a short
+directory under `TEMP` when the journal path is long. The journal lock and an
+ownership marker bind that directory to this publication. Retries clean up
+stale owned Git data; completed attempts remove it. Artifacts, staging and
+publication receipts remain in their original locations. Git commands explicitly
+select their bare repository and cannot fall back to a parent checkout.
+An unusually long `TEMP` path is rejected with a request to choose a shorter
+temporary directory; no global Git setting needs to be changed.
+
 ## Resource limits
 
-Managed sessions default to the normal workstation policy, including a 20 GiB
-encoded-transfer ceiling. For a larger machine or artifact, set
+Managed sessions default to the normal workstation policy: 100 GiB temporary
+disk, 100 GiB permanent disk, and a separate 20 GiB encoded-transfer ceiling.
+These are software budgets, not measurements of available drive space. Temporary
+reader sessions use the temporary-disk budget; their Git objects, retained parts
+and reconstructed packages count toward it. Prefetch checks capacity before
+downloading. For a larger machine or artifact, set
 `XC_RESOURCE_POLICY_FILE` to a JSON file containing a complete
 `xc_core::ResourcePolicy`. Limits are bytes or seconds as named; `null` means no
 explicit ceiling. Unknown fields, zero limits and files larger than 64 KiB are
 rejected. Resource settings do not change numerical precision, mathematical
 identities, assurance or publication authorization. They do not reserve hardware
 or replace the caller's disk/memory availability checks.
+
+On Linux, use `export XC_RESOURCE_POLICY_FILE=/path/to/resources.json`; on
+PowerShell, use `$env:XC_RESOURCE_POLICY_FILE = 'C:/path/to/resources.json'`.
+Numerical working-memory settings do not implicitly change cache disk budgets.
+Repository shard capacity is a separate publication policy, not this local
+reader budget.
 
 Example bounded policy for large artifact transport:
 
@@ -70,6 +89,34 @@ validation or promote assurance. Legacy unprofiled objects require a different
 explicit migration and are rejected by this route.
 
 Hashing, ZIP decoding, split-part creation and network transfer still take time.
-They do not repeat the numerical producer. The original failed capture receipt
+Dependency preflight logs its destination, pass, family, reuse count and elapsed
+time. Successful exact ancestry proofs are reused across phases of one
+publication invocation. Proofs bind the destination, manifest, topology and all
+observed repository heads, and expire at scheduled revocations. Each transaction
+takes a fresh read snapshot; a changed head requires validation again. Mutation
+authorization, leases and compare-and-swap checks always use the live store.
+For wide dependency graphs, manifest, index and revocation metadata is fetched
+in batches of at most 256 paths, followed by the same per-document validation.
+No numerical payload object is requested by this ancestry prefetch. Local blob
+sizes and small metadata bytes are read with batched Git commands. Disk growth
+still requires reservations and post-fetch measurements; returning immutable
+bytes from memory does not enumerate the temporary filesystem.
+Small metadata and confirmed absent paths share a bounded invocation memo keyed
+by repository, full Git commit and path, including registry and topology JSON.
+The memo survives individual Git session cleanup, allowing later phases to reuse
+authenticated bytes. It is released at invocation end; changing a store's resource
+policy detaches its memo. Every caller still validates each returned document.
+Metadata bytes are capped at 32 MiB (or one eighth of the memory allowance),
+with at most 4,096 records and 1 MiB per document; proof storage is capped at
+8 MiB (or one sixteenth of the allowance). Numerical payloads remain streamed.
+
+When an existing compatible V2 producer satisfies a numerical parent, new
+descendants reference that admitted producer's exact manifest. A fresh wrapper
+with different provenance therefore does not force the same numerical payload
+back into publication. Semantic keys and payload identities are preserved;
+legacy V1 dependency semantics retain their exact-identity requirements.
+Exact external public producer manifests and their complete admission closure
+are authenticated before any family writes. Recovery does not repeat numerical
+production. The original failed capture receipt
 stays failed: record publication recovery and any retrospective completeness
 assessment separately, tied to the original and recovered artifact identities.

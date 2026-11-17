@@ -2,5 +2,5 @@
 # Native Windows UCRT builds use the matching packaged GNU host toolchain;
 # see docs/WINDOWS.md and tools/windows-env.ps1.
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]

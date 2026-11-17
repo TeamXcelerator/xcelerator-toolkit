@@ -147,3 +147,15 @@ Deployment must preserve one shared GMP/MPFR pair, without bundled native symbol
 definitions or allocator/interposition overrides. Numerical tests alone do not
 establish this packaging contract. See the
 [native build and linkage policy](../crates/xc-numerics/ARBITRARY_PRECISION_QUADRATURE.md).
+
+## Optional exact CPU kernels
+
+The packed signed-residue layout, scalar/AVX2/AVX-512 kernels and flat input
+residue storage are original implementations developed with AI assistance.
+They use the existing Rust standard library and Rayon dependency; no external
+kernel source or new package dependency is incorporated. ISA semantics were
+checked against Rust's [AVX2 multiply-add](https://doc.rust-lang.org/core/arch/x86_64/fn._mm256_madd_epi16.html)
+and [AVX-512 multiply-add](https://doc.rust-lang.org/core/arch/x86_64/fn._mm512_madd_epi16.html)
+documentation. Pair products widen before accumulation, under the existing
+proved signed-integer bounds. Runtime feature checks gate every SIMD call.
+Independent BigInt/i128 oracles test results, tails and signed boundary values.

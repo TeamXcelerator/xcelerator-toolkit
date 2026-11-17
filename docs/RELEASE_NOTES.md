@@ -1,5 +1,103 @@
 # Release notes
 
+## 0.17.2 (2026-11-17)
+
+Amended 2026-11-19 with cache-validation, native Windows Git transport and
+publication-performance fixes. The release version and portable defaults are
+unchanged.
+
+### Cache reuse and resource accounting
+
+The normal workstation disk defaults are 100 GiB for temporary and permanent
+storage. Temporary readers use the temporary allowance and admit prefetch
+capacity before downloading; memory and transfer allowances remain separate.
+See [resource configuration](PUBLICATION_RECOVERY.md#resource-limits).
+
+Self-contained retained input views and preflight inventories preserve producer
+ancestry as provenance without fetching unrelated historical payloads. Exact
+decimal coordinate equality allows alternate decimal spellings without rounded
+comparisons. Reference projection authenticates original cached JSON bytes when
+typed serialization changes field order or whitespace.
+Root-window replay tolerates the obsolete seed-dataset attribution field in
+older summaries while still checking acquisition decisions, source schema,
+every retained root and all finite statistics against the authenticated source.
+
+Publication recognizes obsolete visibility annotations consistently across
+shards. Disclosure, mathematical assumptions, compatibility, assurance and
+revocation checks remain enforced. Retained transport schema/profile labels
+are reconciled only when their complete encoding digest is already authorized
+by the manifest; package and ordered-part bytes must still match exactly.
+Existing repositories are not rewritten automatically.
+
+Git transport commands explicitly select their bare repository instead of
+allowing parent-directory discovery. On Windows, long publication-journal paths
+use an owned, short temporary Git workspace with the same locking, resource
+accounting and cleanup; retained artifacts and journals keep their original
+paths. This avoids repository-discovery failures before Git's long-path setting
+has taken effect.
+
+Publication preflight reuses validated index and exact-parent metadata within
+an admission pass, with separate Git revisions and destinations. Shared disk
+accounting uses directory-entry metadata to avoid per-file reopen overhead on
+Windows. Limits and ancestry/revocation checks remain enforced; progress logs
+report per-family preflight timing and reuse counts.
+Wide producer-ancestry graphs prefetch manifest, index and revocation metadata
+in bounded batches instead of negotiating a separate transfer for each parent.
+Prefetch never substitutes for hashing, compatibility or disclosure validation.
+Small metadata reads and authenticated absence are shared across publication
+phases by repository, full commit and path. Session cleanup retains this bounded
+invocation memo; resource-policy changes detach it. Memory hits avoid disk scans,
+while cold metadata reads and blob-size checks use batched Git processes.
+Successful exact ancestry proofs also survive phase boundaries, bound to every
+observed head and topology and expiring at scheduled revocations. Each transaction
+refreshes its read snapshot; mutation authorization and compare-and-swap checks
+remain live. Numerical payloads remain streamed, with unchanged resource limits.
+
+New V2 descendants bind to the compatible existing producer selected during
+publication reuse. A changed provenance wrapper no longer forces equal parents
+and their ancestors back into the write set. Numerical keys and payload digests
+remain unchanged, with exact ancestry, version and disclosure checks retained.
+
+### Optional CPU execution tuning
+
+Portable execution remains the default. Opt-in packed, AVX2 and AVX-512 integer
+product kernels preserve exact accumulation and CRT reconstruction. Runtime
+dispatch checks the required ISA features; unsupported explicit choices fail
+before CPU execution. Optional contiguous residue storage also applies to CUDA
+preparation. Both choices preserve conservative workspace admission and
+numerical cache identities, with bounded logs identifying nondefault execution.
+See [CPU execution tuning](CPU_EXECUTION.md) for runtime controls, local compiler
+flags, LTO/PGO considerations and measurement guidance. Hardware-specific build
+flags and process affinity are not enabled by repository defaults.
+
+Parallel profile diagnostics bind schema-4 targets by their declared numerical
+identity. Unchanged targets and provenance-only changes remain valid; changed
+numerical inputs and invalid value contracts are rejected. Synthetic provider
+regressions cover complete residual and deviation payloads with legacy and
+schema-4 targets under serial and parallel execution.
+
+### Toolchain and compatibility
+
+Development and native Windows qualification now use stable Rust 1.100.0;
+the declared MSRV remains 1.99. The Windows dependency lock binds the updated
+Rust package and compiler files. GMP 6.3.0, MPFR 4.2.2, FLINT 3.6.0, numerical
+library versions and archive encoders are unchanged. An unused cache dependency
+and workspace aliases were removed; a transfer-response loop was adjusted for
+strict lint without changing arithmetic order.
+
+This release adds execution options, not a new numerical identity or archive
+format. Existing producer/reader floors, schema-2 capability requirements and
+private-publication restrictions remain in force. Compatible earlier artifacts
+are reused with their original provenance. A newer producer version alone is
+not grounds for republishing. No cache migration or scientific rerun is implied.
+
+Native Windows qualification covers exact-product oracles, optional kernels and
+layouts, CPU/CUDA equality, managed-cache reuse, external consumers and strict
+lint. These bounded checks do not establish whole-claim speedups. The historical
+Linux/Windows byte comparisons in the 0.17.1 notes apply to that native port;
+they are not a new Linux qualification of 0.17.2. See
+[numerical compatibility](NUMERICAL_COMPATIBILITY.md).
+
 ## 0.17.1 (2026-11-11)
 
 ### Cache identity and disclosure maintenance

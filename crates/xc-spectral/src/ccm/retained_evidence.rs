@@ -210,38 +210,48 @@ where
         annotations,
         numerical_inputs,
         |req, scope, dependencies, identities| {
-            let mut result = resolve_or_compute_json_artifact_with_dependencies(
-                req,
-                || {
-                    let data = compute().map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
-                    Ok((
-                        ResearchRecord {
-                            schema_version: 2,
-                            semantics: req.semantic_key.mathematical_semantics_version.clone(),
-                            kind: kind.into(),
-                            scope: scope.into(),
-                            source_dependencies: identities.clone(),
-                            request: request.clone(),
-                            data,
-                        },
-                        dependencies.clone(),
-                    ))
-                },
-                |r| {
-                    if r.schema_version != 2
-                        || r.semantics != req.semantic_key.mathematical_semantics_version
-                        || r.kind != kind
-                        || r.scope != scope
-                        || r.request.get("expected_rows").and_then(Value::as_u64)
-                            != request.get("expected_rows").and_then(Value::as_u64)
-                    {
-                        return Err(CacheError::InvalidManifest(
-                            "retained research identity mismatch".into(),
-                        ));
-                    }
-                    validate(&r.data).map_err(|e| CacheError::InvalidManifest(e.to_string()))
-                },
-            )?;
+            let compute_record = || {
+                let data = compute().map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                Ok((
+                    ResearchRecord {
+                        schema_version: 2,
+                        semantics: req.semantic_key.mathematical_semantics_version.clone(),
+                        kind: kind.into(),
+                        scope: scope.into(),
+                        source_dependencies: identities.clone(),
+                        request: request.clone(),
+                        data,
+                    },
+                    dependencies.clone(),
+                ))
+            };
+            let validate_record = |r: &ResearchRecord<T>| {
+                if r.schema_version != 2
+                    || r.semantics != req.semantic_key.mathematical_semantics_version
+                    || r.kind != kind
+                    || r.scope != scope
+                    || r.request.get("expected_rows").and_then(Value::as_u64)
+                        != request.get("expected_rows").and_then(Value::as_u64)
+                {
+                    return Err(CacheError::InvalidManifest(
+                        "retained research identity mismatch".into(),
+                    ));
+                }
+                validate(&r.data).map_err(|e| CacheError::InvalidManifest(e.to_string()))
+            };
+            let mut result = if numerical_inputs.is_some_and(|inputs| inputs.is_empty()) {
+                xc_cache::resolve_or_compute_self_contained_json_artifact(
+                    req,
+                    || compute_record().map(|(record, _)| record),
+                    validate_record,
+                )?
+            } else {
+                resolve_or_compute_json_artifact_with_dependencies(
+                    req,
+                    compute_record,
+                    validate_record,
+                )?
+            };
             result.value.source_dependencies = identities;
             result.value.request = request.clone();
             Ok(result)
@@ -878,7 +888,16 @@ fn validate_root_window(r: &RootWindowData, roots: &RetainedRoots) -> Result<()>
     // Replay cheap finite statistics from the admitted source points. A matching
     // count total or recognized status alone does not authenticate a conclusion.
     let expected = root_window_data(roots)?;
-    if r != &expected {
+    let mut comparable = r.clone();
+    // Older migrated summaries retain the seed dataset's attribution here.
+    // It is producer provenance, not a consumed value. Keep every acquisition
+    // decision, source schema, point and finite statistic in the replay check.
+    comparable
+        .source_acquisition
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("root acquisition must be an object"))?
+        .remove("reference_dataset");
+    if comparable != expected {
         bail!("root_window summary disagrees with source replay");
     }
     Ok(())
@@ -1169,7 +1188,8 @@ fn transforms_with_guard_limit(
             for (row, input) in r.rows.iter().zip(&dataset.points) {
                 if row.ordinal != input.ordinal
                     || row.source_status != input.source_status
-                    || row.t != input.value
+                    || row.t.as_deref().map(canonical_decimal).transpose()?
+                        != input.value.as_deref().map(canonical_decimal).transpose()?
                     || row.newton_remainder
                         != "not_bounded; local_Newton_diagnostic_not_a_zero_error_certificate"
                 {
@@ -1933,12 +1953,27 @@ impl ResearchInputs {
 }
 fn admitted_reference(
     result: ArtifactExecutionCacheResult<ResearchRecord<ReferenceData>>,
+    cache: &ArtifactCacheContext<'_>,
 ) -> Result<RetainedReference> {
     let m = result
         .produced_manifest
         .or(result.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("reference capture requires a managed manifest"))?;
-    let bytes = serde_json::to_vec(&result.value)?;
+    let mut bytes = serde_json::to_vec(&result.value)?;
+    if ContentDigest::sha256(&bytes) != m.content_digest {
+        // JSON field order and whitespace are not preserved by typed decoding.
+        // Authenticate the original cache bytes, never a reserialization
+        // against the original byte digest.
+        let resolver = cache.resolver.ok_or_else(|| {
+            anyhow::anyhow!("reference capture requires its original authenticated payload")
+        })?;
+        let policy = cache.acceptance.ok_or_else(|| {
+            anyhow::anyhow!("reference capture requires a cache admission policy")
+        })?;
+        bytes = resolver
+            .resolve_exact(&m.key, &m.content_digest, m.quality, policy)?
+            .payload;
+    }
     RetainedReference::from_payload(&m, &bytes, std::slice::from_ref(&m.content_digest))
 }
 pub fn capture_configured_projection(
@@ -1947,11 +1982,11 @@ pub fn capture_configured_projection(
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<CapturedDiagnostic> {
     input.validate()?;
-    let reference = admitted_reference(capture_reference(&input.reference, cache)?)?;
+    let reference = admitted_reference(capture_reference(&input.reference, cache)?, cache)?;
     let basis = input
         .basis
         .iter()
-        .map(|b| admitted_reference(capture_reference(b, cache)?))
+        .map(|b| admitted_reference(capture_reference(b, cache)?, cache))
         .collect::<Result<Vec<_>>>()?;
     Ok(CapturedDiagnostic::from_cached(capture_projection(
         state,

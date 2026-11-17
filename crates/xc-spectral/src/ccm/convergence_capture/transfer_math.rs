@@ -146,8 +146,8 @@ fn calculate(
         .map_or(0, i64::from);
     let mut residual_exponent = None;
     for i in 0..n {
-        for j in 0..n {
-            if !s.coefficients[j].is_zero() {
+        for (j, coefficient) in s.coefficients.iter().enumerate() {
+            if !coefficient.is_zero() {
                 update_exponent(&shifted(i, j)?, &mut residual_exponent)?
             }
         }

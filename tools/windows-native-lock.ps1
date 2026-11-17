@@ -3,7 +3,7 @@ function Get-XcWindowsDependencyLock {
     param([string]$Path = (Join-Path $PSScriptRoot 'windows-dependencies.json'))
     $lock = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
     if ($lock.schema_version -ne 1 -or $lock.target -ne 'x86_64-pc-windows-gnu' -or
-        $lock.rust_version -ne '1.99.1' -or $lock.packages.Count -eq 0 -or $lock.native_files.Count -eq 0 -or
+        $lock.rust_version -ne '1.100.0' -or $lock.packages.Count -eq 0 -or $lock.native_files.Count -eq 0 -or
         $lock.package_base_url -ne 'https://repo.msys2.org/mingw/ucrt64/') {
         throw 'Unsupported native Windows dependency lock.'
     }
@@ -16,7 +16,7 @@ function Get-XcWindowsDependencyLock {
         }
     }
     foreach ($file in $lock.native_files) {
-        if ($file.path -notmatch '^(bin|include|lib/gcc|x86_64-w64-mingw32/bin)/[A-Za-z0-9_./+-]+$' -or
+        if ($file.path -notmatch '^(bin|include|lib/gcc|lib/rustlib/x86_64-pc-windows-gnu/lib|x86_64-w64-mingw32/bin)/[A-Za-z0-9_./+-]+$' -or
             $file.path -match '(^|/)\.\.(/|$)' -or $file.sha256 -notmatch '^[a-f0-9]{64}$') {
             throw 'Malformed native Windows file binding.'
         }
@@ -30,7 +30,7 @@ function Assert-XcWindowsNativeFiles {
         $path = Join-Path $Prefix $file.path
         if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
             (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $file.sha256) {
-            throw "Native dependency differs from the qualified v0.17.1 build: $($file.path). Use a fresh pinned bootstrap or requalify the changed toolchain."
+            throw "Native dependency differs from the qualified v$($Lock.toolkit_version) build: $($file.path). Use a fresh pinned bootstrap or requalify the changed toolchain."
         }
     }
 }

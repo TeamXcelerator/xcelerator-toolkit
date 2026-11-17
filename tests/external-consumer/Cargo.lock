@@ -640,13 +640,12 @@ dependencies = [
 
 [[package]]
 name = "xc-cache"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "flate2",
  "fs2",
  "getrandom",
  "miniz_oxide",
- "rayon",
  "serde",
  "serde_json",
  "sha2",
@@ -656,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "xc-certify"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "rug",
  "serde",
@@ -668,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "xc-core"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -677,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "xc-numerics"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "anyhow",
  "num-bigint",
@@ -695,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "xc-operator"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "rayon",
  "rug",
@@ -706,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "xc-root"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "num-bigint",
  "rayon",
@@ -719,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "xc-solver"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "matrixmultiply",
  "nalgebra",
@@ -736,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "xc-spectral"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "anyhow",
  "cc",
@@ -764,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "xc-zeta"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "anyhow",
  "rug",

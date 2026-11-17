@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -20,6 +20,8 @@ use xc_core::{CancellationToken, ResourcePolicy};
 
 const GIT_REVISION_METADATA_RESERVATION_BYTES: u64 = 512 * 1024;
 const DEFAULT_IMMUTABLE_DIGEST_BLOB_LIMIT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+mod metadata;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PublicationPackPolicy {
@@ -86,6 +88,33 @@ struct FlatGitTreeNode {
 }
 
 type VerifiedDigestCache = BTreeMap<(PathBuf, String, u64), (ContentDigest, LooseObjectStamp)>;
+type MetadataReadCache = BTreeMap<(String, String, String), (Arc<Vec<u8>>, ContentDigest)>;
+#[derive(Debug, Default)]
+struct MetadataReadMemo {
+    entries: MetadataReadCache,
+    absent: BTreeSet<(String, String, String)>,
+    bytes: u64,
+}
+
+/// Immutable, repository/revision/path-bound metadata retained for one run.
+/// Independent Git sessions share bytes, never mutable indexes or ref answers.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PublicationMetadataCache(Arc<Mutex<MetadataReadMemo>>);
+
+fn is_cache_metadata_path(path: &str) -> bool {
+    path == "registry.json"
+        || (path.ends_with(".json")
+            && [
+                "manifests/",
+                "indexes/",
+                "revocations/indexes/",
+                "transactions/batches/",
+                "families/",
+                "shards/",
+            ]
+            .iter()
+            .any(|prefix| path.starts_with(prefix)))
+}
 #[derive(Debug)]
 pub struct GitCliRemoteStore {
     git_executable: OsString,
@@ -110,6 +139,9 @@ pub struct GitCliRemoteStore {
     /// collectively overcommit.
     disk_reservations: Arc<Mutex<DiskReservationState>>,
     verified_blob_digests: Mutex<VerifiedDigestCache>,
+    metadata_reads: Arc<Mutex<MetadataReadMemo>>,
+    #[cfg(test)]
+    disk_scans: std::sync::atomic::AtomicU64,
     metrics: crate::publication_metrics::PublicationMetrics,
 }
 
@@ -305,6 +337,9 @@ impl GitCliRemoteStore {
             resolved_blob_oids: Mutex::new(BTreeMap::new()),
             disk_reservations: Arc::new(Mutex::new(DiskReservationState::default())),
             verified_blob_digests: Mutex::new(BTreeMap::new()),
+            metadata_reads: Arc::new(Mutex::new(MetadataReadMemo::default())),
+            #[cfg(test)]
+            disk_scans: std::sync::atomic::AtomicU64::new(0),
             metrics: crate::publication_metrics::PublicationMetrics::default(),
         };
         if store.author_name.trim().is_empty() || store.author_email.trim().is_empty() {
@@ -478,7 +513,15 @@ impl GitCliRemoteStore {
         unreachable!("bounded CAS push retry loop always returns")
     }
     pub fn with_resource_policy(mut self, resources: ResourcePolicy) -> Self {
-        self.resources = resources;
+        self.set_resource_policy(resources);
+        self
+    }
+
+    pub(crate) fn with_publication_metadata_cache(
+        mut self,
+        cache: &PublicationMetadataCache,
+    ) -> Self {
+        self.metadata_reads = Arc::clone(&cache.0);
         self
     }
 
@@ -513,6 +556,8 @@ impl GitCliRemoteStore {
 
     pub(crate) fn set_resource_policy(&mut self, resources: ResourcePolicy) {
         self.resources = resources;
+        // Detach a changed policy from any invocation-wide memo.
+        self.metadata_reads = Arc::new(Mutex::new(MetadataReadMemo::default()));
     }
 
     /// Explicit cleanup after a receipt-complete or deliberately abandoned
@@ -547,6 +592,21 @@ impl GitCliRemoteStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|(cached_repository, _, _), _| cached_repository != repository);
+        if Arc::strong_count(&self.metadata_reads) == 1 {
+            let mut memo = self
+                .metadata_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            memo.entries
+                .retain(|(cached_repository, _, _), _| cached_repository != repository);
+            memo.absent
+                .retain(|(cached_repository, _, _)| cached_repository != repository);
+            memo.bytes = memo
+                .entries
+                .values()
+                .map(|(bytes, _)| bytes.len() as u64)
+                .sum();
+        }
         Ok(())
     }
 
@@ -578,6 +638,14 @@ impl GitCliRemoteStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // Shared immutable bytes outlive physical preflight sessions, and are
+        // released with the run owner. Standalone cleanup still evicts its memo.
+        if Arc::strong_count(&self.metadata_reads) == 1 {
+            *self
+                .metadata_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = MetadataReadMemo::default();
+        }
         self.repository_operation_locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -713,6 +781,9 @@ impl GitCliRemoteStore {
             .disk_reservations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(test)]
+        self.disk_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let measured_bytes = directory_size_bytes(&self.disk_accounting_root)?;
         if reserved.in_flight_bytes == 0 {
             reserved.baseline_bytes = measured_bytes;
@@ -905,6 +976,14 @@ impl GitCliRemoteStore {
                 .and_modify(|maximum| *maximum = (*maximum).min(effective_maximum))
                 .or_insert(effective_maximum);
         }
+        if self.metadata_prefetch_is_cached(
+            repository,
+            revision,
+            &requested_paths,
+            allow_missing,
+        )? {
+            return Ok(());
+        }
 
         // Object-database mutations are serialized per repository. Separate
         // immutable shards may prepare concurrently without sharing a Git
@@ -1020,11 +1099,12 @@ impl GitCliRemoteStore {
         }
 
         let requested_objects = objects.keys().cloned().collect::<Vec<_>>();
-        let present = present_blob_objects(&self.git_executable, &session, &requested_objects)?;
+        let mut measured =
+            metadata::local_blob_sizes(&self.git_executable, &session, &requested_objects)?;
         let mut missing = Vec::new();
         let mut projected_bytes = 0u64;
         for (object_id, size_bytes) in objects {
-            if present.contains(&object_id) {
+            if measured.contains_key(&object_id) {
                 continue;
             }
             projected_bytes = projected_bytes.checked_add(size_bytes).ok_or_else(|| {
@@ -1048,10 +1128,10 @@ impl GitCliRemoteStore {
             arguments.extend(object_ids.iter().map(OsString::from));
             run_git_network(&self.git_executable, Some(&session), arguments, &[])?;
         }
-        let hydrated = present_blob_objects(&self.git_executable, &session, &missing)?;
+        let hydrated = metadata::local_blob_sizes(&self.git_executable, &session, &missing)?;
         if let Some(object_id) = missing
             .iter()
-            .find(|object_id| !hydrated.contains(*object_id))
+            .find(|object_id| !hydrated.contains_key(*object_id))
         {
             return Err(CacheError::Io(format!(
                 "git fetch reported success but blob {object_id} is still absent from the session"
@@ -1060,7 +1140,7 @@ impl GitCliRemoteStore {
         // Validate every requested object, including objects already present.
         // Prefetch is successful only if each declared limit and the total
         // admitted payload budget hold after hydration.
-        let mut measured = BTreeMap::new();
+        measured.extend(hydrated);
         for (path, maximum) in &requested_paths {
             if absent.contains(path) {
                 continue;
@@ -1068,7 +1148,14 @@ impl GitCliRemoteStore {
             let mut object = self
                 .cached_blob_object(repository, revision, path)
                 .ok_or_else(|| CacheError::Io("prefetched object identity disappeared".into()))?;
-            let size = self.local_blob_size(&session, &object.object_id, *maximum)?;
+            let size = *measured
+                .get(&object.object_id)
+                .ok_or_else(|| CacheError::Io("prefetched blob size is missing".into()))?;
+            if size > *maximum || size >= crate::GITHUB_HARD_FILE_BOUNDARY_BYTES {
+                return Err(CacheError::ResourceLimit(
+                    "prefetched blob exceeds its read limit".into(),
+                ));
+            }
             if object.size_bytes.is_some_and(|expected| expected != size) {
                 return Err(CacheError::InvalidManifest(
                     "prefetched blob size changed".into(),
@@ -1094,6 +1181,17 @@ impl GitCliRemoteStore {
         // Git manages its network pack exchange internally. These are payload
         // admission and temporary-disk checks, not a byte-exact network quota.
         self.enforce_transport_disk_budget(0)?;
+        for path in &absent {
+            self.remember_metadata_absence(repository, revision, path);
+        }
+        self.prefetch_metadata_bytes(
+            &session,
+            repository,
+            revision,
+            &requested_paths,
+            &absent,
+            cancellation,
+        )?;
         Ok(())
     }
 
@@ -2020,6 +2118,7 @@ impl GitCliRemoteStore {
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(session)
+            .arg("--git-dir=.")
             .args(["cat-file", "blob"])
             .arg(object_id)
             .env("GIT_NO_LAZY_FETCH", "1")
@@ -2201,8 +2300,61 @@ impl RemoteGitStore for GitCliRemoteStore {
             .session_gate
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        validate_repository(repository)?;
+        validate_revision(revision)?;
+        validate_relative_git_path(path)?;
+        let memo_key = (repository.to_owned(), revision.to_owned(), path.to_owned());
+        let cached = self
+            .metadata_reads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get(&memo_key)
+            .cloned();
+        if let Some((bytes, digest)) = cached {
+            let limit =
+                maximum_bytes.min(self.resources.maximum_transfer_bytes.unwrap_or(u64::MAX));
+            if bytes.len() as u64 > limit
+                || limit == 0
+                || self.resources.maximum_memory_bytes == Some(0)
+            {
+                return Err(CacheError::ResourceLimit(
+                    "cached Git metadata exceeds the read resource limit".into(),
+                ));
+            }
+            if self
+                .unusable_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&self.session_path(repository))
+            {
+                return Err(CacheError::Io("Git metadata session is unusable".into()));
+            }
+            // Returning immutable bytes from memory cannot grow disk usage.
+            // Growth reservations and post-fetch accounting remain at writes.
+            writer.write_all(&bytes)?;
+            return Ok(crate::RemoteReadReport {
+                repository_path: path.to_owned(),
+                revision: revision.to_owned(),
+                size_bytes: bytes.len() as u64,
+                content_digest: digest,
+            });
+        }
+        if self
+            .metadata_reads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .absent
+            .contains(&memo_key)
+        {
+            self.require_usable_session(&self.session_path(repository))?;
+            return Err(CacheError::NotFound(format!(
+                "remote path {path:?} at {revision}"
+            )));
+        }
         let Some((session, mut object)) = self.resolve_blob_object(repository, revision, path)?
         else {
+            self.remember_metadata_absence(repository, revision, path);
             return Err(CacheError::NotFound(format!(
                 "remote path {path:?} at {revision}"
             )));
@@ -2239,9 +2391,23 @@ impl RemoteGitStore for GitCliRemoteStore {
                 "remote path {path:?} requires {size_bytes} bytes above the {effective_maximum}-byte limit"
             )));
         }
+        // Only small, immutable metadata is retained. Numerical payloads never
+        // enter this memo. Readers still deserialize and validate each document
+        // at the exact repository/revision/path; changed refs cannot hit it.
+        let memo_budget = (self
+            .resources
+            .maximum_memory_bytes
+            .unwrap_or(256 * 1024 * 1024)
+            / 8)
+        .min(32 * 1024 * 1024);
+        let mut retained = (memo_budget >= 64 * 1024
+            && is_cache_metadata_path(path)
+            && size_bytes <= (1024 * 1024).min(memo_budget))
+        .then(|| Vec::with_capacity(size_bytes as usize));
         let mut child = git_command(&self.git_executable)
             .arg("-C")
             .arg(&session)
+            .arg("--git-dir=.")
             .args(["cat-file", "blob"])
             .arg(&object.object_id)
             .stdout(Stdio::piped())
@@ -2281,6 +2447,14 @@ impl RemoteGitStore for GitCliRemoteStore {
                 }
                 hasher.update(&buffer[..count]);
                 writer.write_all(&buffer[..count])?;
+                if retained.as_ref().is_some_and(|bytes| {
+                    bytes.len().saturating_add(count) as u64 > (1024 * 1024).min(memo_budget)
+                }) {
+                    retained = None;
+                }
+                if let Some(retained) = &mut retained {
+                    retained.extend_from_slice(&buffer[..count]);
+                }
             }
             Ok((
                 size_bytes,
@@ -2298,6 +2472,24 @@ impl RemoteGitStore for GitCliRemoteStore {
             )));
         }
         self.enforce_transport_disk_budget(0)?;
+        if let Some(bytes) = retained {
+            let mut memo = self
+                .metadata_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if memo.bytes.saturating_add(bytes.len() as u64) > memo_budget
+                || memo.entries.len() + memo.absent.len() >= 4096
+            {
+                *memo = MetadataReadMemo::default();
+            }
+            if let Some((old, _)) = memo
+                .entries
+                .insert(memo_key, (Arc::new(bytes), content_digest.clone()))
+            {
+                memo.bytes = memo.bytes.saturating_sub(old.len() as u64);
+            }
+            memo.bytes += size_bytes;
+        }
         Ok(crate::RemoteReadReport {
             repository_path: path.to_owned(),
             revision: revision.to_owned(),
@@ -2356,6 +2548,7 @@ impl RemoteGitStore for GitCliRemoteStore {
         let mut child = git_command(&self.git_executable)
             .arg("-C")
             .arg(&session)
+            .arg("--git-dir=.")
             .args(["ls-tree", "-r", "-z", "--name-only"])
             .arg(revision)
             .arg("--")
@@ -2899,7 +3092,10 @@ where
     // continue to work for explicit authenticated operations.
     command.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(directory) = directory {
-        command.arg("-C").arg(directory);
+        // Every transport session is a bare repository. Selecting it explicitly
+        // avoids Git's parent discovery, which can skip a long Windows path
+        // even with core.longpaths enabled and select an enclosing checkout.
+        command.arg("-C").arg(directory).arg("--git-dir=.");
     }
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     let operation = match arguments.first().and_then(|value| value.to_str()) {
@@ -3104,7 +3300,7 @@ where
 {
     let mut command = git_command(executable);
     if let Some(directory) = directory {
-        command.arg("-C").arg(directory);
+        command.arg("-C").arg(directory).arg("--git-dir=.");
     }
     command.args(arguments);
     for (key, value) in environment {
@@ -3236,50 +3432,6 @@ fn parse_ls_tree_blob_object(
     })
 }
 
-/// Return the subset of `object_ids` that exist locally as blobs, using one
-/// `git cat-file --batch-check` process for the whole set instead of one
-/// process per object.
-fn present_blob_objects(
-    git_executable: &OsStr,
-    session: &Path,
-    object_ids: &[String],
-) -> Result<BTreeSet<String>, CacheError> {
-    let mut present = BTreeSet::new();
-    if object_ids.is_empty() {
-        return Ok(present);
-    }
-    for batch in object_ids.chunks(4096) {
-        let mut input = Vec::new();
-        for object_id in batch {
-            validate_revision(object_id)?;
-            input.extend_from_slice(object_id.as_bytes());
-            input.push(b'\n');
-        }
-        let output = run_git_with_input(
-            git_executable,
-            Some(session),
-            [OsString::from("cat-file"), OsString::from("--batch-check")],
-            &[],
-            &input,
-        )?;
-        let stdout = std::str::from_utf8(&output.stdout).map_err(|error| {
-            CacheError::Io(format!(
-                "git cat-file --batch-check returned non-UTF8: {error}"
-            ))
-        })?;
-        for line in stdout.lines() {
-            let mut fields = line.split_whitespace();
-            let (Some(object_id), Some(kind)) = (fields.next(), fields.next()) else {
-                continue;
-            };
-            if kind == "blob" {
-                present.insert(object_id.to_owned());
-            }
-        }
-    }
-    Ok(present)
-}
-
 fn parse_ls_tree_blob_objects(
     bytes: &[u8],
 ) -> Result<BTreeMap<String, ResolvedBlobObject>, CacheError> {
@@ -3405,7 +3557,11 @@ pub(crate) fn directory_size_bytes(path: &Path) -> Result<u64, CacheError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error.into()),
     };
-    if metadata.file_type().is_symlink() {
+    directory_size_with_metadata(path, &metadata)
+}
+
+fn directory_size_with_metadata(path: &Path, metadata: &fs::Metadata) -> Result<u64, CacheError> {
+    if staged_metadata_is_link(metadata) {
         return Ok(0);
     }
     if metadata.is_file() {
@@ -3423,13 +3579,41 @@ pub(crate) fn directory_size_bytes(path: &Path) -> Result<u64, CacheError> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
+        // On Windows DirEntry carries the metadata returned by directory
+        // enumeration. Reopening every file here makes the shared disk-budget
+        // check dominate publication metadata reads. This still measures every
+        // entry on each check and never follows symlinks or reparse points.
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         total = total
-            .checked_add(directory_size_bytes(&entry.path())?)
+            .checked_add(directory_size_with_metadata(&entry.path(), &metadata)?)
             .ok_or_else(|| {
                 CacheError::ResourceLimit("Git transport directory size exceeds u64".to_owned())
             })?;
     }
     Ok(total)
+}
+
+#[test]
+fn directory_accounting_measures_nested_files_and_observes_changes() {
+    let root = crate::test_support::temporary_root("disk-accounting-enumeration");
+    fs::create_dir_all(root.join("nested/empty")).unwrap();
+    fs::write(root.join("first"), [1u8; 19]).unwrap();
+    fs::write(root.join("nested/second"), [2u8; 31]).unwrap();
+    assert_eq!(directory_size_bytes(&root).unwrap(), 50);
+    fs::write(root.join("nested/second"), [2u8; 60]).unwrap();
+    assert_eq!(directory_size_bytes(&root).unwrap(), 79);
+    fs::remove_file(root.join("first")).unwrap();
+    assert_eq!(directory_size_bytes(&root).unwrap(), 60);
+    assert_eq!(directory_size_bytes(&root.join("absent")).unwrap(), 0);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&root, root.join("nested/loop")).unwrap();
+        assert_eq!(directory_size_bytes(&root).unwrap(), 60);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3468,6 +3652,94 @@ mod tests {
     use super::*;
 
     use crate::test_support::temporary_root;
+
+    #[test]
+    fn explicit_git_session_never_discovers_a_parent_repository() {
+        let root = temporary_root("git-explicit-session-parent");
+        let parent = root.join("parent");
+        fs::create_dir_all(&parent).unwrap();
+        assert!(test_git(Some(&parent), &["init"]));
+        assert!(test_git(
+            Some(&parent),
+            &["remote", "add", "origin", "file:///parent-fixture.git"]
+        ));
+        let child = parent.join("empty-session");
+        fs::create_dir_all(&child).unwrap();
+        let result = run_git_allow_failure(
+            OsStr::new("git"),
+            Some(&child),
+            ["remote", "get-url", "origin"].map(OsString::from),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !result.status.success(),
+            "an empty session must not discover its parent"
+        );
+        assert_eq!(
+            test_git_stdout(Some(&parent), &["remote", "get-url", "origin"]),
+            "file:///parent-fixture.git"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn git_transport_binds_long_bare_sessions_without_repository_discovery() {
+        let root = temporary_root("git-long-explicit-session");
+        let repository = "https://example.invalid/fixture.git";
+        for length in [210, 235, 248] {
+            let mut transport = root.join(format!("case-{length}"));
+            // session_path appends one separator, a 64-character digest and
+            // another separator followed by remote.git.
+            let target_length = length - 1 - 64 - 1 - "remote.git".len();
+            while transport.as_os_str().len() + 51 < target_length {
+                transport.push("d".repeat(50));
+            }
+            transport.push("p".repeat(target_length - transport.as_os_str().len() - 1));
+            let store = GitCliRemoteStore::new(
+                transport,
+                root.join("staging"),
+                "Fixture",
+                "fixture@example.invalid",
+            )
+            .unwrap();
+            let session = store.ensure_session(repository).unwrap();
+            assert_eq!(session.as_os_str().len(), length);
+            assert_eq!(store.ensure_session(repository).unwrap(), session);
+            let origin = run_git(
+                OsStr::new("git"),
+                Some(&session),
+                ["remote", "get-url", "origin"].map(OsString::from),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(String::from_utf8(origin.stdout).unwrap().trim(), repository);
+            let payload = b"explicit long-path session payload";
+            let written = run_git_with_input(
+                OsStr::new("git"),
+                Some(&session),
+                ["hash-object", "-w", "--stdin"].map(OsString::from),
+                &[],
+                payload,
+            )
+            .unwrap();
+            let object = String::from_utf8(written.stdout).unwrap().trim().to_owned();
+            assert_eq!(
+                store
+                    .digest_local_blob(&session, &object, payload.len() as u64)
+                    .unwrap(),
+                ContentDigest::sha256(payload)
+            );
+            let read = run_git(
+                OsStr::new("git"),
+                Some(&session),
+                ["cat-file", "blob", &object].map(OsString::from),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(read.stdout, payload);
+        }
+    }
 
     #[test]
     #[cfg(windows)]
@@ -3762,8 +4034,8 @@ mod tests {
         .unwrap();
         let object_id = String::from_utf8(written.stdout).unwrap().trim().to_owned();
         let object_ids = vec![object_id.clone(); 500];
-        let present = present_blob_objects(OsStr::new("git"), &root, &object_ids).unwrap();
-        assert_eq!(present, BTreeSet::from([object_id]));
+        let present = metadata::local_blob_sizes(OsStr::new("git"), &root, &object_ids).unwrap();
+        assert_eq!(present, BTreeMap::from([(object_id, 19)]));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3883,6 +4155,275 @@ mod tests {
         assert!(make()
             .with_exact_staged_part_sources([(root.join("outside"), part)])
             .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_read_memo_is_commit_bound_bounded_and_cleared_with_session() {
+        if !test_git(None, &["--version"]) {
+            return;
+        }
+        let root = temporary_root("git-metadata-memo");
+        let seed = root.join("seed");
+        assert!(test_git(None, &["init", seed.to_str().unwrap()]));
+        assert!(test_git(Some(&seed), &["config", "user.name", "Test"]));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.email", "test@example.invalid"]
+        ));
+        fs::create_dir_all(seed.join("indexes/family")).unwrap();
+        fs::create_dir_all(seed.join("objects")).unwrap();
+        let path = "indexes/family/aa.json";
+        fs::write(seed.join(path), b"first metadata").unwrap();
+        fs::write(
+            seed.join("indexes/family/large.json"),
+            vec![b'x'; 70 * 1024],
+        )
+        .unwrap();
+        fs::write(seed.join("objects/payload.json"), b"numerical payload").unwrap();
+        assert!(test_git(Some(&seed), &["add", "."]));
+        assert!(test_git(Some(&seed), &["commit", "-m", "first"]));
+        let first = test_git_stdout(Some(&seed), &["rev-parse", "HEAD"]);
+        fs::write(seed.join(path), b"second metadata").unwrap();
+        assert!(test_git(Some(&seed), &["commit", "-am", "second"]));
+        let second = test_git_stdout(Some(&seed), &["rev-parse", "HEAD"]);
+        let repository = seed.to_string_lossy().into_owned();
+        let mut store = GitCliRemoteStore::new(
+            root.join("transport"),
+            root.join("staging"),
+            "Test",
+            "test@example.invalid",
+        )
+        .unwrap();
+        let read = |store: &GitCliRemoteStore,
+                    revision: &str,
+                    path: &str,
+                    limit,
+                    cancellation: &CancellationToken| {
+            let mut bytes = Vec::new();
+            let report = store.read_committed_path(
+                &repository,
+                revision,
+                path,
+                limit,
+                cancellation,
+                &mut bytes,
+            )?;
+            assert_eq!(report.content_digest, ContentDigest::sha256(&bytes));
+            Ok::<_, CacheError>(bytes)
+        };
+        let token = CancellationToken::new();
+        assert_eq!(
+            read(&store, &first, path, 1024, &token).unwrap(),
+            b"first metadata"
+        );
+        assert_eq!(
+            read(&store, &second, path, 1024, &token).unwrap(),
+            b"second metadata"
+        );
+        read(&store, &first, "objects/payload.json", 1024, &token).unwrap();
+        assert_eq!(store.metadata_reads.lock().unwrap().entries.len(), 2);
+        let git = store.git_executable.clone();
+        store.git_executable = root.join("missing-git.exe").into_os_string();
+        let scans = store.disk_scans.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            read(&store, &first, path, 1024, &token).unwrap(),
+            b"first metadata",
+            "repeated immutable metadata reads must not spawn Git"
+        );
+        assert_eq!(
+            store.disk_scans.load(std::sync::atomic::Ordering::Relaxed),
+            scans,
+            "memory hits must not scan the temporary filesystem"
+        );
+        assert!(matches!(
+            read(&store, &first, path, 1, &token),
+            Err(CacheError::ResourceLimit(_))
+        ));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel(xc_core::CancellationReason::UserRequested);
+        assert!(matches!(
+            read(&store, &first, path, 1024, &cancelled),
+            Err(CacheError::Cancelled(_))
+        ));
+        assert!(
+            read(&store, &first, "objects/payload.json", 1024, &token).is_err(),
+            "payload objects are never memoized"
+        );
+        assert!(store
+            .read_committed_path(
+                "different-repository",
+                &first,
+                path,
+                1024,
+                &token,
+                &mut Vec::new()
+            )
+            .is_err());
+        store.cleanup_session(&repository).unwrap();
+        assert!(store.metadata_reads.lock().unwrap().entries.is_empty());
+        assert!(read(&store, &first, path, 1024, &token).is_err());
+        store.git_executable = git;
+        store.set_resource_policy(ResourcePolicy {
+            maximum_memory_bytes: Some(512 * 1024),
+            ..ResourcePolicy::default()
+        });
+        read(
+            &store,
+            &first,
+            "indexes/family/large.json",
+            128 * 1024,
+            &token,
+        )
+        .unwrap();
+        assert!(
+            store.metadata_reads.lock().unwrap().entries.is_empty(),
+            "documents larger than the configured memo budget are streamed only"
+        );
+        store.cleanup_all_sessions().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publication_metadata_survives_session_cleanup_and_batches_cold_reads() {
+        let root = temporary_root("shared-metadata");
+        let seed = root.join("seed");
+        assert!(test_git(None, &["init", seed.to_str().unwrap()]));
+        assert!(test_git(Some(&seed), &["config", "user.name", "Test"]));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.email", "test@example.invalid"]
+        ));
+        let paths = [
+            "registry.json",
+            "families/f.json",
+            "shards/s.json",
+            "indexes/f/aa.json",
+            "manifests/aa/m.json",
+            "transactions/batches/t.json",
+            "objects/payload.json",
+        ];
+        for path in paths {
+            let file = seed.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, path.as_bytes()).unwrap();
+        }
+        assert!(test_git(Some(&seed), &["add", "."]));
+        assert!(test_git(Some(&seed), &["commit", "-m", "metadata"]));
+        let revision = test_git_stdout(Some(&seed), &["rev-parse", "HEAD"]);
+        let repository = seed.to_str().unwrap();
+        let cache = PublicationMetadataCache::default();
+        let first = GitCliRemoteStore::new(
+            root.join("first"),
+            root.join("staging"),
+            "Test",
+            "test@example.invalid",
+        )
+        .unwrap()
+        .with_publication_metadata_cache(&cache);
+        let token = CancellationToken::new();
+        let mut requests = paths
+            .iter()
+            .map(|p| crate::RemotePathPrefetch {
+                repository_path: (*p).into(),
+                maximum_bytes: 1024,
+            })
+            .collect::<Vec<_>>();
+        requests.push(crate::RemotePathPrefetch {
+            repository_path: "indexes/f/missing.json".into(),
+            maximum_bytes: 1024,
+        });
+        first
+            .prefetch_present_committed_paths(repository, &revision, &requests, &token)
+            .unwrap();
+        assert_eq!(
+            cache.0.lock().unwrap().entries.len(),
+            6,
+            "cold prefetch must batch-read all metadata categories, excluding numerical objects"
+        );
+        first.cleanup_all_sessions().unwrap();
+        let mut second = GitCliRemoteStore::new(
+            root.join("second"),
+            root.join("staging2"),
+            "Test",
+            "test@example.invalid",
+        )
+        .unwrap()
+        .with_publication_metadata_cache(&cache);
+        second.git_executable = root.join("no-git.exe").into_os_string();
+        for path in &paths[..6] {
+            let mut bytes = Vec::new();
+            let report = second
+                .read_committed_path(repository, &revision, path, 1024, &token, &mut bytes)
+                .unwrap();
+            assert_eq!(bytes, path.as_bytes());
+            assert_eq!(report.content_digest, ContentDigest::sha256(&bytes));
+        }
+        requests.retain(|p| !p.repository_path.starts_with("objects/"));
+        second
+            .prefetch_present_committed_paths(repository, &revision, &requests, &token)
+            .unwrap();
+        assert!(matches!(
+            second.prefetch_committed_paths(repository, &revision, &requests, &token),
+            Err(CacheError::NotFound(_))
+        ));
+        assert!(matches!(
+            second.read_committed_path(
+                repository,
+                &revision,
+                "indexes/f/missing.json",
+                1024,
+                &token,
+                &mut Vec::new()
+            ),
+            Err(CacheError::NotFound(_))
+        ));
+        assert_eq!(
+            second.disk_scans.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(
+            !second.session_path(repository).exists(),
+            "shared metadata reuse must not recreate a Git session"
+        );
+        assert!(second
+            .read_committed_path(
+                repository,
+                &"a".repeat(40),
+                paths[0],
+                1024,
+                &token,
+                &mut Vec::new()
+            )
+            .is_err());
+        second
+            .unusable_sessions
+            .lock()
+            .unwrap()
+            .insert(second.session_path(repository));
+        assert!(matches!(
+            second.read_committed_path(
+                repository,
+                &revision,
+                paths[0],
+                1024,
+                &token,
+                &mut Vec::new()
+            ),
+            Err(CacheError::Io(_))
+        ));
+        assert!(matches!(
+            second.read_committed_path(
+                repository,
+                &revision,
+                "indexes/f/missing.json",
+                1024,
+                &token,
+                &mut Vec::new()
+            ),
+            Err(CacheError::Io(_))
+        ));
+        second.cleanup_all_sessions().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

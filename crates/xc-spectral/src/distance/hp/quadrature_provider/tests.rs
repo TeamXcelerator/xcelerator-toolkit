@@ -122,6 +122,17 @@ fn trap(steps: usize) -> WeightedIntegrationRule {
     }
 }
 
+fn declare_value_contract(spec: &mut crate::target::TargetProfileSpec) {
+    spec.schema_version = 4;
+    let external = spec.external_profile.as_mut().unwrap();
+    external.value_contract = Some(crate::target::ExternalTargetValueContract {
+        schema_version: 1,
+        value_semantics: "synthetic-identity-with-injected-failures-v1".into(),
+        normalization: "unit-at-one".into(),
+        numerical_input_digest: xc_cache::canonical_digest(&external.input).unwrap(),
+    });
+}
+
 fn rendered(
     result: Result<WeightedGridValueHp>,
 ) -> std::result::Result<(u32, String, bool), String> {
@@ -850,15 +861,21 @@ fn profile_provider_complete_payloads_and_order() {
     let rules = [trap(16)];
     let owner = xc_core::RunResources::with_worker_limit(1 << 28, 16).unwrap();
     let _scope = owner.enter();
-    for workers in [1, 8, 16] {
+    for (schema, workers) in [3, 4]
+        .into_iter()
+        .flat_map(|schema| [1, 8, 16].map(|workers| (schema, workers)))
+    {
         configure(
             &root,
             &executable,
-            &format!("profile-{workers}"),
+            &format!("profile-{schema}-{workers}"),
             None,
             Some("2.5"),
         );
         let mut spec = crate::target::TargetProfileSpec::from_environment().unwrap();
+        if schema == 4 {
+            declare_value_contract(&mut spec);
+        }
         spec.auxiliary_series = Some(crate::target::GaussianPolynomialSeriesSpec {
             term_input_power: 0,
             polynomial_coefficients: vec!["0".into(), "1".into()],
@@ -869,7 +886,7 @@ fn profile_provider_complete_payloads_and_order() {
             maximum_terms: 1000,
         });
         fs::write(root.join("target.json"), serde_json::to_vec(&spec).unwrap()).unwrap();
-        let digest = spec.digest().unwrap();
+        let digest = spec.base_value_digest().unwrap();
         std::env::set_var("XC_TARGET_PROVIDER_PURE", "0");
         let distances = rules
             .iter()
@@ -924,13 +941,13 @@ fn profile_provider_complete_payloads_and_order() {
         assert_eq!(
             residual().unwrap(),
             expected,
-            "complete residual workers={workers}"
+            "complete residual schema={schema} workers={workers}"
         );
         assert_eq!(
             serde_json::to_vec(&compute_deviation_decomposition_payload(&profile, p).unwrap())
                 .unwrap(),
             expected_deviation,
-            "complete deviation workers={workers}"
+            "complete deviation schema={schema} workers={workers}"
         );
         assert_eq!(owner.usage().working_bytes, 0);
     }
@@ -983,6 +1000,70 @@ fn profile_provider_complete_payloads_and_order() {
         assert_eq!(actual, expected, "{tag}");
         assert_eq!(owner.usage().working_bytes, 0);
     }
+}
+
+#[test]
+fn profile_provider_declared_value_identity_and_admission() {
+    if run_in_child("profile_provider_declared_value_identity_and_admission") {
+        return;
+    }
+    let _environment = Environment::save();
+    let root = xc_core::test_support::TestDir::new("profile-provider-identity");
+    let executable = provider(&root);
+    configure(&root, &executable, "value-identity", None, None);
+    std::env::set_var("XC_TARGET_PROVIDER_PURE", "1");
+    std::env::set_var("XC_TARGET_PROVIDER_WORKERS", "4");
+    let mut spec = crate::target::TargetProfileSpec::from_environment().unwrap();
+    declare_value_contract(&mut spec);
+    let path = root.join("target.json");
+    let target = crate::target::hp::TargetEvaluator::from_spec(&spec, 256).unwrap();
+    assert_ne!(spec.digest().unwrap(), target.base_value_digest());
+    let owner = xc_core::RunResources::with_worker_limit(1 << 20, 4).unwrap();
+    let _scope = owner.enter();
+    for provenance_changed in [false, true] {
+        if provenance_changed {
+            spec.profile_id = "another-descriptive-label".into();
+            spec.external_profile.as_mut().unwrap().execution_provenance =
+                Some(serde_json::json!({"source":"another-source"}));
+        }
+        fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
+        // Distinct cold coordinates exercise parallel execution in both cases.
+        let us = if provenance_changed {
+            [1.5, 3.0]
+        } else {
+            [1.25, 2.5]
+        }
+        .map(|u| Float::with_val(192, u));
+        let points = us.iter().map(Some).collect::<Vec<_>>();
+        let mut prepared = ProfileTargets::try_new(&target, &points, 256)
+            .unwrap()
+            .expect("an unchanged numerical identity must allow parallel evaluation");
+        for (index, u) in us.iter().enumerate() {
+            assert_eq!(
+                prepared.value(index, &target, u).unwrap(),
+                target.try_value(u).unwrap()
+            );
+        }
+        drop(prepared);
+        assert_eq!(owner.usage().working_bytes, 0);
+    }
+    let us = [Float::with_val(192, 1.75), Float::with_val(192, 3.5)];
+    let points = us.iter().map(Some).collect::<Vec<_>>();
+    spec.external_profile.as_mut().unwrap().input["fail_u"] = "1.75".into();
+    fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    assert!(
+        ProfileTargets::try_new(&target, &points, 256).is_err(),
+        "tampered input must fail admission"
+    );
+    declare_value_contract(&mut spec);
+    fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let error = ProfileTargets::try_new(&target, &points, 256)
+        .err()
+        .unwrap();
+    assert!(error
+        .to_string()
+        .contains("runtime target specification changed"));
+    assert_eq!(owner.usage().working_bytes, 0);
 }
 
 #[test]

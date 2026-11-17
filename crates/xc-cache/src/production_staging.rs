@@ -754,17 +754,17 @@ fn validate_reopened_draft_location(
 }
 
 /// Select the transport identity already authorized by a retained manifest.
-/// The short-lived first v0.14.2 build tagged unchanged single-entry ZIP bytes
-/// as V2. If those exact bytes and parts reproduce a published V1 transport
-/// digest, retain the published label instead of creating a duplicate identity.
+/// Older producers and migrations used either supported schema for unique
+/// parts, and either ZIP profile label for single-entry packages. Accept an
+/// alternate label only when the entire encoding, including exact package and
+/// ordered part identities, reproduces a digest authorized by the manifest.
 fn bind_retained_transport_encoding(
     canonical_payload: &CanonicalPayloadEnvelope,
     retained: &CanonicalArtifactManifest,
-    mut encoding: TransportEncodingRecord,
+    encoding: TransportEncodingRecord,
 ) -> Result<TransportEncodingRecord, CacheError> {
-    if retained.transport_digests.contains(&encoding.digest()?) {
-        return Ok(encoding);
-    }
+    encoding.validate()?;
+    let mut profiles = vec![encoding.encoder_profile.clone()];
     if canonical_payload.ordered_items.len() == 1 {
         let alternate_profile = match encoding.encoder_profile.as_str() {
             DETERMINISTIC_ZIP64_PROFILE_V1 => Some(DETERMINISTIC_ZIP64_PROFILE_V2),
@@ -772,9 +772,20 @@ fn bind_retained_transport_encoding(
             _ => None,
         };
         if let Some(alternate_profile) = alternate_profile {
-            encoding.encoder_profile = alternate_profile.to_owned();
-            if retained.transport_digests.contains(&encoding.digest()?) {
-                return Ok(encoding);
+            profiles.push(alternate_profile.to_owned());
+        }
+    }
+    for schema in [encoding.schema_version, 1, 2] {
+        for profile in &profiles {
+            let mut candidate = encoding.clone();
+            candidate.schema_version = schema;
+            candidate.encoder_profile = profile.clone();
+            // Schema 1 cannot describe repeated paths. Never downgrade such
+            // an encoding, even if a malformed retained digest asks for it.
+            if candidate.validate().is_ok()
+                && retained.transport_digests.contains(&candidate.digest()?)
+            {
+                return Ok(candidate);
             }
         }
     }
@@ -2636,6 +2647,56 @@ mod tests {
             expected_v2
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retained_transport_reconciles_schema_only_for_authorized_exact_bytes() {
+        let scratch = crate::test_support::TestDir::new("transport-schema-reuse");
+        let draft = stage_produced_artifact(
+            &record(),
+            &scratch.join("original"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        for schema in [1, 2] {
+            for profile in [
+                DETERMINISTIC_ZIP64_PROFILE_V1,
+                DETERMINISTIC_ZIP64_PROFILE_V2,
+            ] {
+                let mut expected = draft.encoding.clone();
+                expected.schema_version = schema;
+                expected.encoder_profile = profile.into();
+                let mut manifest = draft.manifest.clone();
+                manifest.transport_digests = vec![expected.digest().unwrap()];
+                assert_eq!(
+                    bind_retained_transport_encoding(
+                        &manifest.canonical_payload,
+                        &manifest,
+                        draft.encoding.clone()
+                    )
+                    .unwrap(),
+                    expected
+                );
+                let mut corrupt = draft.encoding.clone();
+                corrupt.package_digest = ContentDigest::sha256(b"different bytes");
+                assert!(bind_retained_transport_encoding(
+                    &manifest.canonical_payload,
+                    &manifest,
+                    corrupt
+                )
+                .is_err());
+                let mut corrupt = draft.encoding.clone();
+                corrupt.ordered_parts[0].content_digest = ContentDigest::sha256(b"different part");
+                assert!(bind_retained_transport_encoding(
+                    &manifest.canonical_payload,
+                    &manifest,
+                    corrupt
+                )
+                .is_err());
+            }
+        }
     }
 
     #[test]

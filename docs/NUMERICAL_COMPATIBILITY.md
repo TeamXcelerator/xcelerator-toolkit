@@ -5,6 +5,27 @@ versioned semantic identities. An upgrade does not rewrite stored artifacts or
 establish the accuracy of an earlier experiment. The changes below apply to
 the library; applications must update their dependencies and rebuild to use them.
 
+## v0.17.2 optional CPU execution and Rust 1.100.0
+
+Opt-in packed, AVX2 and AVX-512 residue products compute the same exact integer
+sums and CRT reconstruction as the portable path. Flat residue storage changes
+allocation layout only, including CUDA preparation. Conservative workspace
+admission, precision, rounding and assurance policies are unchanged. Defaults
+remain portable; explicit unsupported ISA requests fail before CPU execution.
+
+Compiler selection, CPU tuning and storage layout remain execution provenance,
+not numerical cache-key inputs. This release retains earlier producer/reader
+floors and schema-2 capability checks. Compatible 0.17.1 artifacts remain reusable
+with their original producer metadata; the version bump alone does not require
+republishing. There is no archive-format or cache-repository migration.
+
+Native Windows checks cover exact scalar/SIMD products, tails and bounds,
+CPU/CUDA equality and cold/warm managed-cache reuse. Rust 1.100.0 is the selected
+development compiler; native numerical libraries and archive encoders are
+unchanged. The previous cross-platform comparisons below remain historical
+evidence. Linux and non-x86 execution of the new paths require separate
+qualification. See [CPU execution tuning](CPU_EXECUTION.md).
+
 ## v0.17.1 native Windows and dependency updates
 
 The native Windows lane preserves the MPFR precision, directed rounding,
